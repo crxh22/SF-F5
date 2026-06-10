@@ -72,3 +72,16 @@ process:
   agent_timeout_s: 3600
   ndjson_log_dir: .factory/logs   # operational, gitignored
   db_path: .factory/factory.db    # SQLite WAL, orchestrator-exclusive (DoD §6)
+
+canon:
+  # Canon files injected into agent system prompts (decision D-0009).
+  # claude CLI -> --append-system-prompt; codex CLI -> AGENTS.md in workspace / prompt prefix.
+  files:
+    doctrine: "00 - DOCTRINA.md"
+    conventions: work-protocols/conventions.md
+    founder_protocol: work-protocols/protocol_interactiune_founder.md
+  inject:
+    pipeline_agents: [doctrine, conventions]            # every role producing artifacts or judgment
+    founder_facing: [doctrine, conventions, founder_protocol]
+    consultation_points: []   # pure functions, mechanically validated; flip on if DoD §13 CP-quality trigger fires
+  founder_facing_roles: [intake, decision_session, main_architect, phase_architect, notify]

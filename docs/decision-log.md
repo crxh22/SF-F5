@@ -40,6 +40,18 @@ Python 3.12 + uv project (package `sf_factory`), pydantic v2 for config/verdict 
 
 The factory is built by the Main Architect session orchestrating parallel subagent teams, with verification always by a non-executor agent in clean context (Doctrine §4) — founder-endorsed mode ("echipă de subagenți, poate ultracode"). All durable state lives on disk in git; sessions are disposable. This scaffolding mode ends when the deterministic control plane takes over routine coordination.
 
+## D-0009 — 2026-06-10 — founder + main architect — Canon injection into factory agents
+
+Founder (chat 10-06-2026): doctrine + conventions must be loaded into the system prompt of every agent working in the factory; the founder-interaction protocol additionally into every agent whose output the founder reads; that protocol is also a binding design constraint for the dashboard (Etapa 4: Romanian, plain language, no bare IDs, options-with-recommendation cards).
+
+Main Architect refinement (config-controlled, reversible): consultation points (CP-1 class) get NO canon by default — they are bounded pure functions with closed verdict sets whose output is mechanically validated; canon injection there fails the Doctrine §17 test ("what concrete behavior does it change?") and only adds per-call cost. Falsifiability: if the DoD §13 CP-quality trigger fires (>30% verdicts overturned), flip `canon.inject.consultation_points` on and re-measure.
+
+Mechanism (runner design requirement): claude CLI → `--append-system-prompt "$(canon)"`; codex CLI → AGENTS.md in the agent workspace or prompt prefix. Config: `canon.*` in `factory.config.yaml`.
+
+## D-0010 — 2026-06-10 — main architect — Server localized to founder time
+
+Passwordless sudo verified active (D-0001 executed by founder via SSH). Server timezone set to Europe/Chisinau (D-0006 executed); sqlite3 CLI installed. Machine-parsed timestamps remain ISO 8601 UTC.
+
 ---
 
-*Note — 2026-06-10: tentative power outage at 15:00 UTC (18:00 Chișinău); confirmation pending, shutdown decision with founder ~14:40 UTC.*
+*Note — 2026-06-10: tentative power outage at 18:00 Chișinău (now also server-local); confirmation pending, shutdown decision with founder ~17:40.*
