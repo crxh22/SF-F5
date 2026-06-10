@@ -1,0 +1,74 @@
+# factory.config.yaml — single source for all tunable factory parameters (Doctrine §14).
+# Starter values founder-approved 10-06-2026 (decision log D-0005); recalibrate on DoD §13 evidence.
+# Role prompts and code reference these keys by name — never hardcode values elsewhere.
+
+factory:
+  home: /home/artur/projects/SF-F5
+  timezone_founder: Europe/Chisinau   # founder-facing rendering only; machine timestamps are ISO 8601 UTC
+
+projects:
+  erp:
+    docs_repo: /home/artur/projects/ERP-start
+    workspace: /home/artur/projects/erp-workspace   # created at Etapa 5 kickoff
+    proving_phases: [foundation, inventory-procurement]
+
+models:
+  # role -> CLI + model alias (resolved by the respective CLI). Cross-model pairs per D-0003.
+  main_architect:        {cli: claude, model: fable,   mode: interactive}
+  phase_architect:       {cli: claude, model: fable,   mode: print}
+  spec_agent:            {cli: claude, model: fable,   mode: print}
+  builder_routine:       {cli: claude, model: sonnet,  mode: print}
+  builder_heavy:         {cli: claude, model: fable,   mode: print}
+  validator:             {cli: claude, model: sonnet,  mode: print}
+  validator_structural:  {cli: claude, model: fable,   mode: print}
+  integration_validator: {cli: codex,  model: default, mode: print}   # cross-model preferred (DoD §5.2)
+  auditor_same_model:    {cli: claude, model: fable,   mode: print}
+  auditor_cross_model:   {cli: codex,  model: default, mode: print}
+  cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
+
+budgets:
+  # tokens per stage by risk class; exceeding forces a state-preserving reset (DoD §8 context_budget)
+  routine: 300000
+  structural: 1000000
+  critical: 2000000
+
+escalation:
+  max_fix_iterations: 3        # BUILD->VALIDATE loops without failing-test count decreasing
+  churn_threshold: 4           # edits to the same file region within one stage
+  decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
+
+risk_classes:
+  routine:    {validator: validator,            audits: []}
+  structural: {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model]}
+  critical:   {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model], human_gate: true}
+
+economics:
+  dual_audit_structural: true  # second auditor's marginal cost ~0 on current subscriptions (DoD §7)
+
+consultation_points:
+  # The ONLY registered points. Any orchestrator LLM call outside this registry = governance breach (DoD §4),
+  # detectable mechanically from logs. Adding a point = config change + macro decision-log entry.
+  - id: CP-1
+    purpose: feedback-loop triage when deterministic thresholds do not decide
+    inputs: [validation_report, diff_digest, spec]
+    verdicts: [continue_session, rebuild, respec, escalate]
+    fallback: escalate
+    role: cp1_triage
+
+founder_channel:
+  ntfy:
+    server: https://ntfy.sh
+    topic: claude-artur-md-hello   # founder-approved plain topic (D-0004); payloads: title + deep link only
+    priority_decision: high
+    priority_alert: max
+  dashboard:
+    bind: tailscale   # serve only on the tailnet interface
+    port: 8377
+  watchdog:
+    check_interval_s: 60
+    staleness_threshold_s: 300
+
+process:
+  agent_timeout_s: 3600
+  ndjson_log_dir: .factory/logs   # operational, gitignored
+  db_path: .factory/factory.db    # SQLite WAL, orchestrator-exclusive (DoD §6)

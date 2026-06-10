@@ -1,0 +1,11 @@
+_assembled_canon.md
+
+# python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# factory operational state (SQLite + logs are canonical in DB, not git — DoD §6)
+.factory/
