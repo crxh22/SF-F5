@@ -1,0 +1,3531 @@
+"""Level-agnostic DAG scheduler + per-level unit executors (design §3.3/§4/§5.5).
+
+One fan-out/queue/gate code path drives BOTH levels (DoD §3.2): the
+``Scheduler`` operates only on ``sched_category`` + ``dag_edges``; everything
+level-specific lives in the ``UnitExecutor`` implementations (``StageExecutor``
+= the §3.1 SPEC→…→MERGE_GATE conveyor, ``PhaseExecutor`` = the §3.2
+plan→freeze→fan-out→integrate flow). Crash recovery (``Scheduler.recover``)
+implements §5.5 steps a–d and gates the loop start.
+
+Concurrency (§7): single asyncio loop; every DB write happens on the loop
+thread inside a synchronous ``Database.transaction()`` block (never an await
+inside); notification I/O only via the async ``NtfyPublisher``.
+
+Caller-side SQL note: a handful of private read helpers (and the §4
+``tier1_gate``-mandated ``artifact_refs.git_commit`` re-resolve UPDATE) run
+their SQL here rather than in db.py — the design assigns these behaviors to
+this module's classes explicitly (the same pattern as thresholds.py's §2
+trigger SQL); each is a small, commented, single-statement query.
+
+May import: all of models/config/db/statemachine/runner/artifacts/worktrees/
+thresholds/consultation, plus notify (design §1).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shlex
+import shutil
+import signal
+import sqlite3
+import traceback
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+from sf_factory import db as fdb
+from sf_factory.artifacts import (
+    PHASE_ARTIFACTS,
+    STAGE_ARTIFACTS,
+    detect_sentinels,
+    read_phase_plan,
+    read_validation_sidecar,
+    register_artifact,
+    sha256_file,
+    unit_artifact_dir,
+    verify_integrity,
+)
+from sf_factory.config import ConsultationPointCfg, FactoryConfig, ProjectCfg
+from sf_factory.db import Database
+from sf_factory.models import (
+    ArtifactContractError,
+    ConfigError,
+    DecisionRequest,
+    Escalation,
+    FactoryError,
+    Finding,
+    GitError,
+    IntegrityError,
+    Level,
+    NotifyError,
+    Phase,
+    PhaseState,
+    ProcessRecord,
+    SchedCategory,
+    Stage,
+    StageState,
+    TransitionError,
+    Trigger,
+    new_id,
+    sched_category,
+    utc_now,
+)
+from sf_factory.notify import NtfyPublisher, dashboard_link
+from sf_factory.runner import AgentResult, AgentRunner
+from sf_factory.statemachine import StateMachine
+from sf_factory.thresholds import ThresholdEvaluator
+from sf_factory.worktrees import StaleGateError, WorktreeManager, commit_paths, run_git
+
+if TYPE_CHECKING:  # wave-3 sibling module; only instances are received at runtime
+    from sf_factory.consultation import Consultor, Verdict
+
+# ------------------------------------------------------------------ vocabulary
+
+#: The feedback-triage consultation point (DoD §3.4) — a registry id referenced
+#: by name, like config role keys; the registry itself stays in config.
+CP1_ID = "CP-1"
+
+#: CLIs with verified session resume (OPEN-3: claude native; codex verified by
+#: the D-0011 smoke test; the stub echoes --resume). A route outside this set
+#: executes `continue_session` as `rebuild` + `verdict_downgraded` (§3.1).
+RESUME_VERIFIED_CLIS = frozenset({"claude", "codex", "stub"})
+
+#: Sentinel artifact kind -> (filename, events.event_type, escalations.trigger).
+_SENTINEL_EVENTS: Mapping[str, tuple[str, str]] = {
+    "declared_failure": ("declared_failure", Trigger.AGENT_DECLARED_FAILURE.value),
+    "contract_change_request": (
+        "contract_change_request",
+        Trigger.CONTRACT_CHANGE_REQUEST.value,
+    ),
+}
+
+#: ESCALATED-exit resolution vocabulary (§2 escalations.resolution examples):
+#: resolution string -> target state per level. Anything else = unknown ->
+#: explicit 'alert' event, unit stays put (never guessed, Doctrine §7).
+_STAGE_RESOLUTIONS: Mapping[str, StageState] = {
+    "rework:BUILD": StageState.BUILD,
+    "rework:SPEC": StageState.SPEC,
+    "respec": StageState.SPEC,
+    "rework:VALIDATE": StageState.VALIDATE,
+    "awaiting_human": StageState.AWAITING_HUMAN,
+    "failed": StageState.FAILED,
+    "cancelled": StageState.CANCELLED,
+}
+_PHASE_RESOLUTIONS: Mapping[str, PhaseState] = {
+    "replan": PhaseState.PLANNING,
+    "resume": PhaseState.RUNNING,
+    "awaiting_human": PhaseState.AWAITING_HUMAN,
+    "failed": PhaseState.FAILED,
+    "cancelled": PhaseState.CANCELLED,
+}
+
+#: AWAITING_HUMAN answer vocabulary at stage level (DoD §9 gate answers).
+_STAGE_ANSWERS: Mapping[str, StageState] = {
+    "approved": StageState.MERGE_GATE,
+    "rework:BUILD": StageState.BUILD,
+    "rework:SPEC": StageState.SPEC,
+}
+#: Phase AWAITING_HUMAN / AWAITING_SIGNOFF answers.
+_PHASE_HUMAN_ANSWERS: Mapping[str, PhaseState] = {
+    "resume": PhaseState.RUNNING,
+    "replan": PhaseState.PLANNING,
+}
+
+_ACTOR = "control_plane"
+
+
+# ------------------------------------------------------- private SQL read helpers
+
+
+def _max_event_seq(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()
+    return int(row[0])
+
+
+def _open_escalation_count(conn: sqlite3.Connection, level: str, unit_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM escalations WHERE unit_level = ? AND unit_id = ?"
+        " AND status = 'open'",
+        (level, unit_id),
+    ).fetchone()
+    return int(row[0])
+
+
+def _total_open_escalations(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) FROM escalations WHERE status = 'open'").fetchone()
+    return int(row[0])
+
+
+def _pending_decision_count(conn: sqlite3.Connection, level: str, unit_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM decision_requests WHERE unit_level = ? AND unit_id = ?"
+        " AND status = 'pending'",
+        (level, unit_id),
+    ).fetchone()
+    return int(row[0])
+
+
+def _latest_decision(
+    conn: sqlite3.Connection, level: str, unit_id: str
+) -> DecisionRequest | None:
+    row = conn.execute(
+        "SELECT * FROM decision_requests WHERE unit_level = ? AND unit_id = ?"
+        " ORDER BY id DESC LIMIT 1",
+        (level, unit_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return DecisionRequest(
+        id=row["id"],
+        unit_level=row["unit_level"],
+        unit_id=row["unit_id"],
+        gate_kind=row["gate_kind"],
+        request_artifact_id=row["request_artifact_id"],
+        status=row["status"],
+        answer=row["answer"],
+        answer_artifact_id=row["answer_artifact_id"],
+        created_at=row["created_at"],
+        alerted_at=row["alerted_at"],
+        answered_at=row["answered_at"],
+    )
+
+
+def _latest_resolved_escalation(
+    conn: sqlite3.Connection, level: str, unit_id: str
+) -> Escalation | None:
+    row = conn.execute(
+        "SELECT * FROM escalations WHERE unit_level = ? AND unit_id = ?"
+        " AND status = 'resolved' ORDER BY id DESC LIMIT 1",
+        (level, unit_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return Escalation(
+        id=row["id"],
+        unit_level=row["unit_level"],
+        unit_id=row["unit_id"],
+        trigger=row["trigger"],
+        target=row["target"],
+        payload_artifact_id=row["payload_artifact_id"],
+        event_seq=row["event_seq"],
+        status=row["status"],
+        resolution=row["resolution"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+    )
+
+
+def _dag_edge_exists(
+    conn: sqlite3.Connection, level: Level, from_id: str, to_id: str
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM dag_edges WHERE level = ? AND from_id = ? AND to_id = ?",
+        (Level(level).value, from_id, to_id),
+    ).fetchone()
+    return row is not None
+
+
+def _last_event_seq_of_type(
+    conn: sqlite3.Connection, unit_id: str, event_type: str, *, role: str | None = None
+) -> int:
+    """Latest seq of an event type for a stage; with ``role``, only events whose
+    payload role matches (the runner writes role into spawn payloads, §5.1)."""
+    if role is None:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE unit_level = 'stage'"
+            " AND unit_id = ? AND event_type = ?",
+            (unit_id, event_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE unit_level = 'stage'"
+            " AND unit_id = ? AND event_type = ?"
+            " AND json_extract(payload_json, '$.role') = ?",
+            (unit_id, event_type, role),
+        ).fetchone()
+    return int(row[0])
+
+
+def _last_transition_payload(
+    conn: sqlite3.Connection, level: str, unit_id: str, to_state: str
+) -> dict:
+    """Payload of the unit's most recent transition INTO ``to_state`` — the
+    crash-safe carrier of the CP-1 `continue_session` resume id (§3.1)."""
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE unit_level = ? AND unit_id = ?"
+        " AND event_type = 'transition' AND to_state = ? ORDER BY seq DESC LIMIT 1",
+        (level, unit_id, to_state),
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(row["payload_json"])
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _unit_artifact_rows(
+    conn: sqlite3.Connection, level: str, unit_id: str, repo: str
+) -> list[tuple[int, str, str]]:
+    rows = conn.execute(
+        "SELECT id, path, sha256 FROM artifact_refs WHERE unit_level = ?"
+        " AND unit_id = ? AND repo = ? ORDER BY id",
+        (level, unit_id, repo),
+    ).fetchall()
+    return [(int(r["id"]), r["path"], r["sha256"]) for r in rows]
+
+
+def _reresolve_artifact_commits(
+    conn: sqlite3.Connection, level: str, unit_id: str, worktree: Path, new_head: str
+) -> int:
+    """§4 tier1_gate contract, assigned to the CALLER: after a successful rebase
+    re-resolve the unit's artifact_refs.git_commit at the new branch head —
+    mechanical (same path + same sha256, verified against the rebased checkout);
+    rows whose content no longer matches are left untouched. Returns updates."""
+    updated = 0
+    for ref_id, rel_path, sha in _unit_artifact_rows(conn, level, unit_id, "workspace"):
+        candidate = worktree / rel_path
+        if not candidate.is_file():
+            continue
+        try:
+            if sha256_file(candidate) != sha:
+                continue
+        except IntegrityError:
+            continue
+        conn.execute(
+            "UPDATE artifact_refs SET git_commit = ? WHERE id = ?", (new_head, ref_id)
+        )
+        updated += 1
+    return updated
+
+
+# ----------------------------------------------------------------- misc helpers
+
+
+def _resolve(home: Path, path: Path) -> Path:
+    """Anchor a relative config path at factory.home (same rule as watchdog/runner)."""
+    return path if path.is_absolute() else home / path
+
+
+def _bounded(text: str, max_bytes: int) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    return data[:max_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+
+
+def _read_text(path: Path, *, what: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactContractError(f"cannot read {what} at {path}: {exc}") from exc
+
+
+def _builder_role(cfg: FactoryConfig, risk_class: str) -> str:
+    """Builder route per risk class. Convention over config (the risk_classes
+    section declares validator+audits only): prefer the models key
+    'builder_<risk_class>' when declared, else the conservative
+    'builder_heavy'. Raises ConfigError when neither route exists."""
+    candidate = f"builder_{risk_class}"
+    if candidate in cfg.models:
+        return candidate
+    if "builder_heavy" in cfg.models:
+        return "builder_heavy"
+    raise ConfigError(
+        f"no builder route for risk class {risk_class!r}: neither models.{candidate}"
+        " nor models.builder_heavy is configured"
+    )
+
+
+def _cp_point(cfg: FactoryConfig, cp_id: str) -> ConsultationPointCfg:
+    for cp in cfg.consultation_points:
+        if cp.id == cp_id:
+            return cp
+    raise ConfigError(f"consultation point {cp_id!r} is not registered in config")
+
+
+def _project_for_phase(cfg: FactoryConfig, phase: Phase) -> ProjectCfg:
+    project = cfg.projects.get(phase.project)
+    if project is None:
+        raise ConfigError(
+            f"phase {phase.id!r} references unknown project {phase.project!r}"
+        )
+    return project
+
+
+def _test_cmd(project: ProjectCfg) -> list[str]:
+    """projects.<id>.test_command as argv; None = OPEN-2 still open — explicit
+    failure, never a silently skipped merge-gate suite (Doctrine §7)."""
+    cmd = project.test_command
+    if cmd is None:
+        raise ConfigError(
+            "projects.*.test_command is unset (OPEN-2): the Tier-1 merge gate"
+            " cannot run the full test suite — set the canonical suite command"
+        )
+    if isinstance(cmd, str):
+        argv = shlex.split(cmd)
+    else:
+        argv = [str(part) for part in cmd]
+    if not argv:
+        raise ConfigError("projects.*.test_command is empty")
+    return argv
+
+
+def _read_findings_sidecar(path: Path, *, auditor_role: str) -> list[dict]:
+    """Strict findings sidecar contract (mirrors the OPEN-5 validation sidecar):
+    a JSON object {"findings": [{"ref": str, "severity": str?, "summary": str?,
+    "location": str?}, ...]}; an empty list = clean report. Missing/malformed →
+    ArtifactContractError — agent reports are never parsed best-effort."""
+    text = _read_text(path, what=f"findings sidecar of {auditor_role}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactContractError(
+            f"findings sidecar {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict) or set(data) != {"findings"}:
+        raise ArtifactContractError(
+            f"findings sidecar {path} must be exactly {{'findings': [...]}}"
+        )
+    findings = data["findings"]
+    if not isinstance(findings, list):
+        raise ArtifactContractError(f"findings sidecar {path}: 'findings' must be a list")
+    allowed = {"ref", "severity", "summary", "location"}
+    out: list[dict] = []
+    seen_refs: set[str] = set()
+    for item in findings:
+        if not isinstance(item, dict) or not isinstance(item.get("ref"), str):
+            raise ArtifactContractError(
+                f"findings sidecar {path}: each finding needs a string 'ref', got {item!r}"
+            )
+        unknown = set(item) - allowed
+        if unknown:
+            raise ArtifactContractError(
+                f"findings sidecar {path}: unknown finding keys {sorted(unknown)}"
+            )
+        if item["ref"] in seen_refs:
+            raise ArtifactContractError(
+                f"findings sidecar {path}: duplicate finding ref {item['ref']!r}"
+            )
+        seen_refs.add(item["ref"])
+        out.append(item)
+    return out
+
+
+def _read_response_sidecar(path: Path, open_refs: Sequence[str]) -> dict[str, dict]:
+    """Strict executor-response contract: {"responses": [{"ref", "action":
+    comply|contest|duplicate, "rationale"}]}; every open finding ref must be
+    addressed exactly once (no silent skips, Doctrine §7)."""
+    text = _read_text(path, what="audit response sidecar")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactContractError(
+            f"audit response {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict) or set(data) != {"responses"}:
+        raise ArtifactContractError(
+            f"audit response {path} must be exactly {{'responses': [...]}}"
+        )
+    responses: dict[str, dict] = {}
+    if not isinstance(data["responses"], list):
+        raise ArtifactContractError(f"audit response {path}: 'responses' must be a list")
+    for item in data["responses"]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("ref"), str)
+            or item.get("action") not in ("comply", "contest", "duplicate")
+            or not isinstance(item.get("rationale"), str)
+        ):
+            raise ArtifactContractError(
+                f"audit response {path}: each response needs ref/action"
+                f"(comply|contest|duplicate)/rationale, got {item!r}"
+            )
+        if item["ref"] in responses:
+            raise ArtifactContractError(
+                f"audit response {path}: duplicate response for ref {item['ref']!r}"
+            )
+        responses[item["ref"]] = item
+    missing = [ref for ref in open_refs if ref not in responses]
+    if missing:
+        raise ArtifactContractError(
+            f"audit response {path} does not address finding(s) {missing}"
+        )
+    return responses
+
+
+# ------------------------------------------------------------- frozen interfaces
+
+
+class UnitExecutor(Protocol):
+    """Per-level step-sequence driver (design §4)."""
+
+    level: Level
+
+    async def execute(self, unit_id: str) -> None:
+        """Drive one unit from its current state until BLOCKED or terminal; every step:
+        run agent, register artifacts, evaluate thresholds first, CP-1 only when
+        thresholds do not decide, transition."""
+        ...
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """Outcome of Scheduler.recover() (§5.5 steps a–d)."""
+
+    #: process_registry ids flipped to 'orphaned' (step a).
+    orphaned: tuple[int, ...]
+    #: pids whose process GROUP was SIGKILLed during the sweep (step a).
+    killed_groups: tuple[int, ...]
+    #: checkout path -> heal_git_state actions taken (step b).
+    healed: Mapping[str, tuple[str, ...]]
+    #: paths whose healing failed (recorded, unit escalates on next drive).
+    heal_errors: tuple[str, ...]
+    #: unit worktrees hard-reset after dirty-state evidence capture (step b).
+    dirty_reset: tuple[str, ...]
+    #: verify_integrity counters (step c; failures abort before a report exists).
+    integrity_checked: int
+    integrity_warnings: int
+    #: '<level>:<unit_id>' units in RUNNING-category states re-entering the queue (step d).
+    requeued: tuple[str, ...]
+
+
+# ----------------------------------------------------------------- StageExecutor
+
+
+class StageExecutor:
+    """Implements UnitExecutor(level=STAGE): the §3.1 SPEC→…→MERGE_GATE conveyor,
+    including Validator scratch-worktree isolation, thresholds-first-then-CP-1
+    routing, the §3.1 Tier-2 input contract and CP-1 verdict execution."""
+
+    level: Level = Level.STAGE
+
+    def __init__(
+        self,
+        db: Database,
+        sm: StateMachine,
+        cfg: FactoryConfig,
+        runner: AgentRunner,
+        wt: WorktreeManager,
+        thresholds: ThresholdEvaluator,
+        consultor: Consultor,
+        notify: NtfyPublisher,
+    ) -> None:
+        """Wires the stage conveyor; no policy outside config."""
+        self._db = db
+        self._sm = sm
+        self._cfg = cfg
+        self._runner = runner
+        self._wt = wt
+        self._thresholds = thresholds
+        self._consultor = consultor
+        self._notify = notify
+
+    # ---------------------------------------------------------------- protocol
+
+    async def execute(self, unit_id: str) -> None:
+        """Drive one stage until BLOCKED, terminal, or no further progress is
+        possible without external input; each step follows the §4 contract."""
+        steps = {
+            StageState.PENDING: self._step_dispatch,
+            StageState.SPEC: self._step_spec,
+            StageState.BUILD: self._step_build,
+            StageState.VALIDATE: self._step_validate,
+            StageState.AUDIT: self._step_audit,
+            StageState.MERGE_GATE: self._step_merge_gate,
+            StageState.AWAITING_HUMAN: self._step_awaiting_human,
+            StageState.ESCALATED: self._step_escalated,
+        }
+        while True:
+            stage = self._stage(unit_id)
+            step = steps.get(stage.state)
+            if step is None:  # DONE / FAILED / CANCELLED
+                return
+            if not await step(stage):
+                return
+
+    # ------------------------------------------------------------ shared bits
+
+    def _stage(self, stage_id: str) -> Stage:
+        stage = fdb.get_stage(self._db.read(), stage_id)
+        if stage is None:
+            raise FactoryError(f"unknown stage unit: {stage_id!r}")
+        return stage
+
+    def _context(self, stage: Stage) -> tuple[Phase, ProjectCfg, Path, str]:
+        """(phase, project, repo_root, target_branch) for a stage."""
+        phase = fdb.get_phase(self._db.read(), stage.phase_id)
+        if phase is None:
+            raise FactoryError(f"stage {stage.id!r} references unknown phase")
+        project = _project_for_phase(self._cfg, phase)
+        target_branch = phase.branch or f"phase/{phase.id}"
+        return phase, project, Path(project.workspace), target_branch
+
+    def _worktree(self, stage: Stage) -> Path:
+        if not stage.worktree_path:
+            raise FactoryError(f"stage {stage.id!r} has no worktree (not dispatched?)")
+        return Path(stage.worktree_path)
+
+    def _unit_dir(self, root: Path, stage: Stage) -> Path:
+        return unit_artifact_dir(root, Level.STAGE, stage.id)
+
+    async def _run_step_agent(
+        self,
+        stage: Stage,
+        role: str,
+        prompt: str,
+        *,
+        cwd: Path,
+        resume_session: str | None = None,
+    ) -> AgentResult:
+        """Spawn one conveyor agent and run the §5.4 mechanical post-conditions:
+        detect sentinels where the agent ran and persist their events (the §2
+        always-fire trigger inputs); evaluation/escalation is the caller's
+        thresholds pass."""
+        result = await self._runner.run_agent(
+            role,
+            prompt,
+            unit_level=Level.STAGE.value,
+            unit_id=stage.id,
+            cwd=cwd,
+            resume_session=resume_session,
+        )
+        sentinels = detect_sentinels(self._unit_dir(cwd, stage))
+        if sentinels:
+            with self._db.transaction() as conn:
+                for kind in sentinels:
+                    event_type, _ = _SENTINEL_EVENTS[kind]
+                    fdb.insert_event(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        event_type=event_type,
+                        actor=role,
+                        payload={
+                            "sentinel": str(self._unit_dir(cwd, stage) / STAGE_ARTIFACTS[kind]),
+                            "process_id": result.process_id,
+                        },
+                    )
+        return result
+
+    async def _commit_unit_paths(
+        self, stage: Stage, worktree: Path, paths: Sequence[Path], message: str
+    ) -> str | None:
+        return await commit_paths(
+            worktree, paths, message, trailers={"Factory-Unit": f"stage/{stage.id}"}
+        )
+
+    async def _apply_thresholds(self, stage: Stage, worktree: Path | None) -> bool:
+        """§8-first routing: evaluate the §2 trigger set; execute every firing
+        mechanically. context_budget within escalation.max_context_resets =
+        state-preserving reset (event 'context_reset'); everything else (and a
+        budget firing past the reset allowance) = escalation rows + one
+        transition to ESCALATED. Returns True when the stage escalated."""
+        firings = self._thresholds.evaluate(stage)
+        escalating = []
+        for firing in firings:
+            if firing.trigger is Trigger.CONTEXT_BUDGET:
+                read = self._db.read()
+                reset_seq = _last_event_seq_of_type(read, stage.id, "context_reset")
+                spawn_seq = _last_event_seq_of_type(read, stage.id, "spawn")
+                if reset_seq > spawn_seq:
+                    # A reset is pending and no agent has consumed it yet (no
+                    # spawn since): the breach was already answered — counting
+                    # it again within the same step would burn the allowance
+                    # AND escalate on one breach. Skip; it re-fires after the
+                    # next (fresh-context) spawn if the budget is still blown.
+                    continue
+                resets = int(firing.evidence.get("context_resets", 0))
+                if resets < self._cfg.escalation.max_context_resets:
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level=Level.STAGE.value,
+                            unit_id=stage.id,
+                            event_type="context_reset",
+                            actor=_ACTOR,
+                            payload=firing.evidence,
+                        )
+                    continue
+            escalating.append(firing)
+        if not escalating:
+            return False
+        payload_ref_id = await self._escalation_payload(stage, worktree, escalating)
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            for firing in escalating:
+                if fdb.open_escalation(
+                    conn, Level.STAGE.value, stage.id, firing.trigger.value
+                ):
+                    continue  # uq_open_escalation: one open row per trigger
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        trigger=firing.trigger.value,
+                        target="phase_architect",
+                        payload_artifact_id=payload_ref_id,
+                        event_seq=firing.evidence.get("event_seq"),
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.ESCALATED.value,
+            actor=_ACTOR,
+            reason="threshold trigger(s) fired",
+            payload={"triggers": [f.trigger.value for f in escalating]},
+            coupled=coupled,
+        )
+        return True
+
+    async def _escalation_payload(
+        self, stage: Stage, worktree: Path | None, firings: Sequence
+    ) -> int | None:
+        """Escalation payload = artifacts, not narrative (DoD §8): the firing
+        evidence lands as a committed stage artifact when a worktree exists."""
+        if worktree is None:
+            return None
+        unit_dir = self._unit_dir(worktree, stage)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        path = unit_dir / "escalation-payload.md"
+        body = ["# Escalation payload (mechanical trigger evidence)", ""]
+        for firing in firings:
+            body.append(f"## {firing.trigger.value}")
+            body.append("```json")
+            body.append(json.dumps(firing.evidence, indent=2, sort_keys=True))
+            body.append("```")
+        path.write_text("\n".join(body) + "\n", encoding="utf-8")
+        sha = await self._commit_unit_paths(
+            stage, worktree, [path], f"stage {stage.id}: escalation payload"
+        )
+        with self._db.transaction() as conn:
+            ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="escalation_payload",
+                repo="workspace",
+                repo_root=worktree,
+                path=path,
+                git_commit=sha,
+            )
+        return ref.id
+
+    # ------------------------------------------------------------------- steps
+
+    async def _step_dispatch(self, stage: Stage) -> bool:
+        """PENDING -> SPEC: idempotent worktree create off the phase integration
+        branch, then one tx (transition + worktree columns)."""
+        phase, _project, repo_root, target_branch = self._context(stage)
+        branch = stage.branch or f"stage/{stage.id}"
+        path = await self._wt.create(repo_root, stage.id, branch, target_branch)
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.SPEC.value,
+            actor=_ACTOR,
+            reason="DAG deps DONE, dispatched",
+            payload={"branch": branch, "worktree": str(path)},
+            coupled=lambda conn: fdb.set_stage_worktree(conn, stage.id, branch, str(path)),
+        )
+        return True
+
+    async def _step_spec(self, stage: Stage) -> bool:
+        """SPEC: run the Spec Agent; spec.md committed + registered, then -> BUILD."""
+        phase, _project, _repo_root, _target = self._context(stage)
+        worktree = self._worktree(stage)
+        unit_dir = self._unit_dir(worktree, stage)
+        await self._run_step_agent(
+            stage, "spec_agent", self._spec_prompt(stage, phase, worktree), cwd=worktree
+        )
+        if await self._apply_thresholds(stage, worktree):
+            return False
+        spec_path = unit_dir / STAGE_ARTIFACTS["spec"]
+        if not spec_path.is_file():
+            raise ArtifactContractError(
+                f"spec agent produced no {spec_path} for stage {stage.id}"
+            )
+        sha = await self._commit_unit_paths(
+            stage, worktree, [spec_path], f"stage {stage.id}: spec"
+        )
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.BUILD.value,
+            actor=_ACTOR,
+            reason="spec artifact registered",
+            coupled=lambda conn: register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="spec",
+                repo="workspace",
+                repo_root=worktree,
+                path=spec_path,
+                git_commit=sha,
+            ),
+        )
+        return True
+
+    async def _step_build(self, stage: Stage) -> bool:
+        """BUILD: Validator-isolation assertion, Builder run (resume honored per
+        the entry transition payload), commit-all, churn recording, -> VALIDATE."""
+        worktree = self._worktree(stage)
+        await self._assert_no_unregistered_files(stage, worktree)
+
+        conn = self._db.read()
+        role = _builder_role(self._cfg, stage.risk_class)
+        entry = _last_transition_payload(
+            conn, Level.STAGE.value, stage.id, StageState.BUILD.value
+        )
+        resume = entry.get("resume_session")
+        if resume is not None and not isinstance(resume, str):
+            resume = None
+        if resume is not None:
+            # A context_reset after the builder's last spawn forbids resuming —
+            # that is what the reset resets (§2/§3.1). Recorded, never silent.
+            reset_seq = _last_event_seq_of_type(conn, stage.id, "context_reset")
+            spawn_seq = _last_event_seq_of_type(conn, stage.id, "spawn", role=role)
+            if reset_seq > spawn_seq:
+                with self._db.transaction() as tx:
+                    fdb.insert_event(
+                        tx,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        event_type="verdict_downgraded",
+                        actor=_ACTOR,
+                        payload={
+                            "verdict": "continue_session",
+                            "executed_as": "rebuild",
+                            "reason": "context_reset",
+                        },
+                    )
+                resume = None
+
+        await self._run_step_agent(
+            stage,
+            role,
+            self._build_prompt(stage, worktree, entry),
+            cwd=worktree,
+            resume_session=resume,
+        )
+
+        # Stage the full build (new files included) so churn sees every hunk.
+        code, out, err = await run_git("add", "-A", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git add -A failed in {worktree}: {(err or out).strip()}")
+        code, churn_diff, err = await run_git("diff", "--cached", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git diff --cached failed in {worktree}: {err.strip()}")
+        sha = await self._commit_unit_paths(
+            stage, worktree, [Path(".")], f"stage {stage.id}: build"
+        )
+        if await self._apply_thresholds(stage, worktree):
+            return False
+        if sha is None and not churn_diff:
+            raise ArtifactContractError(
+                f"builder produced no committed changes for stage {stage.id}"
+                " and declared no failure"
+            )
+        notes_path = self._unit_dir(worktree, stage) / STAGE_ARTIFACTS["build_notes"]
+
+        def coupled(tx: sqlite3.Connection) -> None:
+            self._thresholds.record_churn(tx, stage.id, churn_diff)
+            if notes_path.is_file():
+                register_artifact(
+                    tx,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    kind="build_notes",
+                    repo="workspace",
+                    repo_root=worktree,
+                    path=notes_path,
+                    git_commit=sha,
+                )
+
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.VALIDATE.value,
+            actor=_ACTOR,
+            reason="build committed",
+            payload={"commit": sha},
+            coupled=coupled,
+        )
+        return True
+
+    async def _assert_no_unregistered_files(self, stage: Stage, worktree: Path) -> None:
+        """§3.1 Validator isolation: before each BUILD step the stage worktree
+        must contain nothing uncommitted/unregistered — otherwise the Builder
+        could code to leaked Validator internals from iteration 2 onward."""
+        code, out, err = await run_git("status", "--porcelain", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git status failed in {worktree}: {(err or out).strip()}")
+        if out.strip():
+            raise IntegrityError(
+                f"stage {stage.id} worktree has unregistered files before BUILD"
+                f" (Validator-isolation assertion, §3.1):\n{out.strip()}"
+            )
+
+    async def _step_validate(self, stage: Stage) -> bool:
+        """VALIDATE in a scratch worktree (§3.1 isolation); record the fix
+        iteration; route thresholds-first, then CP-1, executing the verdict."""
+        phase, _project, repo_root, target_branch = self._context(stage)
+        worktree = self._worktree(stage)
+        branch = stage.branch or f"stage/{stage.id}"
+        validator_role = self._validator_role(stage)
+
+        scratch = await self._wt.create(
+            repo_root, f"{stage.id}-validate", branch, branch, new_branch=False
+        )
+        await self._run_step_agent(
+            stage, validator_role, self._validate_prompt(stage, scratch), cwd=scratch
+        )
+        if await self._apply_thresholds(stage, worktree):
+            return False  # e.g. validator declared failure / contract change
+
+        # Only the two reports cross the isolation boundary (§3.1).
+        scratch_dir = self._unit_dir(scratch, stage)
+        unit_dir = self._unit_dir(worktree, stage)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[Path] = []
+        for kind in ("validation_report", "validation_sidecar"):
+            src = scratch_dir / STAGE_ARTIFACTS[kind]
+            if not src.is_file():
+                raise ArtifactContractError(
+                    f"validator produced no {STAGE_ARTIFACTS[kind]} for stage {stage.id}"
+                    f" (expected at {src})"
+                )
+            shutil.copyfile(src, unit_dir / STAGE_ARTIFACTS[kind])
+            copied.append(unit_dir / STAGE_ARTIFACTS[kind])
+        report_path, sidecar_path = copied
+        summary = read_validation_sidecar(sidecar_path)
+        sha = await self._commit_unit_paths(
+            stage, worktree, copied, f"stage {stage.id}: validation report"
+        )
+        await self._wt.remove(repo_root, scratch)
+
+        with self._db.transaction() as conn:
+            register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="validation_report",
+                repo="workspace",
+                repo_root=worktree,
+                path=report_path,
+                git_commit=sha,
+            )
+            sidecar_ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="validation_sidecar",
+                repo="workspace",
+                repo_root=worktree,
+                path=sidecar_path,
+                git_commit=sha,
+            )
+            iteration = self._thresholds.record_validation(
+                conn, stage.id, summary, sidecar_ref.id
+            )
+
+        # Deterministic thresholds FIRST (now including this iteration).
+        if await self._apply_thresholds(stage, worktree):
+            return False
+
+        if summary.failing == 0:
+            audits = self._risk_cfg(stage).audits
+            to_state = StageState.AUDIT if audits else StageState.MERGE_GATE
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                to_state.value,
+                actor=_ACTOR,
+                reason="validation passed",
+                payload={"iteration": iteration, "failing": 0},
+            )
+            return True
+
+        # Thresholds did not decide -> CP-1 (DoD §3.4), verdict executed as frozen.
+        verdict = await self._consult_cp1(stage, report_path, worktree, target_branch)
+        return self._execute_cp1_verdict(stage, worktree, verdict, iteration)
+
+    def _risk_cfg(self, stage: Stage):
+        rc = self._cfg.risk_classes.get(stage.risk_class)
+        if rc is None:
+            raise ConfigError(
+                f"stage {stage.id!r} has unknown risk_class {stage.risk_class!r}"
+            )
+        return rc
+
+    def _validator_role(self, stage: Stage) -> str:
+        return self._risk_cfg(stage).validator
+
+    async def _consult_cp1(
+        self, stage: Stage, report_path: Path, worktree: Path, target_branch: str
+    ) -> Verdict:
+        """Assemble CP-1 inputs exactly per the config registry declaration."""
+        cp = _cp_point(self._cfg, CP1_ID)
+        spec_ref = fdb.latest_artifact(
+            self._db.read(), Level.STAGE.value, stage.id, "spec"
+        )
+        spec_text = (
+            _read_text(worktree / spec_ref.path, what="spec artifact")
+            if spec_ref is not None
+            else ""
+        )
+        sources = {
+            "validation_report": _read_text(report_path, what="validation report"),
+            "diff_digest": await self._wt.diff_digest(
+                worktree, target_branch, cp.max_input_bytes
+            ),
+            "spec": spec_text,
+        }
+        unknown = [key for key in cp.inputs if key not in sources]
+        if unknown:
+            raise ConfigError(
+                f"consultation point {cp.id} declares inputs {unknown} that the"
+                " stage executor cannot assemble"
+            )
+        inputs = {key: sources[key] for key in cp.inputs}
+        return await self._consultor.consult(
+            cp.id, unit_level=Level.STAGE.value, unit_id=stage.id, inputs=inputs
+        )
+
+    def _execute_cp1_verdict(
+        self, stage: Stage, worktree: Path, verdict: Verdict, iteration: int
+    ) -> bool:
+        """DoD §3.4 closed set — every verdict executable, never silently collapsed."""
+        value = verdict.value
+        base_payload = {
+            "verdict": value,
+            "fallback_used": verdict.fallback_used,
+            "consultation_id": verdict.consultation_id,
+            "iteration": iteration,
+        }
+        if value == "continue_session":
+            role = _builder_role(self._cfg, stage.risk_class)
+            conn = self._db.read()
+            session_id = fdb.last_session_id(
+                conn, unit_level=Level.STAGE.value, unit_id=stage.id, role=role
+            )
+            route = self._cfg.models[role]
+            downgrade_reason: str | None = None
+            if route.cli not in RESUME_VERIFIED_CLIS:
+                downgrade_reason = f"route cli {route.cli!r} lacks verified resume (OPEN-3)"
+            elif session_id is None:
+                downgrade_reason = "no finalized builder session to resume"
+            if downgrade_reason is not None:
+                def downgrade(tx: sqlite3.Connection) -> None:
+                    fdb.insert_event(
+                        tx,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        event_type="verdict_downgraded",
+                        actor=_ACTOR,
+                        payload={
+                            "verdict": "continue_session",
+                            "executed_as": "rebuild",
+                            "reason": downgrade_reason,
+                        },
+                    )
+
+                self._sm.transition(
+                    Level.STAGE,
+                    stage.id,
+                    StageState.BUILD.value,
+                    actor=_ACTOR,
+                    reason="CP-1 continue_session downgraded to rebuild",
+                    payload=base_payload | {"executed_as": "rebuild"},
+                    coupled=downgrade,
+                )
+                return True
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="CP-1 verdict continue_session",
+                payload=base_payload | {"resume_session": session_id},
+            )
+            return True
+        if value == "rebuild":
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="CP-1 verdict rebuild",
+                payload=base_payload,
+            )
+            return True
+        if value == "respec":
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.SPEC.value,
+                actor=_ACTOR,
+                reason="CP-1 verdict respec",
+                payload=base_payload,
+            )
+            return True
+        if value == "escalate":
+            def coupled(tx: sqlite3.Connection) -> None:
+                if not fdb.open_escalation(
+                    tx, Level.STAGE.value, stage.id, "cp1_verdict"
+                ):
+                    fdb.insert_escalation(
+                        tx,
+                        Escalation(
+                            id=None,
+                            unit_level=Level.STAGE.value,
+                            unit_id=stage.id,
+                            trigger="cp1_verdict",
+                            target="phase_architect",
+                            payload_artifact_id=None,
+                            event_seq=None,
+                            status="open",
+                            resolution=None,
+                            created_at=utc_now(),
+                            resolved_at=None,
+                        ),
+                    )
+
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.ESCALATED.value,
+                actor=_ACTOR,
+                reason="CP-1 verdict escalate",
+                payload=base_payload,
+                coupled=coupled,
+            )
+            return False
+        raise FactoryError(
+            f"CP-1 returned verdict {value!r} outside the executable set"
+        )  # consultation validated the closed set — reaching here is a bug
+
+    async def _step_audit(self, stage: Stage) -> bool:
+        """AUDIT: risk-routed auditors in parallel; the executor (Builder role)
+        triages the union of findings — comply -> BUILD rework, contest ->
+        unresolved-contest escalation, clean -> MERGE_GATE or human gate."""
+        worktree = self._worktree(stage)
+        unit_dir = self._unit_dir(worktree, stage)
+        rc = self._risk_cfg(stage)
+        roles = list(rc.audits)
+        if not roles:
+            raise FactoryError(f"stage {stage.id} entered AUDIT with no audit roles")
+
+        existing_open = fdb.findings(self._db.read(), stage.id, ("open",))
+        if not existing_open:
+            await asyncio.gather(
+                *(
+                    self._run_step_agent(
+                        stage, role, self._audit_prompt(stage, role, worktree), cwd=worktree
+                    )
+                    for role in roles
+                )
+            )
+            if await self._apply_thresholds(stage, worktree):
+                return False
+            to_commit: list[Path] = []
+            parsed: list[tuple[str, Path, Path, list[dict]]] = []
+            for role in roles:
+                report = unit_dir / STAGE_ARTIFACTS["audit_report"].replace("<role>", role)
+                sidecar = report.with_suffix(".json")
+                if not report.is_file():
+                    raise ArtifactContractError(
+                        f"auditor {role} produced no report at {report}"
+                    )
+                findings = _read_findings_sidecar(sidecar, auditor_role=role)
+                parsed.append((role, report, sidecar, findings))
+                to_commit += [report, sidecar]
+            sha = await self._commit_unit_paths(
+                stage, worktree, to_commit, f"stage {stage.id}: audit reports"
+            )
+            with self._db.transaction() as conn:
+                for role, report, sidecar, findings in parsed:
+                    ref = register_artifact(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        kind="audit_report",
+                        repo="workspace",
+                        repo_root=worktree,
+                        path=report,
+                        git_commit=sha,
+                    )
+                    register_artifact(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        kind="audit_report",
+                        repo="workspace",
+                        repo_root=worktree,
+                        path=sidecar,
+                        git_commit=sha,
+                    )
+                    now = utc_now()
+                    for finding in findings:
+                        fdb.insert_finding(
+                            conn,
+                            Finding(
+                                id=None,
+                                stage_id=stage.id,
+                                auditor_role=role,
+                                finding_ref=finding["ref"],
+                                severity=finding.get("severity"),
+                                report_artifact_id=ref.id,
+                                status="open",
+                                contest_artifact_id=None,
+                                resolved_by=None,
+                                created_at=now,
+                                updated_at=now,
+                            ),
+                        )
+            existing_open = fdb.findings(self._db.read(), stage.id, ("open",))
+
+        if not existing_open:
+            return await self._leave_clean_audit(stage, worktree)
+
+        # Executor triage of the union of findings (DoD §7).
+        builder = _builder_role(self._cfg, stage.risk_class)
+        await self._run_step_agent(
+            stage,
+            builder,
+            self._respond_prompt(stage, existing_open, worktree),
+            cwd=worktree,
+        )
+        if await self._apply_thresholds(stage, worktree):
+            return False
+        response_path = unit_dir / "findings-response.json"
+        responses = _read_response_sidecar(
+            response_path, [f.finding_ref for f in existing_open]
+        )
+        sha = await self._commit_unit_paths(
+            stage, worktree, [response_path], f"stage {stage.id}: audit response"
+        )
+        contested = [f for f in existing_open if responses[f.finding_ref]["action"] == "contest"]
+        complied = [f for f in existing_open if responses[f.finding_ref]["action"] == "comply"]
+
+        def couple_statuses(conn: sqlite3.Connection) -> None:
+            response_ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="contest_rationale",
+                repo="workspace",
+                repo_root=worktree,
+                path=response_path,
+                git_commit=sha,
+            )
+            for finding in existing_open:
+                action = responses[finding.finding_ref]["action"]
+                assert finding.id is not None
+                if action == "comply":
+                    fdb.set_finding_status(
+                        conn, finding.id, "complied", resolved_by="executor"
+                    )
+                elif action == "duplicate":
+                    fdb.set_finding_status(
+                        conn, finding.id, "duplicate", resolved_by="executor"
+                    )
+                else:
+                    fdb.set_finding_status(
+                        conn,
+                        finding.id,
+                        "contested",
+                        contest_artifact_id=response_ref.id,
+                    )
+            if contested and not fdb.open_escalation(
+                conn, Level.STAGE.value, stage.id, "unresolved_contest"
+            ):
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        trigger="unresolved_contest",
+                        target="phase_architect",
+                        payload_artifact_id=response_ref.id,
+                        event_seq=None,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        if contested:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.ESCALATED.value,
+                actor=_ACTOR,
+                reason="contested audit finding(s) escalate to the phase architect",
+                payload={"contested": [f.finding_ref for f in contested]},
+                coupled=couple_statuses,
+            )
+            return False
+        if complied:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="executor complies with audit finding(s) — rework",
+                payload={"complied": [f.finding_ref for f in complied]},
+                coupled=couple_statuses,
+            )
+            return True
+        # Only duplicates: close them and leave AUDIT clean.
+        with self._db.transaction() as conn:
+            couple_statuses(conn)
+        return await self._leave_clean_audit(stage, worktree)
+
+    async def _leave_clean_audit(self, stage: Stage, worktree: Path) -> bool:
+        """Findings closed: MERGE_GATE, or the §9 human gate for critical stages."""
+        rc = self._risk_cfg(stage)
+        if not rc.human_gate:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.MERGE_GATE.value,
+                actor=_ACTOR,
+                reason="findings closed, no human gate",
+            )
+            return True
+        await self._enter_awaiting_human(
+            stage,
+            worktree,
+            from_reason="findings closed, critical human gate (DoD §9)",
+            gate_kind="critical_stage",
+        )
+        return False
+
+    async def _enter_awaiting_human(
+        self, stage: Stage, worktree: Path, *, from_reason: str, gate_kind: str
+    ) -> None:
+        """Write + register the decision-request artifact, insert the pending
+        decision row, transition to AWAITING_HUMAN — then publish (off-tx)."""
+        unit_dir = self._unit_dir(worktree, stage)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        path = unit_dir / "decision-request.md"
+        options = " | ".join(sorted(_STAGE_ANSWERS))
+        path.write_text(
+            f"# Decision request — stage {stage.id}\n\n"
+            f"Gate: {gate_kind}\nReason: {from_reason}\n\n"
+            f"Artifacts: see `_factory/stages/{stage.id}/` on branch"
+            f" `{stage.branch}`.\n\nAnswer with one of: {options}\n",
+            encoding="utf-8",
+        )
+        # Committed BEFORE the recording tx (§7 fixed step sequence) — an
+        # uncommitted request file would later trip the §3.1 BUILD-isolation
+        # assertion when the founder routes the stage back to BUILD.
+        sha = await self._commit_unit_paths(
+            stage, worktree, [path], f"stage {stage.id}: decision request"
+        )
+        request_id: int | None = None
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            nonlocal request_id
+            ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="decision_request",
+                repo="workspace",
+                repo_root=worktree,
+                path=path,
+                git_commit=sha,
+            )
+            assert ref.id is not None
+            request_id = fdb.insert_decision_request(
+                conn,
+                DecisionRequest(
+                    id=None,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    gate_kind=gate_kind,
+                    request_artifact_id=ref.id,
+                    status="pending",
+                    answer=None,
+                    answer_artifact_id=None,
+                    created_at=utc_now(),
+                    alerted_at=None,
+                    answered_at=None,
+                ),
+            )
+
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.AWAITING_HUMAN.value,
+            actor=_ACTOR,
+            reason=from_reason,
+            payload={"gate_kind": gate_kind},
+            coupled=coupled,
+        )
+        # Notification I/O strictly OUTSIDE the transaction (§7); the row is
+        # already pending, so a failed publish is caught by the latency alert.
+        await self._publish_decision(request_id, f"Decizie necesară: etapa {stage.name}")
+
+    async def _publish_decision(self, request_id: int | None, title: str) -> None:
+        """Publish a decision request (priority_decision); delivery failure =
+        'alert_delivery_failed' event, state unchanged (§6 NotifyError row)."""
+        link = dashboard_link(self._cfg, f"decision/{request_id}")
+        try:
+            await self._notify.publish(
+                title, link=link, priority=self._notify.priority_decision
+            )
+        except NotifyError as exc:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert_delivery_failed",
+                    actor=_ACTOR,
+                    payload={"decision_request_id": request_id, "error": str(exc)},
+                )
+
+    async def _step_awaiting_human(self, stage: Stage) -> bool:
+        """AWAITING_HUMAN: consume the latest ANSWERED decision for this stage;
+        an unknown answer is reported and leaves the stage blocked (Doctrine §7)."""
+        decision = _latest_decision(self._db.read(), Level.STAGE.value, stage.id)
+        if decision is None or decision.status != "answered" or decision.answer is None:
+            return False
+        target = _STAGE_ANSWERS.get(decision.answer)
+        if target is None:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "unknown_decision_answer",
+                        "decision_request_id": decision.id,
+                        "answer": decision.answer,
+                        "known": sorted(_STAGE_ANSWERS),
+                    },
+                )
+            return False
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            target.value,
+            actor="founder",
+            reason=f"human gate answered: {decision.answer}",
+            payload={"decision_request_id": decision.id, "answer": decision.answer},
+        )
+        return True
+
+    async def _step_escalated(self, stage: Stage) -> bool:
+        """ESCALATED: blocked while any escalation is open; on resolution,
+        archive sentinels (§5.4), settle contested findings, route per the
+        resolution vocabulary."""
+        conn = self._db.read()
+        if _open_escalation_count(conn, Level.STAGE.value, stage.id) > 0:
+            return False
+        last = _latest_resolved_escalation(conn, Level.STAGE.value, stage.id)
+        if last is None:
+            return False  # escalated without a row = operator surgery; stay put
+        target = _STAGE_RESOLUTIONS.get(last.resolution or "")
+        if target is None:
+            with self._db.transaction() as tx:
+                fdb.insert_event(
+                    tx,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "unknown_escalation_resolution",
+                        "escalation_id": last.id,
+                        "resolution": last.resolution,
+                        "known": sorted(_STAGE_RESOLUTIONS),
+                    },
+                )
+            return False
+        if stage.worktree_path:
+            await self._archive_sentinels(stage, Path(stage.worktree_path), last)
+
+        request_id: int | None = None
+
+        def coupled(tx: sqlite3.Connection) -> None:
+            # Contested findings settle with the architect's routing (§5.2
+            # Resolve): rework targets sustain the finding; a VALIDATE re-entry
+            # means the contest prevailed.
+            status = (
+                "overruled" if target is StageState.VALIDATE else "sustained"
+            )
+            if target in (StageState.BUILD, StageState.SPEC, StageState.VALIDATE):
+                for finding in fdb.findings(tx, stage.id, ("contested",)):
+                    assert finding.id is not None
+                    fdb.set_finding_status(
+                        tx, finding.id, status, resolved_by="phase_architect"
+                    )
+            if target is StageState.AWAITING_HUMAN:
+                # §9.4 product trade-off: the gate needs a decision request —
+                # inserted in the SAME tx as the transition, so the unit can
+                # never sit in AWAITING_HUMAN with only a stale answered
+                # decision to (mis)consume.
+                nonlocal request_id
+                request_id = self._insert_escalation_decision(tx, stage, last)
+
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            target.value,
+            actor="phase_architect",
+            reason=f"escalation resolved: {last.resolution}",
+            payload={"escalation_id": last.id, "resolution": last.resolution},
+            coupled=coupled,
+        )
+        if request_id is not None:
+            await self._publish_decision(
+                request_id, f"Decizie necesară (escaladare): etapa {stage.name}"
+            )
+        return True
+
+    def _insert_escalation_decision(
+        self, tx: sqlite3.Connection, stage: Stage, escalation: Escalation
+    ) -> int:
+        """Insert the escalation-tradeoff decision request (in the caller's tx),
+        anchored on the best available artifact (payload -> spec)."""
+        payload_ref = escalation.payload_artifact_id
+        if payload_ref is None:
+            latest = fdb.latest_artifact(
+                tx, Level.STAGE.value, stage.id, "escalation_payload"
+            )
+            payload_ref = latest.id if latest else None
+        if payload_ref is None:
+            spec = fdb.latest_artifact(tx, Level.STAGE.value, stage.id, "spec")
+            payload_ref = spec.id if spec else None
+        if payload_ref is None:
+            raise FactoryError(
+                f"stage {stage.id}: no artifact to anchor the escalation"
+                " trade-off decision request"
+            )
+        return fdb.insert_decision_request(
+            tx,
+            DecisionRequest(
+                id=None,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                gate_kind="escalation_tradeoff",
+                request_artifact_id=payload_ref,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+
+    async def _archive_sentinels(
+        self, stage: Stage, worktree: Path, escalation: Escalation
+    ) -> None:
+        """§5.4 sentinel lifecycle: archive (rename + commit) any present
+        sentinel BEFORE re-running steps — a stale sentinel must not re-fire,
+        while a NEW one written after rework fires again by design."""
+        unit_dir = self._unit_dir(worktree, stage)
+        renamed = False
+        for kind in detect_sentinels(unit_dir):
+            src = unit_dir / STAGE_ARTIFACTS[kind]
+            dst = src.with_name(f"{src.stem}.resolved-{escalation.id}.md")
+            src.rename(dst)
+            renamed = True
+        if renamed:
+            # Commit the whole unit artifact dir: it stages the rename pair even
+            # when the sentinel was never tracked (agents write it uncommitted —
+            # a vanished untracked path would fail a per-file git add).
+            await self._commit_unit_paths(
+                stage,
+                worktree,
+                [unit_dir],
+                f"stage {stage.id}: archive resolved sentinel(s)",
+            )
+
+    # -------------------------------------------------------------- merge gate
+
+    async def _step_merge_gate(self, stage: Stage) -> bool:
+        """MERGE_GATE: Tier 1 (mechanical rebase+suite) then the §3.1 Tier-2
+        contract, then the serialized integration merge."""
+        phase, project, repo_root, target_branch = self._context(stage)
+        worktree = self._worktree(stage)
+        test_cmd = _test_cmd(project)
+        started_at = utc_now()
+        tier1 = await self._wt.tier1_gate(
+            worktree, target_branch, test_cmd, self._cfg.process.test_suite_timeout_s
+        )
+        with self._db.transaction() as conn:
+            # §4 tier1_gate contract: the suite is registered as a kind='tests'
+            # process (final row — the gate already ran it to completion).
+            fdb.insert_process(
+                conn,
+                ProcessRecord(
+                    id=None,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    kind="tests",
+                    role="test_suite",
+                    cp_id=None,
+                    session_id=None,
+                    pid=None,
+                    cmdline=shlex.join(test_cmd),
+                    cwd=str(worktree),
+                    state="exited",
+                    exit_code=1 if tier1.tests_failed else 0,
+                    ndjson_log_path=tier1.test_output_path,
+                    spawned_at=started_at,
+                    heartbeat_at=None,
+                    ended_at=utc_now(),
+                ),
+            )
+            fdb.insert_event(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                event_type="tier1_gate",
+                actor=_ACTOR,
+                payload={
+                    "passed": tier1.passed,
+                    "rebase_conflict": tier1.rebase_conflict,
+                    "tests_failed": tier1.tests_failed,
+                    "test_output_path": tier1.test_output_path,
+                },
+            )
+
+        if tier1.rebase_conflict:
+            # Conflict payload routed back to the owning unit (DoD §5.1).
+            unit_dir = self._unit_dir(worktree, stage)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            conflict_path = unit_dir / "tier1-conflict.md"
+            conflict_path.write_text(tier1.conflict_payload, encoding="utf-8")
+            sha = await self._commit_unit_paths(
+                stage, worktree, [conflict_path], f"stage {stage.id}: tier1 conflict"
+            )
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="Tier-1 rebase conflict routed back",
+                payload={"conflict_artifact": str(conflict_path)},
+                coupled=lambda conn: register_artifact(
+                    conn,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    kind="tier1_conflict",
+                    repo="workspace",
+                    repo_root=worktree,
+                    path=conflict_path,
+                    git_commit=sha,
+                ),
+            )
+            return True
+        if tier1.tests_failed:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="Tier-1 test suite failed",
+                payload={"test_output_path": tier1.test_output_path},
+            )
+            return True
+
+        # Rebase rewrote history: re-resolve this stage's artifact commits at
+        # the new head (§4 tier1_gate caller duty) — mechanical, same path+sha.
+        code, head_out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git rev-parse HEAD failed in {worktree}: {err.strip()}")
+        new_head = head_out.strip()
+        with self._db.transaction() as conn:
+            updated = _reresolve_artifact_commits(
+                conn, Level.STAGE.value, stage.id, worktree, new_head
+            )
+            fdb.insert_event(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                event_type="artifact_commits_reresolved",
+                actor=_ACTOR,
+                payload={"new_head": new_head, "updated": updated},
+            )
+
+        findings = await self._tier2(stage, phase, worktree, repo_root, target_branch)
+        if findings is None:
+            return False  # a threshold trigger decided during Tier 2 — escalated
+        if findings:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="Tier-2 finding(s) routed back",
+                payload={"finding_refs": [f["ref"] for f in findings]},
+            )
+            return True
+
+        try:
+            merge_sha = await self._wt.integrate(
+                repo_root, stage.branch or f"stage/{stage.id}", target_branch
+            )
+        except StaleGateError:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="stale_gate",
+                    actor=_ACTOR,
+                    payload={"target_branch": target_branch},
+                )
+            return True  # loop re-enters MERGE_GATE -> re-gate against new HEAD
+
+        def close_findings(conn: sqlite3.Connection) -> None:
+            # Previously routed-back Tier-2 findings are now reworked and the
+            # gate re-ran clean: mechanical closure (§5.2 Resolve, comply path).
+            for finding in fdb.findings(conn, stage.id, ("open",)):
+                if finding.auditor_role == "integration_validator":
+                    assert finding.id is not None
+                    fdb.set_finding_status(
+                        conn, finding.id, "complied", resolved_by="executor"
+                    )
+
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.DONE.value,
+            actor=_ACTOR,
+            reason="Tier 1 + Tier 2 passed, merged",
+            payload={"merge_commit": merge_sha},
+            coupled=close_findings,
+        )
+        await self._remove_worktree_after_done(stage, repo_root, worktree)
+        return True
+
+    async def _remove_worktree_after_done(
+        self, stage: Stage, repo_root: Path, worktree: Path
+    ) -> None:
+        """Post-DONE cleanup; failure is reported as an event, never an
+        exception (the stage IS merged — cleanup must not un-done it)."""
+        try:
+            await self._wt.remove(repo_root, worktree)
+        except GitError as exc:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={"kind": "worktree_remove_failed", "error": str(exc)},
+                )
+
+    async def _tier2(
+        self, stage: Stage, phase: Phase, worktree: Path, repo_root: Path, target_branch: str
+    ) -> list[dict] | None:
+        """§3.1 Tier-2 invocation contract: contracts in force + phase plan +
+        FULL diff of the gating unit + full diffs of every sibling merged since
+        contract freeze — run in an isolated scratch worktree; findings land in
+        audit_findings. Returns None when a threshold trigger (e.g. the
+        validator's declared-failure sentinel) escalated the stage mid-gate."""
+        max_bytes = self._cfg.process.tier2_max_diff_bytes_per_unit
+        contracts = self._collect_dir_texts(worktree / "_factory" / "contracts")
+        plan_dir = unit_artifact_dir(worktree, Level.PHASE, phase.id)
+        plan_texts = self._collect_dir_texts(plan_dir)
+        full_diff = await self._wt.full_diff(worktree, target_branch, max_bytes)
+        since_ref = self._contract_freeze_commit(phase)
+        sibling_diffs = await self._wt.merged_unit_diffs(
+            repo_root, target_branch, since_ref, max_bytes
+        )
+        sibling_diffs = {uid: d for uid, d in sibling_diffs.items() if uid != stage.id}
+
+        branch = stage.branch or f"stage/{stage.id}"
+        scratch = await self._wt.create(
+            repo_root, f"{stage.id}-tier2", branch, branch, new_branch=False
+        )
+        prompt = self._tier2_prompt(
+            stage, contracts, plan_texts, full_diff, sibling_diffs
+        )
+        await self._run_step_agent(stage, "integration_validator", prompt, cwd=scratch)
+        if await self._apply_thresholds(stage, worktree):
+            return None  # e.g. validator declared failure mid-gate — escalated
+        scratch_dir = self._unit_dir(scratch, stage)
+        report = scratch_dir / "integration-report.md"
+        sidecar = scratch_dir / "integration-report.json"
+        if not sidecar.is_file():
+            raise ArtifactContractError(
+                f"integration validator produced no findings sidecar at {sidecar}"
+            )
+        findings = _read_findings_sidecar(sidecar, auditor_role="integration_validator")
+        # Only the report crosses into the stage worktree (§3.1 isolation).
+        unit_dir = self._unit_dir(worktree, stage)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        copied = [unit_dir / report.name, unit_dir / sidecar.name]
+        if report.is_file():
+            shutil.copyfile(report, copied[0])
+        else:
+            copied[0].write_text("(no prose report)\n", encoding="utf-8")
+        shutil.copyfile(sidecar, copied[1])
+        sha = await self._commit_unit_paths(
+            stage, worktree, copied, f"stage {stage.id}: tier2 report"
+        )
+        await self._wt.remove(repo_root, scratch)
+        with self._db.transaction() as conn:
+            ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="audit_report",
+                repo="workspace",
+                repo_root=worktree,
+                path=copied[1],
+                git_commit=sha,
+            )
+            now = utc_now()
+            for finding in findings:
+                fdb.insert_finding(
+                    conn,
+                    Finding(
+                        id=None,
+                        stage_id=stage.id,
+                        auditor_role="integration_validator",
+                        finding_ref=finding["ref"],
+                        severity=finding.get("severity"),
+                        report_artifact_id=ref.id,
+                        status="open",
+                        contest_artifact_id=None,
+                        resolved_by=None,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                )
+            fdb.insert_event(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                event_type="tier2_gate",
+                actor=_ACTOR,
+                payload={
+                    "findings": [f["ref"] for f in findings],
+                    "siblings": sorted(sibling_diffs),
+                },
+            )
+        return findings
+
+    def _contract_freeze_commit(self, phase: Phase) -> str:
+        """The contract-freeze commit = the commit that captured the phase plan
+        sidecar (PLANNING -> CONTRACTS_FROZEN registration)."""
+        ref = fdb.latest_artifact(
+            self._db.read(), Level.PHASE.value, phase.id, "phase_plan_sidecar"
+        )
+        if ref is None or not ref.git_commit:
+            raise ArtifactContractError(
+                f"phase {phase.id} has no committed phase-plan sidecar — the"
+                " Tier-2 sibling window (since contract freeze) is undefined"
+            )
+        return ref.git_commit
+
+    def _collect_dir_texts(self, directory: Path) -> dict[str, str]:
+        if not directory.is_dir():
+            return {}
+        texts: dict[str, str] = {}
+        for path in sorted(directory.rglob("*")):
+            if path.is_file():
+                texts[str(path.relative_to(directory))] = _read_text(
+                    path, what=f"file under {directory}"
+                )
+        return texts
+
+    # ----------------------------------------------------------------- prompts
+
+    def _layout_note(self, stage: Stage) -> str:
+        return (
+            f"Stage artifact directory (frozen layout): _factory/stages/{stage.id}/ — "
+            "if you cannot proceed, write _DECLARED_FAILURE.md there instead of guessing; "
+            "if a frozen contract must change, STOP and write _CONTRACT_CHANGE_REQUEST.md."
+        )
+
+    def _acceptance_text(self, stage: Stage, phase: Phase, worktree: Path) -> str:
+        plan_path = (
+            unit_artifact_dir(worktree, Level.PHASE, phase.id)
+            / PHASE_ARTIFACTS["phase_plan_sidecar"]
+        )
+        plan_stage_id = stage.id.removeprefix(f"{phase.id}.")
+        if plan_path.is_file():
+            try:
+                plan = read_phase_plan(plan_path, set(self._cfg.risk_classes))
+            except ArtifactContractError:
+                return "(phase plan unreadable — see _factory/phases/)"
+            for ps in plan.stages:
+                if ps.id == plan_stage_id:
+                    return ps.acceptance
+        return "(acceptance criteria: see the phase plan under _factory/phases/)"
+
+    def _spec_prompt(self, stage: Stage, phase: Phase, worktree: Path) -> str:
+        return (
+            f"You are the Spec Agent for stage '{stage.id}' ({stage.name}), risk class "
+            f"{stage.risk_class}, of phase '{phase.id}'.\n"
+            f"Acceptance criteria: {self._acceptance_text(stage, phase, worktree)}\n"
+            "Contracts in force are read-only under _factory/contracts/.\n"
+            f"Write the spec to _factory/stages/{stage.id}/spec.md — depth scaled to the "
+            "risk class, test-first.\n" + self._layout_note(stage)
+        )
+
+    def _build_prompt(self, stage: Stage, worktree: Path, entry_payload: dict) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        context = ""
+        reason = entry_payload.get("reason")
+        if reason:
+            context = f"\nRework context: {reason}."
+        extras = []
+        if (Path(worktree) / unit_rel / "validation-report.md").is_file():
+            extras.append(f"{unit_rel}/validation-report.md")
+        if (Path(worktree) / unit_rel / "tier1-conflict.md").is_file():
+            extras.append(f"{unit_rel}/tier1-conflict.md")
+        if (Path(worktree) / unit_rel / "integration-report.md").is_file():
+            extras.append(f"{unit_rel}/integration-report.md")
+        if extras:
+            context += "\nRead first: " + ", ".join(extras) + "."
+        return (
+            f"You are the Builder for stage '{stage.id}' ({stage.name}).\n"
+            f"Implement EXACTLY the spec at {unit_rel}/spec.md; verify your own work "
+            "before finishing (run what you can). Do NOT modify _factory/contracts/ "
+            "(a needed change = _CONTRACT_CHANGE_REQUEST.md + stop). You may write "
+            f"{unit_rel}/build-notes.md.{context}\n" + self._layout_note(stage)
+        )
+
+    def _validate_prompt(self, stage: Stage, scratch: Path) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        return (
+            f"You are the Validator for stage '{stage.id}' ({stage.name}); clean context.\n"
+            f"Derive tests INDEPENDENTLY from the spec at {unit_rel}/spec.md (never from "
+            "the implementation), run them here in this isolated checkout, then write:\n"
+            f"- {unit_rel}/validation-report.md (human-readable findings)\n"
+            f'- {unit_rel}/validation-report.json — EXACTLY {{"failing": N, "passing": N, '
+            '"total": N}} (machine-read; malformed = contract violation).\n'
+            "Your derived test files stay HERE — they are never copied to the stage "
+            "worktree.\n" + self._layout_note(stage)
+        )
+
+    def _audit_prompt(self, stage: Stage, role: str, worktree: Path) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        return (
+            f"You are auditor '{role}' for stage '{stage.id}' ({stage.name}, risk class "
+            f"{stage.risk_class}).\nAudit the implementation against {unit_rel}/spec.md "
+            "and the contracts under _factory/contracts/. Cite concrete locations.\n"
+            f"Write {unit_rel}/audit-{role}.md (prose) and {unit_rel}/audit-{role}.json — "
+            'EXACTLY {"findings": [{"ref": "<id>", "severity": "...", "summary": "...", '
+            '"location": "..."}]} (empty list = clean).\n' + self._layout_note(stage)
+        )
+
+    def _respond_prompt(self, stage: Stage, findings: Sequence[Finding], worktree: Path) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        listing = "\n".join(
+            f"- {f.finding_ref} (by {f.auditor_role}, severity {f.severity or 'n/a'})"
+            for f in findings
+        )
+        return (
+            f"You are the stage executor for '{stage.id}'. Triage the union of audit "
+            f"findings (deduplicate overlaps):\n{listing}\n"
+            f"Reports: {unit_rel}/audit-*.md. For EVERY finding ref above answer in "
+            f"{unit_rel}/findings-response.json — EXACTLY "
+            '{"responses": [{"ref": "...", "action": "comply|contest|duplicate", '
+            '"rationale": "..."}]}. comply = you will rework; contest = reasoned '
+            "disagreement (logged, escalates); duplicate = covered by another finding.\n"
+            + self._layout_note(stage)
+        )
+
+    def _tier2_prompt(
+        self,
+        stage: Stage,
+        contracts: Mapping[str, str],
+        plan_texts: Mapping[str, str],
+        full_diff: str,
+        sibling_diffs: Mapping[str, str],
+    ) -> str:
+        max_bytes = self._cfg.process.tier2_max_diff_bytes_per_unit
+        parts = [
+            f"You are the Integration Validator at the merge gate of stage '{stage.id}' "
+            "(clean context). Check contract conformance IN SUBSTANCE, cross-boundary "
+            "invariant violations, duplicate/divergent implementations, and assumptions "
+            "contradicted between units. Cite concrete locations.",
+            "\n== CONTRACTS IN FORCE ==",
+        ]
+        for name, text in contracts.items():
+            parts.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
+        parts.append("\n== PHASE PLAN ==")
+        for name, text in plan_texts.items():
+            parts.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
+        parts.append(f"\n== FULL DIFF OF GATING UNIT {stage.id} ==\n{full_diff}")
+        parts.append("\n== FULL DIFFS OF SIBLINGS MERGED SINCE CONTRACT FREEZE ==")
+        if sibling_diffs:
+            for unit_id, diff in sorted(sibling_diffs.items()):
+                parts.append(f"--- merged unit {unit_id} ---\n{diff}")
+        else:
+            parts.append("(none merged since contract freeze)")
+        unit_rel = f"_factory/stages/{stage.id}"
+        parts.append(
+            f"\nWrite {unit_rel}/integration-report.md (prose) and "
+            f"{unit_rel}/integration-report.json — EXACTLY "
+            '{"findings": [{"ref": "...", "severity": "...", "summary": "...", '
+            '"location": "..."}]} (empty list = no findings).\n' + self._layout_note(stage)
+        )
+        return "\n".join(parts)
+
+
+# ----------------------------------------------------------------- PhaseExecutor
+
+
+class PhaseExecutor:
+    """Implements UnitExecutor(level=PHASE): plan -> freeze contracts -> fan out
+    stages -> integrate (§3.2), with strict phase-plan ingestion."""
+
+    level: Level = Level.PHASE
+
+    def __init__(
+        self,
+        db: Database,
+        sm: StateMachine,
+        cfg: FactoryConfig,
+        runner: AgentRunner,
+        wt: WorktreeManager,
+        notify: NtfyPublisher,
+    ) -> None:
+        """Ingests phase-plan.json strictly via artifacts.read_phase_plan (schema +
+        acyclicity validated BEFORE the CONTRACTS_FROZEN→RUNNING transition; failure =
+        ArtifactContractError → escalation) into stages+dag_edges. An LLM-produced plan
+        is never trusted unvalidated (Doctrine §7)."""
+        self._db = db
+        self._sm = sm
+        self._cfg = cfg
+        self._runner = runner
+        self._wt = wt
+        self._notify = notify
+
+    # ---------------------------------------------------------------- protocol
+
+    async def execute(self, unit_id: str) -> None:
+        """Drive one phase until BLOCKED, terminal, or waiting on children."""
+        steps = {
+            PhaseState.PENDING: self._step_dispatch,
+            PhaseState.PLANNING: self._step_planning,
+            PhaseState.CONTRACTS_FROZEN: self._step_ingest,
+            PhaseState.RUNNING: self._step_running,
+            PhaseState.INTEGRATING: self._step_integrating,
+            PhaseState.AWAITING_SIGNOFF: self._step_awaiting_signoff,
+            PhaseState.AWAITING_HUMAN: self._step_awaiting_human,
+            PhaseState.ESCALATED: self._step_escalated,
+        }
+        while True:
+            phase = self._phase(unit_id)
+            step = steps.get(phase.state)
+            if step is None:
+                return
+            if not await step(phase):
+                return
+
+    # ------------------------------------------------------------ shared bits
+
+    def _phase(self, phase_id: str) -> Phase:
+        phase = fdb.get_phase(self._db.read(), phase_id)
+        if phase is None:
+            raise FactoryError(f"unknown phase unit: {phase_id!r}")
+        return phase
+
+    def _branch(self, phase: Phase) -> str:
+        return phase.branch or f"phase/{phase.id}"
+
+    def _worktree(self, phase: Phase) -> Path:
+        """Deterministic phase checkout path (phases carry no worktree column —
+        the path is derived, recomputable state, never authoritative)."""
+        project = _project_for_phase(self._cfg, phase)
+        return Path(project.worktrees_dir) / phase.id
+
+    def _unit_dir(self, root: Path, phase: Phase) -> Path:
+        return unit_artifact_dir(root, Level.PHASE, phase.id)
+
+    def _stage_id(self, phase: Phase, plan_stage_id: str) -> str:
+        """Plan-local stage ids are namespaced by phase (stages.id is a global PK)."""
+        return f"{phase.id}.{plan_stage_id}"
+
+    def _children(self, phase: Phase) -> list[Stage]:
+        stages = fdb.list_units(self._db.read(), Level.STAGE)
+        return [s for s in stages if isinstance(s, Stage) and s.phase_id == phase.id]
+
+    def _escalate(
+        self,
+        phase: Phase,
+        *,
+        trigger: str,
+        target: str,
+        reason: str,
+        payload: dict,
+        event_seq: int | None = None,
+        transition: bool = True,
+    ) -> None:
+        """Escalation row (+ ESCALATED transition when legal from the current
+        state). When the §3.2 table has no ESCALATED edge (CONTRACTS_FROZEN),
+        the row + event still land — visible, paged, never silent."""
+
+        def insert_row(conn: sqlite3.Connection) -> None:
+            if not fdb.open_escalation(conn, Level.PHASE.value, phase.id, trigger):
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=Level.PHASE.value,
+                        unit_id=phase.id,
+                        trigger=trigger,
+                        target=target,
+                        payload_artifact_id=None,
+                        event_seq=event_seq,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        if transition:
+            try:
+                self._sm.transition(
+                    Level.PHASE,
+                    phase.id,
+                    PhaseState.ESCALATED.value,
+                    actor=_ACTOR,
+                    reason=reason,
+                    payload=payload | {"trigger": trigger},
+                    coupled=insert_row,
+                )
+                return
+            except TransitionError:
+                pass  # fall through: record without a state change
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                event_type="escalation",
+                actor=_ACTOR,
+                payload=payload | {"trigger": trigger, "reason": reason},
+            )
+            insert_row(conn)
+
+    async def _detect_phase_sentinels(self, phase: Phase, cwd: Path) -> bool:
+        """§5.4 post-conditions at phase level (no ThresholdEvaluator here — it
+        is stage-scoped by its frozen signature): sentinel file -> event ->
+        escalation to the owning (main) architect. Returns True if escalated."""
+        unit_dir = self._unit_dir(cwd, phase)
+        sentinels = detect_sentinels(unit_dir)
+        if not sentinels:
+            return False
+        for kind in sentinels:
+            event_type, trigger = _SENTINEL_EVENTS[kind]
+            with self._db.transaction() as conn:
+                seq = fdb.insert_event(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type=event_type,
+                    actor="phase_architect",
+                    payload={"sentinel": str(unit_dir / STAGE_ARTIFACTS[kind])},
+                )
+            self._escalate(
+                phase,
+                trigger=trigger,
+                target="main_architect",
+                reason=f"phase-level sentinel: {kind}",
+                payload={"sentinel": kind},
+                event_seq=seq,
+            )
+        return True
+
+    # ------------------------------------------------------------------- steps
+
+    async def _step_dispatch(self, phase: Phase) -> bool:
+        """PENDING -> PLANNING: phase integration branch + checkout off the
+        project integration branch."""
+        project = _project_for_phase(self._cfg, phase)
+        branch = self._branch(phase)
+        path = await self._wt.create(
+            Path(project.workspace), phase.id, branch, project.integration_branch
+        )
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            PhaseState.PLANNING.value,
+            actor=_ACTOR,
+            reason="DAG deps DONE, dispatched",
+            payload={"branch": branch, "worktree": str(path)},
+        )
+        return True
+
+    async def _step_planning(self, phase: Phase) -> bool:
+        """PLANNING: Phase Architect produces phase-plan.md/.json + contracts;
+        the plan is validated BEFORE freezing (a defective plan escalates from
+        PLANNING — CONTRACTS_FROZEN has no ESCALATED edge in §3.2)."""
+        worktree = self._worktree(phase)
+        await self._runner.run_agent(
+            "phase_architect",
+            self._planning_prompt(phase),
+            unit_level=Level.PHASE.value,
+            unit_id=phase.id,
+            cwd=worktree,
+        )
+        if await self._detect_phase_sentinels(phase, worktree):
+            return False
+        unit_dir = self._unit_dir(worktree, phase)
+        plan_md = unit_dir / PHASE_ARTIFACTS["phase_plan"]
+        plan_json = unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"]
+        try:
+            read_phase_plan(plan_json, set(self._cfg.risk_classes))
+            if not plan_md.is_file():
+                raise ArtifactContractError(
+                    f"phase architect produced no {plan_md} for phase {phase.id}"
+                )
+        except ArtifactContractError as exc:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type="artifact_contract_violation",
+                    actor=_ACTOR,
+                    payload={"error": str(exc)},
+                )
+            self._escalate(
+                phase,
+                trigger="artifact_contract",
+                target="main_architect",
+                reason="phase plan failed strict validation",
+                payload={"error": str(exc)},
+            )
+            return False
+
+        contracts_dir = Path(worktree) / "_factory" / "contracts"
+        contract_paths = (
+            sorted(p for p in contracts_dir.rglob("*") if p.is_file())
+            if contracts_dir.is_dir()
+            else []
+        )
+        sha = await commit_paths(
+            worktree,
+            [plan_md, plan_json, *contract_paths],
+            f"phase {phase.id}: plan + frozen contracts",
+            trailers={"Factory-Unit": f"phase/{phase.id}"},
+        )
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            register_artifact(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                kind="phase_plan",
+                repo="workspace",
+                repo_root=worktree,
+                path=plan_md,
+                git_commit=sha,
+            )
+            register_artifact(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                kind="phase_plan_sidecar",
+                repo="workspace",
+                repo_root=worktree,
+                path=plan_json,
+                git_commit=sha,
+            )
+            for contract in contract_paths:
+                register_artifact(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    kind="contract",
+                    repo="workspace",
+                    repo_root=worktree,
+                    path=contract,
+                    git_commit=sha,
+                )
+
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            PhaseState.CONTRACTS_FROZEN.value,
+            actor=_ACTOR,
+            reason="plan + contracts registered & committed",
+            payload={"contracts": len(contract_paths), "commit": sha},
+            coupled=coupled,
+        )
+        return True
+
+    async def _step_ingest(self, phase: Phase) -> bool:
+        """CONTRACTS_FROZEN -> RUNNING: re-validate the plan strictly, then one
+        tx inserts stage rows + stage DAG + the transition (all-or-nothing)."""
+        worktree = self._worktree(phase)
+        plan_path = self._unit_dir(worktree, phase) / PHASE_ARTIFACTS["phase_plan_sidecar"]
+        try:
+            plan = read_phase_plan(plan_path, set(self._cfg.risk_classes))
+        except ArtifactContractError as exc:
+            # No ESCALATED edge from CONTRACTS_FROZEN (§3.2): record the breach
+            # + open escalation without a state change — paged, never silent.
+            self._escalate(
+                phase,
+                trigger="artifact_contract",
+                target="main_architect",
+                reason="frozen phase plan failed re-validation at ingestion",
+                payload={"error": str(exc)},
+                transition=False,
+            )
+            return False
+
+        now = utc_now()
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            for ps in plan.stages:
+                sid = self._stage_id(phase, ps.id)
+                if fdb.get_stage(conn, sid) is None:  # replan: keep prior rows
+                    fdb.insert_stage(
+                        conn,
+                        Stage(
+                            id=sid,
+                            phase_id=phase.id,
+                            name=ps.name,
+                            risk_class=ps.risk_class,
+                            state=StageState.PENDING,
+                            branch=f"stage/{sid}",
+                            worktree_path=None,
+                            spec_artifact_id=None,
+                            created_at=now,
+                            updated_at=now,
+                        ),
+                    )
+            for from_id, to_id in plan.dag_edges:
+                f, t = self._stage_id(phase, from_id), self._stage_id(phase, to_id)
+                if not _dag_edge_exists(conn, Level.STAGE, f, t):
+                    fdb.insert_dag_edge(conn, Level.STAGE, f, t)
+
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            PhaseState.RUNNING.value,
+            actor=_ACTOR,
+            reason="phase plan validated; stages + DAG ingested",
+            payload={"stages": [self._stage_id(phase, s.id) for s in plan.stages]},
+            coupled=coupled,
+        )
+        return True
+
+    async def _step_running(self, phase: Phase) -> bool:
+        """RUNNING: react to children. A FAILED child (or CANCELLED without a
+        registered replacement) escalates — a failed child must never wedge the
+        phase in RUNNING forever (§3.2); all children TERMINAL_OK (or replaced)
+        -> INTEGRATING; otherwise wait."""
+        children = self._children(phase)
+        if not children:
+            return False  # plan ingested no stages yet — nothing to react to
+        failed = [s.id for s in children if s.state is StageState.FAILED]
+        cancelled = [s.id for s in children if s.state is StageState.CANCELLED]
+        unreplaced = [
+            sid for sid in cancelled if not self._replacement_registered(sid)
+        ]
+        if failed or unreplaced:
+            self._escalate(
+                phase,
+                trigger="child_failed",
+                target="phase_architect",
+                reason="child stage(s) FAILED or CANCELLED without replacement",
+                payload={"failed": failed, "cancelled_unreplaced": unreplaced},
+            )
+            return False
+        if all(
+            s.state is StageState.DONE or s.id in cancelled for s in children
+        ):
+            self._sm.transition(
+                Level.PHASE,
+                phase.id,
+                PhaseState.INTEGRATING.value,
+                actor=_ACTOR,
+                reason="no child stage outside TERMINAL_OK",
+                payload={"children": [s.id for s in children]},
+            )
+            return True
+        return False
+
+    def _replacement_registered(self, stage_id: str) -> bool:
+        """A CANCELLED child blocks integration unless a replacement stage was
+        registered against it (event 'replacement_registered' with the new id)."""
+        return (
+            _last_event_seq_of_type(self._db.read(), stage_id, "replacement_registered")
+            > 0
+        )
+
+    async def _step_integrating(self, phase: Phase) -> bool:
+        """INTEGRATING: the same Tier-1 + Tier-2 gates at phase integration
+        (DoD §3.2 'same merge gates'); pass -> sign-off decision request."""
+        project = _project_for_phase(self._cfg, phase)
+        repo_root = Path(project.workspace)
+        worktree = self._worktree(phase)
+        target = project.integration_branch
+        try:
+            test_cmd = _test_cmd(project)
+        except ConfigError as exc:
+            self._escalate(
+                phase,
+                trigger="internal_error",
+                target="main_architect",
+                reason="phase merge gate cannot run (OPEN-2)",
+                payload={"error": str(exc)},
+            )
+            return False
+        started_at = utc_now()
+        tier1 = await self._wt.tier1_gate(
+            worktree, target, test_cmd, self._cfg.process.test_suite_timeout_s
+        )
+        with self._db.transaction() as conn:
+            fdb.insert_process(
+                conn,
+                ProcessRecord(
+                    id=None,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    kind="tests",
+                    role="test_suite",
+                    cp_id=None,
+                    session_id=None,
+                    pid=None,
+                    cmdline=shlex.join(test_cmd),
+                    cwd=str(worktree),
+                    state="exited",
+                    exit_code=1 if tier1.tests_failed else 0,
+                    ndjson_log_path=tier1.test_output_path,
+                    spawned_at=started_at,
+                    heartbeat_at=None,
+                    ended_at=utc_now(),
+                ),
+            )
+            fdb.insert_event(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                event_type="tier1_gate",
+                actor=_ACTOR,
+                payload={
+                    "passed": tier1.passed,
+                    "rebase_conflict": tier1.rebase_conflict,
+                    "tests_failed": tier1.tests_failed,
+                    "test_output_path": tier1.test_output_path,
+                },
+            )
+        if not tier1.passed:
+            self._escalate(
+                phase,
+                trigger="integration_conflict",
+                target="main_architect",
+                reason="phase Tier-1 gate failed",
+                payload={
+                    "rebase_conflict": tier1.rebase_conflict,
+                    "tests_failed": tier1.tests_failed,
+                    "conflict_payload": _bounded(tier1.conflict_payload, 20000),
+                    "test_output_path": tier1.test_output_path,
+                },
+            )
+            return False
+
+        code, head_out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git rev-parse HEAD failed in {worktree}: {err.strip()}")
+        with self._db.transaction() as conn:
+            _reresolve_artifact_commits(
+                conn, Level.PHASE.value, phase.id, worktree, head_out.strip()
+            )
+
+        findings = await self._tier2(phase, project, worktree, repo_root, target)
+        if findings is None:
+            return False  # validator declared failure — already escalated
+        if findings:
+            self._escalate(
+                phase,
+                trigger="semantic_conflict",
+                target="main_architect",
+                reason="phase Tier-2 finding(s) — architect routes stage rework",
+                payload={"finding_refs": [f["ref"] for f in findings]},
+            )
+            return False
+
+        await self._enter_signoff(phase, worktree)
+        return False  # AWAITING_SIGNOFF is BLOCKED — nothing further to drive
+
+    async def _tier2(
+        self,
+        phase: Phase,
+        project: ProjectCfg,
+        worktree: Path,
+        repo_root: Path,
+        target: str,
+    ) -> list[dict] | None:
+        """Phase-level §3.1 Tier-2 contract on the same code path. The sibling
+        window opens at this phase's fork point from the integration branch
+        (cross-phase contract freeze is a planning artifact in MVP — DoD §3.2
+        scopes phase-level execution as first production use)."""
+        max_bytes = self._cfg.process.tier2_max_diff_bytes_per_unit
+        contracts = {}
+        contracts_dir = Path(worktree) / "_factory" / "contracts"
+        if contracts_dir.is_dir():
+            contracts = {
+                str(p.relative_to(contracts_dir)): _read_text(p, what="contract")
+                for p in sorted(contracts_dir.rglob("*"))
+                if p.is_file()
+            }
+        plan_dir = self._unit_dir(worktree, phase)
+        plan_texts = {
+            p.name: _read_text(p, what="phase plan")
+            for p in sorted(plan_dir.glob("*"))
+            if p.is_file()
+        }
+        full_diff = await self._wt.full_diff(worktree, target, max_bytes)
+        code, base_out, err = await run_git(
+            "merge-base", self._branch(phase), target, cwd=repo_root
+        )
+        if code != 0:
+            raise GitError(
+                f"git merge-base failed in {repo_root}: {(err or base_out).strip()}"
+            )
+        sibling_diffs = await self._wt.merged_unit_diffs(
+            repo_root, target, base_out.strip(), max_bytes
+        )
+        sibling_diffs = {uid: d for uid, d in sibling_diffs.items() if uid != phase.id}
+
+        parts = [
+            f"You are the Integration Validator at the integration gate of phase"
+            f" '{phase.id}' (clean context). Check contract conformance in substance,"
+            " cross-boundary invariants, duplicate/divergent implementations,"
+            " contradicted assumptions. Cite concrete locations.",
+            "\n== CONTRACTS IN FORCE ==",
+            *(f"--- {n} ---\n{_bounded(t, max_bytes)}" for n, t in contracts.items()),
+            "\n== PHASE PLAN ==",
+            *(f"--- {n} ---\n{_bounded(t, max_bytes)}" for n, t in plan_texts.items()),
+            f"\n== FULL DIFF OF PHASE {phase.id} vs {target} ==\n{full_diff}",
+            "\n== FULL DIFFS OF UNITS MERGED INTO THE TARGET SINCE FORK ==",
+        ]
+        if sibling_diffs:
+            parts += [
+                f"--- merged unit {uid} ---\n{diff}"
+                for uid, diff in sorted(sibling_diffs.items())
+            ]
+        else:
+            parts.append("(none)")
+        unit_rel = f"_factory/phases/{phase.id}"
+        parts.append(
+            f"\nWrite {unit_rel}/integration-report.md and {unit_rel}/integration-report.json"
+            ' — EXACTLY {"findings": [{"ref": "...", "severity": "...", "summary": "...",'
+            ' "location": "..."}]} (empty list = no findings). If you cannot proceed,'
+            f" write {unit_rel}/_DECLARED_FAILURE.md instead of guessing."
+        )
+
+        branch = self._branch(phase)
+        scratch = await self._wt.create(
+            repo_root, f"{phase.id}-tier2", branch, branch, new_branch=False
+        )
+        await self._runner.run_agent(
+            "integration_validator",
+            "\n".join(parts),
+            unit_level=Level.PHASE.value,
+            unit_id=phase.id,
+            cwd=scratch,
+        )
+        if await self._detect_phase_sentinels(phase, scratch):
+            return None  # sentinel path already escalated — no second escalation
+        scratch_dir = self._unit_dir(scratch, phase)
+        sidecar_src = scratch_dir / "integration-report.json"
+        if not sidecar_src.is_file():
+            raise ArtifactContractError(
+                f"integration validator produced no findings sidecar at {sidecar_src}"
+            )
+        findings = _read_findings_sidecar(
+            sidecar_src, auditor_role="integration_validator"
+        )
+        unit_dir = self._unit_dir(worktree, phase)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        report_src = scratch_dir / "integration-report.md"
+        report_dst = unit_dir / "integration-report.md"
+        sidecar_dst = unit_dir / "integration-report.json"
+        if report_src.is_file():
+            shutil.copyfile(report_src, report_dst)
+        else:
+            report_dst.write_text("(no prose report)\n", encoding="utf-8")
+        shutil.copyfile(sidecar_src, sidecar_dst)
+        await commit_paths(
+            worktree,
+            [report_dst, sidecar_dst],
+            f"phase {phase.id}: tier2 report",
+            trailers={"Factory-Unit": f"phase/{phase.id}"},
+        )
+        await self._wt.remove(repo_root, scratch)
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                event_type="tier2_gate",
+                actor=_ACTOR,
+                payload={
+                    "findings": [f["ref"] for f in findings],
+                    "siblings": sorted(sibling_diffs),
+                },
+            )
+        return findings
+
+    async def _enter_signoff(self, phase: Phase, worktree: Path) -> None:
+        """Phase merge gates passed -> AWAITING_SIGNOFF + decision request
+        (gate_kind='phase_signoff', DoD §9.3) + founder push."""
+        unit_dir = self._unit_dir(worktree, phase)
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        path = unit_dir / "signoff-request.md"
+        path.write_text(
+            f"# Phase sign-off — {phase.id} ({phase.name})\n\n"
+            "All stages DONE; Tier-1 + Tier-2 phase gates passed.\n"
+            f"Plan + reports: `_factory/phases/{phase.id}/` on `{self._branch(phase)}`.\n\n"
+            "Answer with one of: approved | changes\n",
+            encoding="utf-8",
+        )
+        sha = await commit_paths(
+            worktree,
+            [path],
+            f"phase {phase.id}: sign-off request",
+            trailers={"Factory-Unit": f"phase/{phase.id}"},
+        )
+        request_id: int | None = None
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            nonlocal request_id
+            ref = register_artifact(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                kind="decision_request",
+                repo="workspace",
+                repo_root=worktree,
+                path=path,
+                git_commit=sha,
+            )
+            assert ref.id is not None
+            request_id = fdb.insert_decision_request(
+                conn,
+                DecisionRequest(
+                    id=None,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    gate_kind="phase_signoff",
+                    request_artifact_id=ref.id,
+                    status="pending",
+                    answer=None,
+                    answer_artifact_id=None,
+                    created_at=utc_now(),
+                    alerted_at=None,
+                    answered_at=None,
+                ),
+            )
+
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            PhaseState.AWAITING_SIGNOFF.value,
+            actor=_ACTOR,
+            reason="phase merge gates pass (DoD §9.3)",
+            coupled=coupled,
+        )
+        assert request_id is not None  # coupled ran inside the committed tx
+        await self._publish_signoff_decision(
+            request_id, f"Semnătură de fază necesară: {phase.name}"
+        )
+
+    async def _step_awaiting_signoff(self, phase: Phase) -> bool:
+        """AWAITING_SIGNOFF: 'approved' -> integrate into the project branch +
+        DONE; 'changes' -> RUNNING; unknown answers reported, never guessed."""
+        decision = _latest_decision(self._db.read(), Level.PHASE.value, phase.id)
+        if decision is None or decision.status != "answered" or decision.answer is None:
+            return False
+        project = _project_for_phase(self._cfg, phase)
+        repo_root = Path(project.workspace)
+        if decision.answer == "approved":
+            try:
+                merge_sha = await self._wt.integrate(
+                    repo_root, self._branch(phase), project.integration_branch
+                )
+            except StaleGateError:
+                # Target moved after the gate: §3.2 path back through RUNNING ->
+                # INTEGRATING re-runs the gates mechanically.
+                self._sm.transition(
+                    Level.PHASE,
+                    phase.id,
+                    PhaseState.RUNNING.value,
+                    actor=_ACTOR,
+                    reason="integration target moved since the gate — re-gating",
+                    payload={"decision_request_id": decision.id},
+                )
+                return True
+            self._sm.transition(
+                Level.PHASE,
+                phase.id,
+                PhaseState.DONE.value,
+                actor="founder",
+                reason="founder sign-off",
+                payload={"decision_request_id": decision.id, "merge_commit": merge_sha},
+            )
+            try:
+                await self._wt.remove(repo_root, self._worktree(phase))
+            except GitError as exc:
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level=Level.PHASE.value,
+                        unit_id=phase.id,
+                        event_type="alert",
+                        actor=_ACTOR,
+                        payload={"kind": "worktree_remove_failed", "error": str(exc)},
+                    )
+            return True
+        if decision.answer in ("changes", "changes_requested"):
+            self._sm.transition(
+                Level.PHASE,
+                phase.id,
+                PhaseState.RUNNING.value,
+                actor="founder",
+                reason="sign-off: changes requested",
+                payload={"decision_request_id": decision.id},
+            )
+            return True
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                event_type="alert",
+                actor=_ACTOR,
+                payload={
+                    "kind": "unknown_decision_answer",
+                    "decision_request_id": decision.id,
+                    "answer": decision.answer,
+                    "known": ["approved", "changes"],
+                },
+            )
+        return False
+
+    async def _step_awaiting_human(self, phase: Phase) -> bool:
+        decision = _latest_decision(self._db.read(), Level.PHASE.value, phase.id)
+        if decision is None or decision.status != "answered" or decision.answer is None:
+            return False
+        target = _PHASE_HUMAN_ANSWERS.get(decision.answer)
+        if target is None:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "unknown_decision_answer",
+                        "decision_request_id": decision.id,
+                        "answer": decision.answer,
+                        "known": sorted(_PHASE_HUMAN_ANSWERS),
+                    },
+                )
+            return False
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            target.value,
+            actor="founder",
+            reason=f"human gate answered: {decision.answer}",
+            payload={"decision_request_id": decision.id, "answer": decision.answer},
+        )
+        return True
+
+    async def _step_escalated(self, phase: Phase) -> bool:
+        conn = self._db.read()
+        if _open_escalation_count(conn, Level.PHASE.value, phase.id) > 0:
+            return False
+        last = _latest_resolved_escalation(conn, Level.PHASE.value, phase.id)
+        if last is None:
+            return False
+        target = _PHASE_RESOLUTIONS.get(last.resolution or "")
+        if target is None:
+            with self._db.transaction() as tx:
+                fdb.insert_event(
+                    tx,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "unknown_escalation_resolution",
+                        "escalation_id": last.id,
+                        "resolution": last.resolution,
+                        "known": sorted(_PHASE_RESOLUTIONS),
+                    },
+                )
+            return False
+        request_id: int | None = None
+
+        def coupled(tx: sqlite3.Connection) -> None:
+            if target is PhaseState.AWAITING_HUMAN:
+                # Same crash-safety rule as the stage path: the gate's decision
+                # request lands in the SAME tx as the transition.
+                nonlocal request_id
+                request_id = self._insert_tradeoff_decision(tx, phase)
+
+        self._sm.transition(
+            Level.PHASE,
+            phase.id,
+            target.value,
+            actor="main_architect",
+            reason=f"escalation resolved: {last.resolution}",
+            payload={"escalation_id": last.id, "resolution": last.resolution},
+            coupled=coupled,
+        )
+        if request_id is not None:
+            await self._publish_signoff_decision(
+                request_id, f"Decizie necesară (escaladare): faza {phase.name}"
+            )
+        return True
+
+    def _insert_tradeoff_decision(self, tx: sqlite3.Connection, phase: Phase) -> int:
+        """Escalation-tradeoff decision request for a phase (in the caller's tx,
+        same crash-safety rule as the stage path), anchored on the newest phase
+        artifact — a phase with no artifact yet cannot pose a trade-off."""
+        anchor = None
+        for kind in ("phase_plan_sidecar", "phase_plan", "decision_request", "contract"):
+            ref = fdb.latest_artifact(tx, Level.PHASE.value, phase.id, kind)
+            if ref is not None:
+                anchor = ref.id
+                break
+        if anchor is None:
+            raise FactoryError(
+                f"phase {phase.id}: no artifact to anchor the escalation"
+                " trade-off decision request"
+            )
+        return fdb.insert_decision_request(
+            tx,
+            DecisionRequest(
+                id=None,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                gate_kind="escalation_tradeoff",
+                request_artifact_id=anchor,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+
+    async def _publish_signoff_decision(self, request_id: int, title: str) -> None:
+        try:
+            await self._notify.publish(
+                title,
+                link=dashboard_link(self._cfg, f"decision/{request_id}"),
+                priority=self._notify.priority_decision,
+            )
+        except NotifyError as exc:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert_delivery_failed",
+                    actor=_ACTOR,
+                    payload={"decision_request_id": request_id, "error": str(exc)},
+                )
+
+    # ----------------------------------------------------------------- prompts
+
+    def _planning_prompt(self, phase: Phase) -> str:
+        risk_classes = sorted(self._cfg.risk_classes)
+        unit_rel = f"_factory/phases/{phase.id}"
+        return (
+            f"You are the Phase Architect for phase '{phase.id}' ({phase.name}).\n"
+            "Decompose the phase into stages sized at the upper bound of one-pass "
+            "builder confidence; declare per-stage acceptance criteria and risk class; "
+            "freeze the intra-phase contracts (shared schemas, API signatures, named "
+            "invariants) as files under _factory/contracts/ BEFORE any fan-out.\n"
+            f"Write {unit_rel}/phase-plan.md (rationale) and {unit_rel}/phase-plan.json — "
+            'EXACTLY {"stages": [{"id": "<plan-local-id>", "name": "...", '
+            '"risk_class": "<one of ' + "|".join(risk_classes) + '>", '
+            '"acceptance": "..."}], "dag_edges": [["<from>", "<to>"]]} — '
+            "ids unique, every edge endpoint declared, DAG acyclic.\n"
+            f"If you cannot proceed, write {unit_rel}/_DECLARED_FAILURE.md; a cross-phase "
+            f"contract change needs {unit_rel}/_CONTRACT_CHANGE_REQUEST.md + stop."
+        )
+
+
+# -------------------------------------------------------------------- Scheduler
+
+
+class Scheduler:
+    """Level-agnostic loop over sched categories + dag_edges (design §4); max
+    process.max_parallel_agents concurrent units; crash recovery entry."""
+
+    def __init__(
+        self,
+        db: Database,
+        sm: StateMachine,
+        cfg: FactoryConfig,
+        executors: Mapping[Level, UnitExecutor],
+        notify: NtfyPublisher,
+    ) -> None:
+        """Level-agnostic loop over sched categories + dag_edges; max
+        process.max_parallel_agents concurrent units."""
+        self._db = db
+        self._sm = sm
+        self._cfg = cfg
+        self._executors = dict(executors)
+        self._notify = notify
+        #: Internal worktree manager for recover()'s §5.5b git healing — a
+        #: mechanics helper, not an executor dependency.
+        self._wt = WorktreeManager(cfg)
+        self._tasks: dict[tuple[Level, str], asyncio.Task] = {}
+        #: max events.seq at the end of a unit's last drive — the re-dispatch
+        #: edge trigger (a no-progress unit is not respun until facts change).
+        self._last_seq: dict[tuple[Level, str], int] = {}
+        #: (open escalations, pending decisions) snapshot at last drive end —
+        #: wakes BLOCKED units on resolutions/answers even if the answering
+        #: plumbing wrote no event.
+        self._blocked_snapshot: dict[tuple[Level, str], tuple[int, int]] = {}
+        self._stall_event_logged = False
+        self._stall_published = False
+        #: One alert_delivery_failed event per consecutive-failure streak (the
+        #: retry itself continues every tick; only the event is deduplicated).
+        self._delivery_failed_logged: set[object] = set()
+
+    # ----------------------------------------------------------- liveness files
+
+    def _liveness_path(self) -> Path:
+        return _resolve(self._cfg.factory.home, self._cfg.process.liveness_file)
+
+    def _pid_path(self) -> Path:
+        return _resolve(self._cfg.factory.home, self._cfg.process.pid_file)
+
+    def _touch_liveness(self) -> None:
+        """mtime = last orchestrator tick (the watchdog's staleness input)."""
+        path = self._liveness_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(utc_now() + "\n", encoding="utf-8")
+
+    def _refresh_pidfile(self) -> None:
+        """Pidfile content contract shared with cli/watchdog (§4/watchdog doc):
+        line 1 = pid, line 2 = /proc/<pid>/cmdline with NULs as spaces. The
+        rewrite refreshes mtime in place (same inode — the cli flock survives)."""
+        path = self._pid_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            raw = Path("/proc/self/cmdline").read_bytes()
+            cmdline = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+        except OSError:  # non-/proc platform: pid-only file (watchdog tolerates)
+            cmdline = ""
+        with open(path, "r+" if path.exists() else "w", encoding="utf-8") as fh:
+            fh.seek(0)
+            fh.write(f"{os.getpid()}\n{cmdline}\n")
+            fh.truncate()
+
+    # -------------------------------------------------------------- §5.5 recover
+
+    def recover(self) -> RecoveryReport:
+        """Crash recovery (DoD §12.A2), only under the cli single-instance flock.
+        Touches the liveness file at entry and periodically during the scan (a healthy
+        restart must not page the watchdog). Steps: (a) orphan sweep — kill by PROCESS
+        GROUP, mark 'orphaned' + event; (b) git healing — worktrees.heal_git_state on
+        every known worktree + the integration checkout, `git worktree prune`; then
+        worktree canonicalization: `git status --porcelain` per unit worktree — if dirty
+        (an orphan kept writing until killed), save the dirty diff to ndjson_log_dir as
+        evidence + event, hard-reset + `clean -fd` to the step's base commit (committed
+        git state is the ONLY canonical step input — the idempotency precondition of
+        §5.5d); (c) verify_integrity — abort start on a non-terminal-unit mismatch;
+        BLOCKED/RUNNING units re-enter the queue and resume from SQLite state + on-disk
+        artifacts."""
+        self._touch_liveness()
+        return asyncio.run(self._recover_async())
+
+    async def _recover_async(self) -> RecoveryReport:
+        orphaned, killed_groups = self._orphan_sweep()  # (a)
+        self._touch_liveness()
+        healed, heal_errors, dirty_reset = await self._heal_git()  # (b)
+        self._touch_liveness()
+        checked, warnings = await self._integrity_gate()  # (c)
+        self._touch_liveness()
+        requeued = self._requeue_scan()  # (d) — the loop drives them from disk
+        return RecoveryReport(
+            orphaned=tuple(orphaned),
+            killed_groups=tuple(killed_groups),
+            healed=healed,
+            heal_errors=tuple(heal_errors),
+            dirty_reset=tuple(dirty_reset),
+            integrity_checked=checked,
+            integrity_warnings=warnings,
+            requeued=tuple(requeued),
+        )
+
+    def _orphan_sweep(self) -> tuple[list[int], list[int]]:
+        """§5.5a: every 'spawned'/'running' registry row — pid alive with a
+        matching cmdline (or a dead leader with a live group: our descendants)
+        -> SIGKILL the process GROUP; every such row -> 'orphaned' + event.
+        A live pid with a foreign cmdline is pid reuse — never killed."""
+        conn = self._db.read()
+        rows = fdb.processes_in_state(conn, "spawned") + fdb.processes_in_state(
+            conn, "running"
+        )
+        orphaned: list[int] = []
+        killed: list[int] = []
+        for rec in rows:
+            assert rec.id is not None
+            kill = False
+            if rec.pid is not None:
+                if _pid_alive(rec.pid):
+                    kill = _proc_cmdline_matches(rec.pid, rec.cmdline)
+                else:
+                    kill = _group_alive(rec.pid)  # leader gone, group ours
+            if kill and rec.pid is not None:
+                try:
+                    os.killpg(rec.pid, signal.SIGKILL)
+                    killed.append(rec.pid)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            with self._db.transaction() as tx:
+                fdb.finalize_process(
+                    tx, rec.id, state="orphaned", exit_code=None, ended_at=utc_now()
+                )
+                fdb.insert_event(
+                    tx,
+                    unit_level=rec.unit_level or "factory",
+                    unit_id=rec.unit_id,
+                    event_type="orphaned",
+                    actor=_ACTOR,
+                    payload={
+                        "process_id": rec.id,
+                        "pid": rec.pid,
+                        "role": rec.role,
+                        "group_killed": kill,
+                    },
+                )
+            orphaned.append(rec.id)
+        return orphaned, killed
+
+    def _known_checkouts(self) -> tuple[list[tuple[str, Path]], list[Path]]:
+        """(unit worktrees as (label, path), integration checkouts). Only paths
+        that exist on disk — a configured-but-uncreated workspace has no git
+        state to heal."""
+        conn = self._db.read()
+        unit_worktrees: list[tuple[str, Path]] = []
+        for stage in fdb.list_units(conn, Level.STAGE):
+            assert isinstance(stage, Stage)
+            if stage.worktree_path and Path(stage.worktree_path).is_dir():
+                unit_worktrees.append((f"stage:{stage.id}", Path(stage.worktree_path)))
+        for phase in fdb.list_units(conn, Level.PHASE):
+            assert isinstance(phase, Phase)
+            project = self._cfg.projects.get(phase.project)
+            if project is None:
+                continue
+            path = Path(project.worktrees_dir) / phase.id
+            if path.is_dir():
+                unit_worktrees.append((f"phase:{phase.id}", path))
+        checkouts = [
+            Path(project.workspace)
+            for project in self._cfg.projects.values()
+            if Path(project.workspace).is_dir()
+        ]
+        return unit_worktrees, checkouts
+
+    async def _heal_git(
+        self,
+    ) -> tuple[dict[str, tuple[str, ...]], list[str], list[str]]:
+        unit_worktrees, checkouts = self._known_checkouts()
+        healed: dict[str, tuple[str, ...]] = {}
+        heal_errors: list[str] = []
+        dirty_reset: list[str] = []
+        for checkout in checkouts:
+            try:
+                actions = await self._wt.heal_git_state(checkout)
+                healed[str(checkout)] = tuple(actions)
+            except GitError as exc:
+                heal_errors.append(f"{checkout}: {exc}")
+            code, out, err = await run_git("worktree", "prune", cwd=checkout)
+            if code != 0:
+                heal_errors.append(f"{checkout}: worktree prune: {(err or out).strip()}")
+            self._touch_liveness()
+        for label, worktree in unit_worktrees:
+            try:
+                actions = await self._wt.heal_git_state(worktree)
+                healed[str(worktree)] = tuple(actions)
+                if await self._canonicalize_worktree(label, worktree):
+                    dirty_reset.append(str(worktree))
+            except GitError as exc:
+                heal_errors.append(f"{worktree}: {exc}")
+            self._touch_liveness()
+        return healed, heal_errors, dirty_reset
+
+    async def _canonicalize_worktree(self, label: str, worktree: Path) -> bool:
+        """§5.5b worktree canonicalization: dirty unit worktree -> evidence file
+        in ndjson_log_dir + event, then hard-reset + clean -fd to the step's
+        base commit (= the committed HEAD: every step commits before the tx
+        that records it, §7)."""
+        code, status_out, err = await run_git("status", "--porcelain", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git status failed in {worktree}: {(err or status_out).strip()}")
+        if not status_out.strip():
+            return False
+        code, diff_out, _ = await run_git("diff", "HEAD", cwd=worktree)
+        if code != 0:
+            diff_out = "(git diff HEAD failed)"
+        log_dir = _resolve(self._cfg.factory.home, self._cfg.process.ndjson_log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        evidence = log_dir / f"{new_id('recovery-dirty')}.diff"
+        evidence.write_text(
+            f"# dirty worktree evidence: {label} at {worktree}\n"
+            f"## git status --porcelain\n{status_out}\n## git diff HEAD\n{diff_out}",
+            encoding="utf-8",
+        )
+        level, _, unit_id = label.partition(":")
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=level,
+                unit_id=unit_id,
+                event_type="dirty_worktree_reset",
+                actor=_ACTOR,
+                payload={"worktree": str(worktree), "evidence": str(evidence)},
+            )
+        for args in (("reset", "--hard", "HEAD"), ("clean", "-fd")):
+            code, out, err = await run_git(*args, cwd=worktree)
+            if code != 0:
+                raise GitError(
+                    f"git {' '.join(args)} failed in {worktree}: {(err or out).strip()}"
+                )
+        return True
+
+    async def _integrity_gate(self) -> tuple[int, int]:
+        """§5.5c: verify_integrity over factory + workspace roots; non-terminal
+        mismatch -> alert + IntegrityError (start aborted, no silent repair)."""
+        report = verify_integrity(self._db, self._repo_roots())
+        if report.failures:
+            summary = [
+                f"{i.unit_level}/{i.unit_id} {i.kind} {i.path}: {i.problem}"
+                for i in report.failures
+            ]
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="integrity_failure",
+                    actor=_ACTOR,
+                    payload={"failures": summary[:50], "count": len(summary)},
+                )
+            try:
+                await self._notify.publish(
+                    "Fabrica nu poate porni: integritatea artefactelor a eșuat",
+                    link=dashboard_link(self._cfg, "health"),
+                    priority=self._notify.priority_alert,
+                )
+            except NotifyError as exc:
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert_delivery_failed",
+                        actor=_ACTOR,
+                        payload={"kind": "integrity_failure", "error": str(exc)},
+                    )
+            raise IntegrityError(
+                "artifact integrity check failed for non-terminal unit(s); start "
+                "aborted (no silent repair): " + "; ".join(summary[:10])
+            )
+        return report.checked, len(report.warnings)
+
+    def _repo_roots(self) -> dict[str, Path]:
+        """artifact_refs.repo -> root. 'factory' = factory.home; 'workspace' =
+        the project workspace — unambiguous in MVP (single project); with
+        several configured, the one the DB's phases actually reference."""
+        roots = {"factory": self._cfg.factory.home}
+        projects = self._cfg.projects
+        if len(projects) == 1:
+            roots["workspace"] = Path(next(iter(projects.values())).workspace)
+            return roots
+        referenced = {
+            phase.project
+            for phase in fdb.list_units(self._db.read(), Level.PHASE)
+            if isinstance(phase, Phase)
+        }
+        known = referenced & set(projects)
+        if len(known) == 1:
+            roots["workspace"] = Path(projects[next(iter(known))].workspace)
+            return roots
+        if not known:
+            return roots  # no workspace refs can exist yet
+        raise FactoryError(
+            "cannot map artifact repo 'workspace' to a single project workspace: "
+            f"phases reference projects {sorted(known)}"
+        )
+
+    def _requeue_scan(self) -> list[str]:
+        """§5.5d: units in RUNNING-category states re-enter the queue (the loop
+        re-runs their current step from disk); AWAITING_* stay blocked."""
+        conn = self._db.read()
+        requeued: list[str] = []
+        for level in self._levels():
+            for unit in fdb.list_units(conn, level):
+                category = sched_category(level, unit.state.value, True)
+                if category is SchedCategory.RUNNING:
+                    requeued.append(f"{level.value}:{unit.id}")
+        return requeued
+
+    # ----------------------------------------------------------------- the loop
+
+    async def run_forever(self) -> None:
+        """Main loop, tick = process.loop_tick_s: refresh liveness file + pidfile,
+        dispatch RUNNABLE units, reap finished tasks, fire decision-latency alerts, and
+        run the STALL DETECTOR — non-terminal units exist, nothing RUNNABLE/RUNNING, and
+        no open decision_request/escalation → 'alert' event + ntfy (a wedged factory
+        must page, never idle green — Doctrine §20). One asyncio TaskGroup; ALL db
+        writes happen on this loop thread; notification I/O only via the async
+        NtfyPublisher (never blocks the loop)."""
+        await self._run(stop_when_blocked=False)
+
+    async def run_until_blocked(self) -> None:
+        """Same loop; returns when nothing is RUNNABLE/RUNNING (tests, criterion runs).
+        Quiescence is observed at the dispatch boundary: no live executor task and no
+        unit eligible for (re-)dispatch — i.e. every remaining unit is terminal,
+        WAITING, BLOCKED, or category-RUNNING with no new facts to act on."""
+        await self._run(stop_when_blocked=True)
+
+    async def _run(self, *, stop_when_blocked: bool) -> None:
+        async with asyncio.TaskGroup() as tg:
+            while True:
+                self._touch_liveness()
+                self._refresh_pidfile()
+                self._reap()
+                scan = self._scan_units()
+                await self._stall_detector(scan)
+                await self._decision_latency_alerts()
+                dispatched = self._dispatch(tg, scan)
+                if stop_when_blocked and not self._tasks and dispatched == 0:
+                    return
+                await asyncio.sleep(self._cfg.process.loop_tick_s)
+
+    def _levels(self) -> list[Level]:
+        return sorted(self._executors, key=lambda level: level.value)
+
+    def _reap(self) -> None:
+        for key in [k for k, task in self._tasks.items() if task.done()]:
+            del self._tasks[key]
+
+    def _scan_units(self) -> list[tuple[Level, str, SchedCategory]]:
+        """One categorized pass over all units (feeds dispatch + stall detector)."""
+        conn = self._db.read()
+        scan: list[tuple[Level, str, SchedCategory]] = []
+        for level in self._levels():
+            for unit in fdb.list_units(conn, level):
+                state = unit.state.value
+                deps = (
+                    fdb.deps_done(conn, level, unit.id) if state == "PENDING" else True
+                )
+                scan.append((level, unit.id, sched_category(level, state, deps)))
+        return scan
+
+    def _dispatch(
+        self, tg: asyncio.TaskGroup, scan: list[tuple[Level, str, SchedCategory]]
+    ) -> int:
+        """Dispatch eligible units up to the max_parallel_agents cap. RUNNABLE
+        always dispatches; category-RUNNING re-dispatches when events advanced
+        since its last drive (or it was never driven — crash resume, §5.5d);
+        BLOCKED re-dispatches additionally when its open-escalation/pending-
+        decision counts changed (answers may arrive without events)."""
+        conn = self._db.read()
+        cap = self._cfg.process.max_parallel_agents
+        seq = _max_event_seq(conn)
+        dispatched = 0
+        for level, unit_id, category in scan:
+            key = (level, unit_id)
+            if key in self._tasks:
+                continue
+            if category in (
+                SchedCategory.WAITING,
+                SchedCategory.TERMINAL_OK,
+                SchedCategory.TERMINAL_FAIL,
+            ):
+                continue
+            if category is SchedCategory.RUNNABLE:
+                eligible = True
+            elif category is SchedCategory.RUNNING:
+                eligible = key not in self._last_seq or seq > self._last_seq[key]
+            else:  # BLOCKED
+                snapshot = (
+                    _open_escalation_count(conn, level.value, unit_id),
+                    _pending_decision_count(conn, level.value, unit_id),
+                )
+                eligible = (
+                    key not in self._last_seq
+                    or seq > self._last_seq[key]
+                    or self._blocked_snapshot.get(key) != snapshot
+                )
+            if not eligible:
+                continue
+            if len(self._tasks) >= cap:
+                break  # economics cap (§7) — the rest waits for a free slot
+            self._tasks[key] = tg.create_task(self._drive(level, unit_id))
+            dispatched += 1
+        return dispatched
+
+    async def _drive(self, level: Level, unit_id: str) -> None:
+        """Run one executor; unit-scoped failures are contained here (§6) so
+        parallel siblings keep running; bookkeeping feeds the edge trigger."""
+        try:
+            await self._executors[level].execute(unit_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — §6 containment boundary
+            self._contain_failure(level, unit_id, exc)
+        finally:
+            conn = self._db.read()
+            key = (level, unit_id)
+            self._last_seq[key] = _max_event_seq(conn)
+            self._blocked_snapshot[key] = (
+                _open_escalation_count(conn, level.value, unit_id),
+                _pending_decision_count(conn, level.value, unit_id),
+            )
+
+    def _contain_failure(self, level: Level, unit_id: str, exc: Exception) -> None:
+        """§6: executor error -> unit ESCALATED (trigger='internal_error',
+        traceback artifact under ndjson_log_dir); where the transition table
+        has no ESCALATED edge the escalation row + event still land. A failure
+        INSIDE this handler propagates — that is orchestrator-scoped (§6)."""
+        log_dir = _resolve(self._cfg.factory.home, self._cfg.process.ndjson_log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = log_dir / f"{new_id('error')}.traceback.txt"
+        trace_path.write_text(
+            "".join(traceback.format_exception(exc)), encoding="utf-8"
+        )
+        target = "phase_architect" if level is Level.STAGE else "main_architect"
+        payload = {
+            "error": repr(exc),
+            "error_type": type(exc).__name__,
+            "traceback_path": str(trace_path),
+        }
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            fdb.insert_event(
+                conn,
+                unit_level=level.value,
+                unit_id=unit_id,
+                event_type="internal_error",
+                actor=_ACTOR,
+                payload=payload,
+            )
+            if not fdb.open_escalation(conn, level.value, unit_id, "internal_error"):
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=level.value,
+                        unit_id=unit_id,
+                        trigger="internal_error",
+                        target=target,
+                        payload_artifact_id=None,
+                        event_seq=None,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        escalated_state = (
+            StageState.ESCALATED.value if level is Level.STAGE else PhaseState.ESCALATED.value
+        )
+        try:
+            self._sm.transition(
+                level,
+                unit_id,
+                escalated_state,
+                actor=_ACTOR,
+                reason=f"internal error contained at executor boundary: {exc!r}",
+                payload=payload,
+                coupled=coupled,
+            )
+        except TransitionError:
+            # No ESCALATED edge from the current state (e.g. PENDING/terminal):
+            # the escalation row + event still land — visible, never silent.
+            with self._db.transaction() as conn:
+                coupled(conn)
+
+    # ------------------------------------------------------------------ alerts
+
+    async def _decision_latency_alerts(self) -> None:
+        """§2 decision-latency trigger: pending decisions never alerted and older
+        than escalation.decision_latency_alert_h -> ntfy (priority_alert), then
+        mark_decision_alerted so the alert never re-fires every tick (CCR-1)."""
+        stale = fdb.pending_decisions(
+            self._db.read(),
+            unalerted_older_than_h=self._cfg.escalation.decision_latency_alert_h,
+        )
+        for decision in stale:
+            assert decision.id is not None
+            streak_key = ("decision_latency", decision.id)
+            try:
+                await self._notify.publish(
+                    "Decizie în așteptare de prea mult timp: "
+                    f"{decision.unit_level} {decision.unit_id}",
+                    link=dashboard_link(self._cfg, f"decision/{decision.id}"),
+                    priority=self._notify.priority_alert,
+                )
+            except NotifyError as exc:
+                if streak_key not in self._delivery_failed_logged:
+                    self._delivery_failed_logged.add(streak_key)
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="alert_delivery_failed",
+                            actor=_ACTOR,
+                            payload={
+                                "kind": "decision_latency",
+                                "decision_request_id": decision.id,
+                                "error": str(exc),
+                            },
+                        )
+                continue  # unmarked -> retried next tick until delivered
+            self._delivery_failed_logged.discard(streak_key)
+            with self._db.transaction() as conn:
+                fdb.mark_decision_alerted(conn, decision.id, utc_now())
+                fdb.insert_event(
+                    conn,
+                    unit_level=decision.unit_level,
+                    unit_id=decision.unit_id,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "decision_latency",
+                        "decision_request_id": decision.id,
+                        "alert_after_h": self._cfg.escalation.decision_latency_alert_h,
+                    },
+                )
+
+    async def _stall_detector(
+        self, scan: list[tuple[Level, str, SchedCategory]]
+    ) -> None:
+        """§4 STALL DETECTOR: non-terminal units exist, nothing RUNNABLE/RUNNING,
+        and no open decision_request/escalation -> 'alert' event + ntfy. Fires
+        once per stall episode (the latch clears when anything moves again) —
+        a wedged factory pages, it does not page every tick."""
+        non_terminal = [
+            entry
+            for entry in scan
+            if entry[2] not in (SchedCategory.TERMINAL_OK, SchedCategory.TERMINAL_FAIL)
+        ]
+        stalled = bool(non_terminal) and not any(
+            category in (SchedCategory.RUNNABLE, SchedCategory.RUNNING)
+            for _, _, category in non_terminal
+        )
+        if stalled:
+            conn = self._db.read()
+            if fdb.pending_decisions(conn) or _total_open_escalations(conn) > 0:
+                stalled = False
+        if not stalled:
+            self._stall_event_logged = False
+            self._stall_published = False
+            self._delivery_failed_logged.discard("stall")
+            return
+        wedged = [f"{level.value}:{unit_id}" for level, unit_id, _ in non_terminal]
+        if not self._stall_event_logged:
+            self._stall_event_logged = True
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={"kind": "stall", "non_terminal_units": wedged[:100]},
+                )
+        if not self._stall_published:
+            try:
+                await self._notify.publish(
+                    "Fabrica este blocată: nicio unitate nu poate avansa",
+                    link=dashboard_link(self._cfg, "health"),
+                    priority=self._notify.priority_alert,
+                )
+                self._stall_published = True
+                self._delivery_failed_logged.discard("stall")
+            except NotifyError as exc:
+                if "stall" not in self._delivery_failed_logged:
+                    self._delivery_failed_logged.add("stall")
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="alert_delivery_failed",
+                            actor=_ACTOR,
+                            payload={"kind": "stall", "error": str(exc)},
+                        )
+
+
+# ------------------------------------------------------------ process predicates
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _proc_cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
+    """§5.5a 'pid alive with matching cmdline': compare /proc/<pid>/cmdline with
+    the registry cmdline (recorded as shlex.join(argv) at spawn). Unreadable
+    /proc => no match — never kill what cannot be identified."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    parts = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
+    return bool(parts) and shlex.join(parts) == recorded_cmdline
