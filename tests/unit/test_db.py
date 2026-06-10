@@ -5,6 +5,7 @@ re-entrancy guard — plus repository round-trips and WAL/FK connection settings
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ from sf_factory.db import (
     latest_artifact,
     list_units,
     mark_decision_alerted,
+    mark_process_running,
     open_escalation,
     pending_decisions,
     processes_in_state,
@@ -303,6 +305,31 @@ class TestConnection:
         ro.open(read_only=True)
         try:
             assert get_phase(ro.read(), "ph-ro") is not None
+        finally:
+            ro.close()
+
+    def test_read_only_uri_quotes_special_path_chars(self, tmp_path: Path):
+        # CCR-2 minor fix: without percent-encoding, '?' truncates the URI path
+        # into a query string, '#' into a fragment, and '%41' is mis-decoded to
+        # 'A' — mode=ro would open the WRONG file (or none). Normal paths are
+        # untouched by quote(), covered by every other read-only test here.
+        odd_dir = tmp_path / "odd %41 dir?with#specials"
+        odd_dir.mkdir()
+        path = odd_dir / "factory.db"
+        rw = Database(path, busy_timeout_ms=100)
+        rw.open()
+        try:
+            rw.migrate(MIGRATIONS_DIR)
+            with rw.transaction() as conn:
+                insert_phase(conn, make_phase("ph-uri"))
+        finally:
+            rw.close()
+        ro = Database(path, busy_timeout_ms=100)
+        ro.open(read_only=True)
+        try:
+            assert get_phase(ro.read(), "ph-uri") is not None
+            with pytest.raises(sqlite3.OperationalError):  # still genuinely ro
+                ro.read().execute("DELETE FROM phases")
         finally:
             ro.close()
 
@@ -732,6 +759,89 @@ class TestProcessRepo:
         with db.transaction() as conn:
             finalize_process(conn, pid, state="timed_out", exit_code=None, ended_at=T0)
         assert processes_in_state(db.read(), "timed_out")[0].session_id == "sess-keep"
+
+
+class TestMarkProcessRunning:
+    """db.mark_process_running (CCR-2): 'spawned'→'running' post-exec — persist
+    the pid the cross-restart orphan sweep kills by, and write heartbeat_at=at
+    as the INITIAL heartbeat. FactoryError on rowcount != 1."""
+
+    def test_spawned_to_running_roundtrip(self, seeded_stage: Database):
+        db = seeded_stage
+        with db.transaction() as conn:
+            proc_id = insert_process(conn, replace(make_process(), pid=None))
+        at = utc_now()
+        with db.transaction() as conn:
+            mark_process_running(conn, proc_id, pid=4321, at=at)
+        rows = processes_in_state(db.read(), "running")
+        assert [r.id for r in rows] == [proc_id]
+        rec = rows[0]
+        assert rec.pid == 4321  # persisted post-exec — the §5.5a sweep's key
+        assert rec.heartbeat_at == at  # initial heartbeat: staleness sound from exec
+        assert rec.ended_at is None and rec.exit_code is None  # NOT finalized
+        assert rec.session_id is None  # never written here
+        assert processes_in_state(db.read(), "spawned") == []
+
+    def test_unknown_process_raises(self, db: Database):
+        with pytest.raises(FactoryError, match="unknown process"):
+            with db.transaction() as conn:
+                mark_process_running(conn, 999, pid=1, at=T0)
+
+    def test_finalized_row_untouched(self, seeded_stage: Database):
+        # Misuse on a terminal row must raise and change NOTHING — reverting a
+        # finalized row would corrupt last_session_id's finalized predicate.
+        db = seeded_stage
+        with db.transaction() as conn:
+            proc_id = insert_process(conn, make_process())
+            finalize_process(conn, proc_id, state="exited", exit_code=0, ended_at=T0,
+                             session_id="sess-done")
+        with pytest.raises(FactoryError, match="cannot mark process"):
+            with db.transaction() as conn:
+                mark_process_running(conn, proc_id, pid=777, at=utc_now())
+        row = db.read().execute(
+            "SELECT * FROM process_registry WHERE id = ?", (proc_id,)
+        ).fetchone()
+        assert row["state"] == "exited"
+        assert row["pid"] == 4242  # make_process's original pid, not 777
+        assert row["heartbeat_at"] is None
+        assert (row["ended_at"], row["exit_code"], row["session_id"]) == (
+            T0, 0, "sess-done",
+        )
+
+    def test_already_running_not_remarked(self, seeded_stage: Database):
+        # Double-mark is a lifecycle bug: the second call must raise and must not
+        # rewrite the pid or the initial heartbeat.
+        db = seeded_stage
+        with db.transaction() as conn:
+            proc_id = insert_process(conn, replace(make_process(), pid=None))
+        first_at = "2026-06-10T01:00:00Z"
+        with db.transaction() as conn:
+            mark_process_running(conn, proc_id, pid=4321, at=first_at)
+        with pytest.raises(FactoryError, match="cannot mark process"):
+            with db.transaction() as conn:
+                mark_process_running(conn, proc_id, pid=9999, at=utc_now())
+        rec = processes_in_state(db.read(), "running")[0]
+        assert (rec.pid, rec.heartbeat_at) == (4321, first_at)
+
+    def test_last_session_id_semantics_unaffected(self, seeded_stage: Database):
+        # A 'running' row keeps ended_at NULL: even with a session id known at
+        # (resumed) spawn time it must NOT feed continue_session until finalized.
+        db = seeded_stage
+        with db.transaction() as conn:
+            done = insert_process(conn, make_process())
+            finalize_process(conn, done, state="exited", exit_code=0, ended_at=T0,
+                             session_id="sess-final")
+            inflight = insert_process(
+                conn, replace(make_process(session_id="sess-inflight"), pid=None))
+            mark_process_running(conn, inflight, pid=555, at=utc_now())
+        assert last_session_id(db.read(), unit_level="stage", unit_id="st-1",
+                               role="builder_routine") == "sess-final"
+        with db.transaction() as conn:
+            finalize_process(conn, inflight, state="exited", exit_code=0,
+                             ended_at=utc_now())
+        # Only finalization (ended_at) makes the newer session the resume target.
+        assert last_session_id(db.read(), unit_level="stage", unit_id="st-1",
+                               role="builder_routine") == "sess-inflight"
 
 
 class TestLastSessionId:
@@ -1267,6 +1377,7 @@ class TestModuleSurface:
             "deps_done", "insert_artifact_ref", "latest_artifact", "find_artifact_ref",
             "iter_latest_artifact_refs", "insert_process", "finalize_process",
             "heartbeat_process", "processes_in_state", "last_session_id",
+            "mark_process_running",
             "insert_token_usage", "unit_token_total", "insert_fix_iteration", "bump_churn",
             "insert_consultation", "insert_escalation", "resolve_escalation",
             "open_escalation", "insert_finding", "set_finding_status", "findings",

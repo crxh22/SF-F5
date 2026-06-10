@@ -17,6 +17,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 from sf_factory.models import (
     ArtifactRef,
@@ -59,8 +60,12 @@ class Database:
         if self._conn is not None:
             raise FactoryError(f"database already open: {self._path}")
         if read_only:
+            # The path must be percent-encoded inside the URI (CCR-2 minor fix):
+            # a literal '?'/'#' would truncate it into query/fragment and '%' would
+            # be mis-decoded. quote() keeps '/' and ordinary path chars untouched —
+            # behavior is identical for normal paths.
             conn = sqlite3.connect(
-                f"file:{self._path}?mode=ro", uri=True, isolation_level=None
+                f"file:{quote(str(self._path))}?mode=ro", uri=True, isolation_level=None
             )
         else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -519,6 +524,33 @@ def insert_process(conn: sqlite3.Connection, rec: ProcessRecord) -> int:
     )
     assert cur.lastrowid is not None
     return cur.lastrowid
+
+
+def mark_process_running(
+    conn: sqlite3.Connection, process_id: int, *, pid: int, at: str
+) -> None:
+    """'spawned'→'running' (CCR-2): persist the child pid post-exec — the §5.5a
+    cross-restart orphan sweep kills by ``process_registry.pid`` — and write
+    ``heartbeat_at = at`` as the INITIAL heartbeat, so staleness math is sound
+    from exec time. Strictly guarded on state='spawned': a finalized (or already
+    running) row is left untouched and raises — ``ended_at``/``session_id`` are
+    never written here, so ``last_session_id``'s finalized predicate is
+    unaffected. Raises FactoryError on rowcount != 1."""
+    cur = conn.execute(
+        "UPDATE process_registry SET state = 'running', pid = ?, heartbeat_at = ?"
+        " WHERE id = ? AND state = 'spawned'",
+        (pid, at, process_id),
+    )
+    if cur.rowcount != 1:
+        row = conn.execute(
+            "SELECT state FROM process_registry WHERE id = ?", (process_id,)
+        ).fetchone()
+        if row is None:
+            raise FactoryError(f"unknown process id: {process_id}")
+        raise FactoryError(
+            f"cannot mark process {process_id} running: state is {row['state']!r},"
+            " not 'spawned' (finalized rows are never reverted)"
+        )
 
 
 def finalize_process(
