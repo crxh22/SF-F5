@@ -1,5 +1,5 @@
 # factory.config.yaml — single source for all tunable factory parameters (Doctrine §14).
-# Starter values founder-approved 10-06-2026 (decision log D-0005); recalibrate on DoD §13 evidence.
+# Starter values founder-approved 10-06-2026 (decision log D-0005, D-0011); recalibrate on DoD §13 evidence.
 # Role prompts and code reference these keys by name — never hardcode values elsewhere.
 
 factory:
@@ -10,6 +10,9 @@ projects:
   erp:
     docs_repo: /home/artur/projects/ERP-start
     workspace: /home/artur/projects/erp-workspace   # created at Etapa 5 kickoff
+    integration_branch: main
+    worktrees_dir: /home/artur/projects/erp-workspace/.worktrees
+    test_command: null                # OPEN-2: must be set before the first real ERP BUILD stage
     proving_phases: [foundation, inventory-procurement]
 
 models:
@@ -27,14 +30,18 @@ models:
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
 
 budgets:
-  # tokens per stage by risk class; exceeding forces a state-preserving reset (DoD §8 context_budget)
-  routine: 300000
-  structural: 1000000
-  critical: 2000000
+  per_stage:                          # tokens per stage by risk class (D-0005); keys mirror risk_classes
+    routine: 300000
+    structural: 1000000
+    critical: 2000000
+  usage_missing_policy: estimate      # estimate = logged-stream-bytes/4 into ledger (estimated=1) | escalate_after
+  usage_missing_max_per_stage: 3      # used by escalate_after policy
 
 escalation:
   max_fix_iterations: 3        # BUILD->VALIDATE loops without failing-test count decreasing
   churn_threshold: 4           # edits to the same file region within one stage
+  churn_region_lines: 40       # hunk-bucket size for the churn detector
+  max_context_resets: 1        # context_budget firings executed as reset before escalating
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
 
 risk_classes:
@@ -54,6 +61,7 @@ consultation_points:
     verdicts: [continue_session, rebuild, respec, escalate]
     fallback: escalate
     role: cp1_triage
+    max_input_bytes: 200000
 
 founder_channel:
   ntfy:
@@ -61,17 +69,31 @@ founder_channel:
     topic: claude-artur-md-hello   # founder-approved plain topic (D-0004); payloads: title + deep link only
     priority_decision: high
     priority_alert: max
+    timeout_s: 10
   dashboard:
     bind: tailscale   # serve only on the tailnet interface
     port: 8377
   watchdog:
     check_interval_s: 60
-    staleness_threshold_s: 300
+    staleness_threshold_s: 300   # must stay >= 10x process.loop_tick_s
+  decision_session: {}           # dashboard design slice (OPEN-4); placeholder
 
 process:
   agent_timeout_s: 3600
+  max_parallel_agents: 4          # economics knob (5h subscription window), not a technical limit
   ndjson_log_dir: .factory/logs   # operational, gitignored
   db_path: .factory/factory.db    # SQLite WAL, orchestrator-exclusive (DoD §6)
+  db_busy_timeout_ms: 5000
+  liveness_file: .factory/liveness
+  pid_file: .factory/orchestrator.pid   # also the single-instance flock target
+  terminate_grace_s: 10
+  kill_grace_s: 5
+  ndjson_max_line_bytes: 1048576
+  test_suite_timeout_s: 1800
+  loop_tick_s: 5                  # scheduler tick / liveness refresh
+  heartbeat_min_interval_s: 1
+  tier2_max_diff_bytes_per_unit: 300000
+  stub_agent_path: tests/stub_agent.py   # used only by routes with cli: stub (tests)
 
 canon:
   # Canon files injected into agent system prompts (decision D-0009).

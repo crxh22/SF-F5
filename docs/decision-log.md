@@ -52,6 +52,17 @@ Mechanism (runner design requirement): claude CLI → `--append-system-prompt "$
 
 Passwordless sudo verified active (D-0001 executed by founder via SSH). Server timezone set to Europe/Chisinau (D-0006 executed); sqlite3 CLI installed. Machine-parsed timestamps remain ISO 8601 UTC.
 
+## D-0011 — 2026-06-10 — main architect — Control-plane design v1.1 approved; OPEN dispositions
+
+`docs/design/control-plane-design.md` v1.1 approved after adversarial review (two independent reviewers, both approve_with_fixes; 36/36 findings applied, 0 rejected; both critical findings — Tier-2 semantic-gate input contract, single-instance enforcement — were design defects fixed in the DoD's direction; no DoD amendment needed). Build waves launched per design §9 under D-0008 bootstrap mode.
+
+OPEN dispositions:
+- **OPEN-1 approved:** §10 config keys added to `factory.config.yaml` with proposed defaults. Architect amendment: per-class budgets nested under `budgets.per_stage` so the policy keys (`usage_missing_*`) don't break the budgets↔risk_classes cross-check; design §2/§4 references updated.
+- **OPEN-2 stays OPEN** (Doctrine §12): `projects.erp.test_command: null` placeholder; owner Main Architect + founder; deciding trigger = before the first real ERP BUILD stage (Etapa 5).
+- **OPEN-3 resolved at smoke level** (10-06-2026 test): `codex exec --json` emits JSONL (`thread.started{thread_id}`, `item.completed{agent_message}`, `turn.completed{usage{input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens}}`) — **token usage IS reported**; session resume = `codex exec resume <thread_id>`; runner requirements learned: spawn with stdin=devnull (it reads piped stdin otherwise), `--skip-git-repo-check` or trusted dir, stderr kept separate (interleaves into the stream when merged). Design's hard gates remain until the wave-2 builder verifies in code.
+- **OPEN-4 confirmed:** runner = print mode only; Main Architect/Intake PTY sessions stay operator-driven in MVP; orchestrator-spawned Decision Sessions belong to the dashboard design slice.
+- **OPEN-5 confirmed:** `validation-report.json` sidecar `{failing, passing, total}` is a mandatory Validator role-prompt contract; missing/malformed = `ArtifactContractError` → escalation.
+
 ---
 
 *Note — 2026-06-10: tentative power outage at 18:00 Chișinău (now also server-local); confirmation pending, shutdown decision with founder ~17:40.*
