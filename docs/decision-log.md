@@ -44,7 +44,7 @@ The factory is built by the Main Architect session orchestrating parallel subage
 
 Founder (chat 10-06-2026): doctrine + conventions must be loaded into the system prompt of every agent working in the factory; the founder-interaction protocol additionally into every agent whose output the founder reads; that protocol is also a binding design constraint for the dashboard (Etapa 4: Romanian, plain language, no bare IDs, options-with-recommendation cards).
 
-Main Architect refinement (config-controlled, reversible): consultation points (CP-1 class) get NO canon by default — they are bounded pure functions with closed verdict sets whose output is mechanically validated; canon injection there fails the Doctrine §17 test ("what concrete behavior does it change?") and only adds per-call cost. Falsifiability: if the DoD §13 CP-quality trigger fires (>30% verdicts overturned), flip `canon.inject.consultation_points` on and re-measure.
+Main Architect refinement, **founder-ratified** ("sunt ok cu excepția", chat 10-06-2026): consultation points (CP-1 class) get NO canon by default — they are bounded pure functions with closed verdict sets whose output is mechanically validated; canon injection there fails the Doctrine §17 test ("what concrete behavior does it change?") and only adds per-call cost. Falsifiability: if the DoD §13 CP-quality trigger fires (>30% verdicts overturned), flip `canon.inject.consultation_points` on and re-measure.
 
 Mechanism (runner design requirement): claude CLI → `--append-system-prompt "$(canon)"`; codex CLI → AGENTS.md in the agent workspace or prompt prefix. Config: `canon.*` in `factory.config.yaml`.
 
