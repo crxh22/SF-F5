@@ -71,6 +71,10 @@ Wave-1 builder built the foundations strictly as-frozen and STOPped with a contr
 
 Wave 1 verified by non-executor (222 tests green, ruff clean) and committed (`17315a3`, 3936 insertions: models/config/db/DDL + tests). Two minor verifier findings dispositioned: `MIGRATIONS_DIR` ratified into §4 (already imported by frozen conftest.py); ro-URI quoting folded into the CCR-2 delta. CCR-2 (wave-2 runner builder, which built-as-frozen with documented stopgaps instead of improvising): `db.mark_process_running(conn, process_id, *, pid, at)` approved — flips 'spawned'→'running' and persists pid post-exec, enabling the §5.5a cross-restart orphan sweep; architect amendment: `at` writes the initial heartbeat. Token-named log files (`proc-<12hex>.*`) ratified — registry column authoritative. Wave-2 siblings (statemachine+thresholds, artifacts+worktrees, notify+watchdog) are built green on disk and enter non-executor verification together with the delta. Design v1.2→v1.3.
 
+## D-0014 — 2026-06-10 — main architect — Wave-2 verifier dispositions allocated
+
+(1) `budgets.usage_missing_policy='escalate_after'` is owned by **StageExecutor** as a direct events-table count check (more than `budgets.usage_missing_max_per_stage` `usage_missing` events in one stage → the executor inserts the escalation row itself, like `internal_error`); NO `Trigger` enum extension — the enum stays the set of §8 SQL-evaluated triggers. Enforced in the wave-3 verification round; the stale comment at `tests/unit/test_runner.py:495` is corrected to name the owner. (2) `kill_running` cmdline exact-match vs interpreter-wrapped CLIs: empirically checked during wave-4 A2 integration tests with a real CLI; if mismatched, loosened to a documented tolerant form — recorded, never silent.
+
 ---
 
-*Note — 2026-06-10: tentative power outage at 18:00 Chișinău (now also server-local); confirmation pending, shutdown decision with founder ~17:40.*
+*Note — 2026-06-10: power outage happened as planned (clean scheduled shutdown 17:52, server back ~22:32); no state loss — resume per `docs/resume-state-10-06-2026.md`.*
