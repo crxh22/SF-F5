@@ -67,6 +67,10 @@ OPEN dispositions:
 
 Wave-1 builder built the foundations strictly as-frozen and STOPped with a contract change request instead of working around gaps — first live confirmation of the DoD §5.2 Prevent discipline. Four additive §4↔§2 freeze gaps approved: `Escalation.event_seq` (sentinel dedup cursor writable — without it always-fire triggers would re-escalate stale events forever), `ProcessRecord.session_id` + `finalize_process(session_id=…)` + `db.last_session_id(…)` (continue_session resumable across restarts), `insert_token_usage(estimated=…)` (estimate policy writable), `db.mark_decision_alerted(…)` (latency alerts fire once, not every tick). Plus: FactoryConfig docstring enumerates `canon` (D-0009, required by the golden load under extra='forbid'); `db.find_artifact_ref(…)` keeps register_artifact's get-or-create SQL inside db.py. Design v1.1→v1.2; wave-1 delta builder relaunched; waves 2-4 unchanged (siblings read the amended design).
 
+## D-0013 — 2026-06-10 — main architect — Wave 1 committed; CCR-2 approved (design v1.3)
+
+Wave 1 verified by non-executor (222 tests green, ruff clean) and committed (`17315a3`, 3936 insertions: models/config/db/DDL + tests). Two minor verifier findings dispositioned: `MIGRATIONS_DIR` ratified into §4 (already imported by frozen conftest.py); ro-URI quoting folded into the CCR-2 delta. CCR-2 (wave-2 runner builder, which built-as-frozen with documented stopgaps instead of improvising): `db.mark_process_running(conn, process_id, *, pid, at)` approved — flips 'spawned'→'running' and persists pid post-exec, enabling the §5.5a cross-restart orphan sweep; architect amendment: `at` writes the initial heartbeat. Token-named log files (`proc-<12hex>.*`) ratified — registry column authoritative. Wave-2 siblings (statemachine+thresholds, artifacts+worktrees, notify+watchdog) are built green on disk and enter non-executor verification together with the delta. Design v1.2→v1.3.
+
 ---
 
 *Note — 2026-06-10: tentative power outage at 18:00 Chișinău (now also server-local); confirmation pending, shutdown decision with founder ~17:40.*
