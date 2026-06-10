@@ -63,6 +63,10 @@ OPEN dispositions:
 - **OPEN-4 confirmed:** runner = print mode only; Main Architect/Intake PTY sessions stay operator-driven in MVP; orchestrator-spawned Decision Sessions belong to the dashboard design slice.
 - **OPEN-5 confirmed:** `validation-report.json` sidecar `{failing, passing, total}` is a mandatory Validator role-prompt contract; missing/malformed = `ArtifactContractError` → escalation.
 
+## D-0012 — 2026-06-10 — main architect — Contract change request CCR-1 approved (design v1.2)
+
+Wave-1 builder built the foundations strictly as-frozen and STOPped with a contract change request instead of working around gaps — first live confirmation of the DoD §5.2 Prevent discipline. Four additive §4↔§2 freeze gaps approved: `Escalation.event_seq` (sentinel dedup cursor writable — without it always-fire triggers would re-escalate stale events forever), `ProcessRecord.session_id` + `finalize_process(session_id=…)` + `db.last_session_id(…)` (continue_session resumable across restarts), `insert_token_usage(estimated=…)` (estimate policy writable), `db.mark_decision_alerted(…)` (latency alerts fire once, not every tick). Plus: FactoryConfig docstring enumerates `canon` (D-0009, required by the golden load under extra='forbid'); `db.find_artifact_ref(…)` keeps register_artifact's get-or-create SQL inside db.py. Design v1.1→v1.2; wave-1 delta builder relaunched; waves 2-4 unchanged (siblings read the amended design).
+
 ---
 
 *Note — 2026-06-10: tentative power outage at 18:00 Chișinău (now also server-local); confirmation pending, shutdown decision with founder ~17:40.*

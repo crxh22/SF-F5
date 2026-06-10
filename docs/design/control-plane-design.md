@@ -1,6 +1,6 @@
 # Control-Plane Design — SF-F5
 
-**Status:** design, v1.1 — 2026-06-10, revised after adversarial review (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
+**Status:** design, v1.2 — 2026-06-10, revised after adversarial review + contract amendment CCR-1 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
 **Harvest note (D-0002):** point mechanics consulted read-only in `~/projects/SF/factory-source/` — NDJSON line-tolerant parsing + terminate/kill grace pattern (`agents/transport.py`), idempotent worktree create + worktree-root/branch guards (`orchestrator/git_manager.py`), `VALID_TRANSITIONS: dict[State, set[State]]` table shape (`orchestrator/models.py`). All rewritten to this design; no architecture, stage sizing, or audit density inherited.
 **Stack (D-0007):** Python 3.12, uv project (package `sf_factory`, src layout), pydantic v2, pytest, ruff. All tunables read from `factory.config.yaml` by key — zero hardcoded values (Doctrine §14). Timestamps: ISO 8601 UTC strings (`conventions.md`).
 
@@ -284,8 +284,8 @@ class Phase:        """id, project, name, state: PhaseState, branch, plan_artifa
 class Stage:        """id, phase_id, name, risk_class, state: StageState, branch, worktree_path, spec_artifact_id, created_at, updated_at."""
 class Event:        """seq, unit_level, unit_id, event_type, from_state, to_state, actor, payload: dict, created_at."""
 class ArtifactRef:  """id, unit_level, unit_id, kind, repo, path, sha256, git_commit, created_at."""
-class ProcessRecord:"""id, unit_level, unit_id, kind, role, cp_id, pid, cmdline, cwd, state, exit_code, ndjson_log_path, spawned_at, heartbeat_at, ended_at."""
-class Escalation:   """id, unit_level, unit_id, trigger, target, payload_artifact_id, status, resolution, created_at, resolved_at."""
+class ProcessRecord:"""id, unit_level, unit_id, kind, role, cp_id, session_id, pid, cmdline, cwd, state, exit_code, ndjson_log_path, spawned_at, heartbeat_at, ended_at."""
+class Escalation:   """id, unit_level, unit_id, trigger, target, payload_artifact_id, event_seq, status, resolution, created_at, resolved_at."""
 class Finding:      """id, stage_id, auditor_role, finding_ref, severity, report_artifact_id, status, contest_artifact_id, resolved_by, created_at, updated_at."""
 class DecisionRequest: """id, unit_level, unit_id, gate_kind, request_artifact_id, status, answer, answer_artifact_id, created_at, alerted_at, answered_at."""
 class TriggerFiring:"""trigger: Trigger, unit_level, unit_id, evidence: dict (the SQL row(s) that fired)."""
@@ -303,7 +303,7 @@ class ModelRoute(BaseModel):           """cli: Literal['claude','codex','stub'];
 class ConsultationPointCfg(BaseModel): """id, purpose, inputs: list[str], verdicts: list[str], fallback: str, role: str, max_input_bytes: int."""
 class FactoryConfig(BaseModel):
     """Typed mirror of factory.config.yaml: factory, projects, models, budgets, escalation, risk_classes,
-    economics, consultation_points, founder_channel, process. extra='forbid' everywhere."""
+    economics, consultation_points, founder_channel, process, canon (D-0009). extra='forbid' everywhere."""
 def load_config(path: Path) -> FactoryConfig:
     """Parse + validate YAML; cross-checks (fallback∈verdicts; risk_classes roles∈models; budgets.per_stage keys==risk_classes keys); raises ConfigError."""
 
@@ -335,12 +335,15 @@ def insert_dag_edge(conn, level: Level, from_id: str, to_id: str) -> None
 def deps_done(conn, level: Level, unit_id: str) -> bool
 def insert_artifact_ref(conn, ref: ArtifactRef) -> int
 def latest_artifact(conn, unit_level: str, unit_id: str, kind: str) -> ArtifactRef | None
+def find_artifact_ref(conn, repo: str, path: str, sha256: str) -> ArtifactRef | None   # get-or-create probe for artifacts.register_artifact (CCR-1)
 def iter_latest_artifact_refs(conn) -> Iterator[ArtifactRef]               # for integrity check
-def insert_process(conn, rec: ProcessRecord) -> int;   def finalize_process(conn, process_id: int, *, state: str, exit_code: int | None, ended_at: str) -> None
+def insert_process(conn, rec: ProcessRecord) -> int;   def finalize_process(conn, process_id: int, *, state: str, exit_code: int | None, ended_at: str, session_id: str | None = None) -> None
 def heartbeat_process(conn, process_id: int, at: str) -> None
 def processes_in_state(conn, state: str) -> list[ProcessRecord]
+def last_session_id(conn, *, unit_level: str, unit_id: str, role: str) -> str | None   # latest finalized session — continue_session support (CCR-1)
 def insert_token_usage(conn, *, process_id: int, unit_level: str, unit_id: str, role: str, model: str,
-                       tokens_in: int | None, tokens_out: int | None, cost_usd: float | None) -> None
+                       tokens_in: int | None, tokens_out: int | None, cost_usd: float | None,
+                       estimated: bool = False) -> None   # estimated=True for usage_missing_policy='estimate' rows (CCR-1)
 def unit_token_total(conn, unit_level: str, unit_id: str) -> int
 def insert_fix_iteration(conn, stage_id: str, failing_tests: int, report_artifact_id: int | None) -> int
 def bump_churn(conn, stage_id: str, file_path: str, region: int) -> int
@@ -351,6 +354,7 @@ def insert_finding(conn, f: Finding) -> int;           def set_finding_status(co
 def findings(conn, stage_id: str, statuses: Sequence[str] = ()) -> list[Finding]
 def insert_decision_request(conn, dr: DecisionRequest) -> int
 def answer_decision(conn, request_id: int, answer: str, answer_artifact_id: int | None) -> None
+def mark_decision_alerted(conn, request_id: int, at: str) -> None   # set alerted_at after successful publish — latency alert must not re-fire every tick (CCR-1)
 def pending_decisions(conn, *, unalerted_older_than_h: int | None = None) -> list[DecisionRequest]
 
 # ---- statemachine.py ------------------------------------------------------------
@@ -668,5 +672,7 @@ All referenced by key in §2/§4/§5; none exist yet in `factory.config.yaml`. P
 ---
 
 ## Review log
+
+**CCR-1 (contract change request #1), 2026-06-10 — approved, v1.1→v1.2.** Wave-1 builder built strictly as-frozen and STOPped on four additive §4↔§2 freeze gaps (DoD §5.2 Prevent working as designed): `Escalation.event_seq` (sentinel dedup cursor must be writable/readable), `ProcessRecord.session_id` + `finalize_process(session_id=…)` + `db.last_session_id(…)` (continue_session must survive restarts), `insert_token_usage(estimated=…)` (usage_missing_policy='estimate' must be writable), `db.mark_decision_alerted(…)` (latency alert must not re-fire every tick). Plus: FactoryConfig docstring now enumerates `canon` (D-0009; golden load requires it under extra='forbid'); `db.find_artifact_ref(…)` added so artifacts.register_artifact's get-or-create keeps all SQL in db.py. Decision log D-0012.
 
 Adversarial review, 2026-06-10 — two independent reviewers, both `approve_with_fixes`; 36 findings total (2 critical, 21 major, 13 minor). Disposition in v1.1: **all 36 applied, 0 rejected.** The empirically verifiable claims (LAG-over-full-set trigger miscount, missing `escalations.payload_json` column, NULL-propagating budget SUM, WAL-pragma no-op inside a migration tx, D-0009 as a ratified runner requirement, absent ntfy timeout key) were re-verified against the DDL, sqlite3 semantics, `docs/decision-log.md`, and `factory.config.yaml` before applying. Neither critical finding conflicted with the DoD itself — both (Tier-2 input contract, single-instance enforcement) were design defects relative to it, fixed in the DoD's direction; no DoD amendment required. Overlapping findings merged into single fixes: max_fix_iterations SQL, sentinel dedup cursor, crash-time git healing, continue_session executability, ntfy timeout, artifact get-or-create, read-path rule.
