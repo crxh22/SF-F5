@@ -249,7 +249,10 @@ class CodexAdapter:
         cmd = ["codex", "exec"]
         if resume_session is not None:
             cmd += ["resume", resume_session]
-        cmd += ["--json", "--skip-git-repo-check"]
+        # B8 live run: codex defaults to a read-only sandbox and refused the
+        # report writes the artifact contract requires — grant workspace-scoped
+        # writes (CLI-verified: `--sandbox <read-only|workspace-write|danger-full-access>`).
+        cmd += ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
         if route.model != "default":  # 'default' = let the codex config decide (D-0005)
             cmd += ["--model", route.model]
         cmd.append(prompt)

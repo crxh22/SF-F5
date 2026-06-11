@@ -244,18 +244,21 @@ def test_codex_build_cmd_and_default_model() -> None:
     adapter = CodexAdapter()
     route = ModelRoute(cli="codex", model="default", mode="print")
     assert adapter.build_cmd(route, "build it") == [
-        "codex", "exec", "--json", "--skip-git-repo-check", "build it",
+        "codex", "exec", "--json", "--skip-git-repo-check",
+        "--sandbox", "workspace-write", "build it",
     ]
     named = ModelRoute(cli="codex", model="o3", mode="print")
     assert adapter.build_cmd(named, "x") == [
-        "codex", "exec", "--json", "--skip-git-repo-check", "--model", "o3", "x",
+        "codex", "exec", "--json", "--skip-git-repo-check",
+        "--sandbox", "workspace-write", "--model", "o3", "x",
     ]
 
 
 def test_codex_build_cmd_resume_subcommand() -> None:
     route = ModelRoute(cli="codex", model="default", mode="print")
     assert CodexAdapter().build_cmd(route, "continue", resume_session="tid-9") == [
-        "codex", "exec", "resume", "tid-9", "--json", "--skip-git-repo-check", "continue",
+        "codex", "exec", "resume", "tid-9", "--json", "--skip-git-repo-check",
+        "--sandbox", "workspace-write", "continue",
     ]
 
 
