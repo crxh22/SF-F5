@@ -1,0 +1,24 @@
+{
+  "project": "erp",
+  "phases": [
+    {"id": "foundation", "name": "Frozen shared core: schema, document engine, posting engine, auth"},
+    {"id": "inventory-procurement", "name": "Stock truth: catalogs, ordering, reception, issue, returns, stocktaking"},
+    {"id": "service-orders", "name": "Operational spine: defectare, cont, ZN, production, release, restant"},
+    {"id": "treasury-payments", "name": "Money truth: payment documents, allocation, desks/accounts, currency, conformity"},
+    {"id": "payroll", "name": "Salary: contract angajat algorithms, calculation document, payouts, cabinet"},
+    {"id": "reporting", "name": "Projections: R01-R21, KPIs, sinecost, WIP, period closing workflow"},
+    {"id": "migration-1c", "name": "1C cutover: master data, opening balances, open documents, reconciliation"}
+  ],
+  "dag_edges": [
+    ["foundation", "inventory-procurement"],
+    ["foundation", "service-orders"],
+    ["foundation", "treasury-payments"],
+    ["service-orders", "payroll"],
+    ["treasury-payments", "payroll"],
+    ["inventory-procurement", "reporting"],
+    ["service-orders", "reporting"],
+    ["treasury-payments", "reporting"],
+    ["payroll", "reporting"],
+    ["reporting", "migration-1c"]
+  ]
+}

@@ -1,0 +1,21 @@
+# C3 — Core Entity Schemas (cross-phase contract)
+
+**Status: DRAFT v0.1 — frozen (v1) at foundation exit; thereafter versioned only by Main Architect.**
+**Normative sources (ERP-start, repo-root-relative):** `docs/Business/domain/counterparties.md`, `docs/Business/domain/organizations-and-treasury.md`, `docs/Business/domain/actors-and-access.md`, `docs/Business/blueprint/register-model.md` R16/R17, `docs/Business/domain/glossary.md` (canonical identifiers), `docs/Business/domain/service-orders.md` + `docs/Business/blueprint/document-catalog.md` items 2-3 (cont/ZN read surface). Pin: ERP-start@51e32b0.
+
+## Scope frozen by this contract
+
+1. **Counterparty** + typed roles (client/supplier/employee/outsourcer/system_counterparty), executor↔counterparty link, reference contributors as counterparties (confidential scope).
+2. **Contract** (per counterparty, multiple): own_pj (relevant only pe alb), delivery-payment mode (alb/negru), default money location, price level, default payment categories; contract TYPES as data: service, `contract angajat` (salary params + algorithm list), `vanzare in rate` (installments), `achizitie TVA`, outsource.
+3. **Own PJ** with VAT-payer flag + per-PJ system tax counterparties (`TVA [PJ]`, `Impozit pe venit [PJ]`), excluded from commercial reports.
+4. **Vehicle** (+ custody field company/client/outsourcer, mileage).
+5. **Users, rights, devices:** flexible per-user rights (view-tx / edit-tx / view-balances, edit⇒view, view-tx⇏view-balances) over the actors-and-access dimensions (depozite, direcții, PJs, tx categories, counterparty categories, money locations, reports, ZN transitions, ordering); device registry (opaque device_token, admin approve/revoke, idle re-auth, sensitive-screen re-auth). Structural invariants frozen: default-deny for new users; reference-bonus, M1, and M2 exist as THREE separate confidential rights scopes (M1 ≠ M2 — founder decision 2026-06-10). Memberships and seed defaults are runtime configuration — initial values per `docs/Business/domain/actors-and-access.md`, never contract text.
+6. **Nomenclature framework** (R16): one configurable-table mechanism powering payment categories, desks/accounts, currencies + default-rate registry, banks, depozite, price levels, expense categories (+direction tag), generic/specific parts catalogs, etape + stări, departamente (+base/foreign works), executori, lucrări (+stage mapping), status labels, rights templates, diapazoane. Framework-vs-content boundary: foundation ships the TABLES (incl. the two parts catalogs as R16 entries); inventory-procurement owns progressive resolution, enrichment-at-reception, and code search behavior.
+7. **Unified ticket entity** (R14): type nomenclature (fiscal-invoice blocking, alb/negru conformity, coordination, overdue-part, accounting escalation), blocking flag, addressee, source-document link, open→in_progress→resolved with mandatory close reason.
+8. **Parameters registry:** every entry of `blueprint/parameters.md` resolvable by key at runtime; canonical-home rule preserved.
+9. **Identifiers:** glossary column-2 canonical identifiers are binding in code (`cont_de_plata`, `zn`, `sinecost`, `casa_cec`, `procent_executor`, …).
+10. **Cont / ZN / ZN-line skeleton interface** (the cross-phase READ surface; foundation builds the skeleton entities, service-orders owns all behavior): cont header — id, tip_cont, total, fiscal mode (from linked contract), linked contract + own PJ, vehicle, payer / vehicle-owner / sales-attribution-source / insurance-company / reference-contributor child rows (contributor, bonus type, value), commercial-status keys; ZN — id, cont ref, estimated release date, status-layer keys (layers 3-5), origin marker (`restant` + parent-chain ref); ZN line — id, ZN ref, cont-line mapping ref, kind (work|part|material), generic/specific item ref, qty, pre-discount value, executor/outsourcer ref. Parallel phases reference THESE fields only (reservations → ZN line; allocations → cont; payroll → ZN line + executor); anything beyond this surface is service-orders-internal and not contract-stable.
+
+## Consumers
+
+Domain phases EXTEND (new document types, new nomenclature entries) — they never fork or duplicate these entities. Schema changes = contract version bump.

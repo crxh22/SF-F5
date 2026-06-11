@@ -1,6 +1,6 @@
 # Control-Plane Design — SF-F5
 
-**Status:** design, v1.4 — 2026-06-11, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
+**Status:** design, v1.5 — 2026-06-12, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3, CCR-5 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
 **Harvest note (D-0002):** point mechanics consulted read-only in `~/projects/SF/factory-source/` — NDJSON line-tolerant parsing + terminate/kill grace pattern (`agents/transport.py`), idempotent worktree create + worktree-root/branch guards (`orchestrator/git_manager.py`), `VALID_TRANSITIONS: dict[State, set[State]]` table shape (`orchestrator/models.py`). All rewritten to this design; no architecture, stage sizing, or audit density inherited.
 **Stack (D-0007):** Python 3.12, uv project (package `sf_factory`, src layout), pydantic v2, pytest, ruff. All tunables read from `factory.config.yaml` by key — zero hardcoded values (Doctrine §14). Timestamps: ISO 8601 UTC strings (`conventions.md`).
 
@@ -674,6 +674,8 @@ All referenced by key in §2/§4/§5; none exist yet in `factory.config.yaml`. P
 ---
 
 ## Review log
+
+**CCR-5 (contract change request #5), 2026-06-12 — approved with the phase-seeding design (D-0024), v1.4→v1.5.** Additive amendments for the Etapa-5 readiness slice: `artifacts.MacroPhase`/`MacroPlan`/`read_macro_plan` (macro-plan file contract, mirroring `read_phase_plan`), `db.list_dag_edges(conn, level)`, cli subcommand `seed-phases` (flock-guarded claim-free via `_InstanceLock.acquire(claim=False)`, single-tx seed of phases + phase DAG + one factory-level `macro_plan` ref + `phase_seeded` events), `config.ProjectCfg.project_md`, ClaudeAdapter `--permission-mode bypassPermissions` when tools enabled (§5.1 argv literal updated; paired with the mechanical out-of-bounds detector at merge gates + recover), scheduler `proving_phases` dispatch hold. Full contract + rationale: `docs/design/phase-seeding-design.md` §§2–6.
 
 **CCR-3 (contract change request #3), 2026-06-11 — approved with the dashboard design (D-0017), v1.3→v1.4.** Additive §4 amendments for the founder-channel slice: `models.GATE_ANSWERS` mapping (gate answer vocabulary moved out of scheduler privates; deliberate behavioral edit: the `changes_requested` alias is dropped); `Scheduler.__init__(…, dashboard: DashboardServer | None = None)` + contained `_dashboard_supervisor`; `config.ModelRoute.tools: Literal['all','none'] = 'all'` honored by adapters (tools-off Decision Sessions); `thresholds` `context_budget` excludes `role='decision_session'` (amended §2 trigger above); `runner.cmdline_matches` promoted public, scheduler drops its private-import alias (closes the D-0016 disposition). Full contract: `docs/design/dashboard-design.md` §6.
 
