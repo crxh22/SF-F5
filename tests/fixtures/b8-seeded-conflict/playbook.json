@@ -1,0 +1,59 @@
+{
+ "phase_plan": {
+  "calls": [],
+  "default": {
+   "write_files": {
+    "_factory/contracts/sum.md": "# Contract: consistenta totalurilor (FROZEN)\n\nINVARIANTA SUM-1: DACA exista fisierul totals.json la radacina repo-ului, atunci cheia lui\n'total_bani' este EGALA cu suma exacta a tuturor valorilor din prices.json. Orice modificare\na prices.json care schimba suma trebuie reflectata in totals.json in aceeasi faza.\nToate sumele sunt intregi (bani).\n"
+   },
+   "plan": {
+    "stages": [
+     {"id": "catalog-a", "name": "Extindere catalog (A)", "risk_class": "structural", "acceptance": "sku-2 adaugat in prices.json; valori intregi; teste verzi"},
+     {"id": "totals-b", "name": "Raport totaluri (B)", "risk_class": "structural", "acceptance": "totals.json conform SUM-1; teste verzi"}
+    ],
+    "dag_edges": [["catalog-a", "totals-b"]]
+   },
+   "plan_md": "# Plan faza B8 v2 (driver)\nDoua etape structurale serializate contra contractului SUM-1: A extinde catalogul (invarianta vacuos satisfacuta), B adauga totals.json pe presupunerea veche — incalcare DOAR in comun (DoD SS5.3).\n"
+  }
+ },
+ "spec": {
+  "calls": [
+   {"spec_text": "# SPEC catalog-a (driver)\nAdauga sku-2 (500 bani) in prices.json si tests/test_a.py care verifica prezenta si tipul intreg al valorilor. Acceptanta: teste verzi; doar intregi.\n"},
+   {"spec_text": "# SPEC totals-b (driver)\nAdauga totals.json cu total_bani conform contractului SUM-1 si tests/test_b.py. Acceptanta: teste verzi.\n"}
+  ],
+  "default": {"spec_text": "# spec (driver, fallback)\n"}
+ },
+ "builder": {
+  "calls": [
+   {"write_files": {
+     "prices.json": "{\"sku-1\": 1000, \"sku-2\": 500}\n",
+     "tests/__init__.py": "",
+     "tests/test_a.py": "import json, unittest\nfrom pathlib import Path\n\nclass TestA(unittest.TestCase):\n    def test_catalog(self):\n        data = json.loads(Path(__file__).resolve().parents[1].joinpath('prices.json').read_text())\n        self.assertIn('sku-2', data)\n        for v in data.values():\n            self.assertIsInstance(v, int)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+   }},
+   {"write_files": {
+     "totals.json": "{\"total_bani\": 1000}\n",
+     "tests/test_b.py": "import json, unittest\nfrom pathlib import Path\n\nclass TestB(unittest.TestCase):\n    def test_totals_present(self):\n        data = json.loads(Path(__file__).resolve().parents[1].joinpath('totals.json').read_text())\n        self.assertEqual(data['total_bani'], 1000)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+   }},
+   {"write_files": {
+     "totals.json": "{\"total_bani\": 1500}\n",
+     "tests/test_b.py": "import json, unittest\nfrom pathlib import Path\n\nclass TestB(unittest.TestCase):\n    def test_totals_match_prices_sum(self):\n        root = Path(__file__).resolve().parents[1]\n        prices = json.loads(root.joinpath('prices.json').read_text())\n        totals = json.loads(root.joinpath('totals.json').read_text())\n        self.assertEqual(totals['total_bani'], sum(prices.values()))\n\nif __name__ == '__main__':\n    unittest.main()\n"
+   }}
+  ],
+  "default": {}
+ },
+ "validator": {
+  "calls": [],
+  "default": {"failing": 0, "passing": 1}
+ },
+ "audit": {
+  "calls": [],
+  "default": {"findings": []}
+ },
+ "respond": {
+  "calls": [],
+  "default": {"action_default": "comply"}
+ },
+ "cp1": {
+  "calls": [],
+  "default": {"verdict": "escalate"}
+ }
+}

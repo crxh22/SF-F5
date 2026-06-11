@@ -134,3 +134,16 @@ Synthetic critical-gate demo on the live orchestrator (stub agent routes via `te
 **Scope note:** this proves the §12.A4 *mechanism*; the formal A-criteria run on real ERP stages (Etapa 5). Ops learnings in `docs/runbooks/first-live-run.md` (tmux-dies-with-command; disarm-before-stop; seed-only-while-stopped).
 
 **needs_architect backlog** (from the live-run investigation; deferred per Doctrine §8, each with its deciding trigger): (1) no operator command to create a phase — manual DB insert is the only entry (trigger: Etapa 5 intake defines the sanctioned path); (2) `notify.dashboard_link` hardcodes `gethostname()` (trigger: first dead-link report — the phone resolved `server-e9` fine); (3) no SIGTERM graceful shutdown in `cli run` (trigger: before a systemd-managed orchestrator); (4) `cli resume` runs dashboard-less (trigger: first production resume); (5) watchdog unit hardcodes the config path (trigger: configs multiply); (6) OPEN-2 production `test_command` still null (existing trigger: before the first real ERP BUILD stage).
+
+## D-0022 — 2026-06-11 — main architect — Criterion B8 PASSED live; three real defects flushed by the run
+
+The §5.3 seeded-conflict scenario ran on the live pipeline with the REAL cross-model Integration Validator (codex). Stage `catalog-a` merged clean — the conditional invariant was vacuously satisfied and the validator correctly stayed silent. Stage `totals-b` (built on the pre-A assumption; own tests green; Tier-1 green) was **caught at its merge gate**: finding `SUM-1`, severity blocker, citing concrete locations and naming the sibling merge ("suma … este 1500 după merge-ul catalog-a") — possible only through the §3.1 sibling-diff Tier-2 input contract (the design-review critical fix earning its keep). Resolution loop completed: executor complied → rework BUILD → fix → clean re-gate → merged. Fixture preserved per DoD §5.3: `tests/fixtures/b8-seeded-conflict/`.
+
+The run flushed three real defects before succeeding:
+1. **codex adapter had no write access** (default read-only sandbox) → `--sandbox workspace-write` (`470f4ad`); the validator had analyzed correctly and documented the write refusal honestly — model behavior exemplary, adapter at fault.
+2. **Validator-isolation assertion tripped on the factory's own test-run bytecode droppings** (`__pycache__/`) → `process.isolation_ignore_globs` (`c50bf37`).
+3. **Multi-project DBs unsupported**: recovery cannot map `repo='workspace'` refs when phases span projects → backlog, trigger = before two projects share one DB (fresh-DB-per-project is the MVP posture).
+
+Scenario re-derivation (Doctrine §6/§11): fixture v1's violation was not joint-only (stage B violated alone) and a kind-keyed playbook derails on unplanned reworks caused by legitimate real-validator variance — v2 uses a conditional invariant (vacuous at A, broken only by the pair) and a minimal-surface stage A. Validator-quality bonus: on v1, codex unprompted flagged Python banker's rounding in `to_bani` as monetarily nondeterministic — a correct finding, adopted.
+
+DoD §12.B status: **B7 ✓** (integration suite), **B8 ✓ live**, **B9** fallback ✓ (integration suite); the "real ambiguous case" half lands naturally at the first real CP-1 consultation in Etapa 5. A-criteria + C10: Etapa 5 (real ERP stages).
