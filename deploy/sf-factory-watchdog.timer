@@ -1,0 +1,10 @@
+[Unit]
+Description=Run SF-F5 watchdog every 60s (founder_channel.watchdog.check_interval_s)
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

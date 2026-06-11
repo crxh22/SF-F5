@@ -1,0 +1,9 @@
+[Unit]
+Description=SF-F5 factory watchdog — external orchestrator liveness check (DoD §9)
+Documentation=file:///home/artur/projects/SF-F5/docs/design/control-plane-design.md
+
+[Service]
+Type=oneshot
+User=artur
+WorkingDirectory=/home/artur/projects/SF-F5
+ExecStart=/home/artur/projects/SF-F5/.venv/bin/python -m sf_factory.watchdog --config /home/artur/projects/SF-F5/factory.config.yaml
