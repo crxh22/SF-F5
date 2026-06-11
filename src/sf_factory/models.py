@@ -257,6 +257,24 @@ def sched_category(level: Level, state: str, deps_done: bool) -> SchedCategory:
     return SchedCategory.RUNNING
 
 
+#: DoD §9 gate-answer vocabulary by ``(unit_level, gate_kind)`` — the ONE source
+#: (Doctrine §9) consumed by BOTH the scheduler executors and the dashboard
+#: option buttons (CCR-3 / D-0017, moved out of scheduler.py privates). A
+#: ``(level, gate_kind)`` with no entry (the DDL enumerates ``business``, which
+#: no executor consumes yet) renders without buttons and answers only via
+#: ``cli decide``. Deliberate behavioral edit ratified with the move: the
+#: signoff executor's ``changes_requested`` alias is DROPPED — ``changes`` is
+#: the only accepted token (D-0017 rider item 4).
+GATE_ANSWERS: Mapping[tuple[str, str], tuple[str, ...]] = MappingProxyType(
+    {
+        ("stage", "critical_stage"): ("approved", "rework:BUILD", "rework:SPEC"),
+        ("stage", "escalation_tradeoff"): ("approved", "rework:BUILD", "rework:SPEC"),
+        ("phase", "phase_signoff"): ("approved", "changes"),
+        ("phase", "escalation_tradeoff"): ("resume", "replan"),
+    }
+)
+
+
 # ------------------------------------------------------------------------ helpers
 
 

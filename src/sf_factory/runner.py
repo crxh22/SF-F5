@@ -157,8 +157,16 @@ class ClaudeAdapter:
         resume_session: str | None = None,
     ) -> list[str]:
         # §5.1 literal argv order: claude --model <m> --output-format stream-json
-        # --verbose --append-system-prompt <canon> [--resume <id>] -p <prompt>.
+        # --verbose [--tools ""] --append-system-prompt <canon> [--resume <id>]
+        # -p <prompt>.
         cmd = ["claude", "--model", route.model, "--output-format", "stream-json", "--verbose"]
+        if route.tools == "none":
+            # CCR-3/D-0017 tools-off spawn (Decision Sessions): structural
+            # no-write enforcement. Exact flagset verified against the installed
+            # CLI at build (dashboard design §4): `--tools <tools...>` — "Use ""
+            # to disable all tools" — disables the FULL built-in set in one flag,
+            # with no tool-name enumeration to drift as the CLI grows.
+            cmd += ["--tools", ""]
         if system_append is not None:
             cmd += ["--append-system-prompt", system_append]
         if resume_session is not None:
@@ -228,6 +236,16 @@ class CodexAdapter:
         system_append: str | None = None,
         resume_session: str | None = None,
     ) -> list[str]:
+        if route.tools == "none":
+            # CCR-3: no VERIFIED codex tools-off flagset exists (only the claude
+            # set was verified at build, dashboard design §4) — spawning a
+            # tools-on process under a tools-off contract would silently void
+            # the structural no-write guarantee. Fail-explicit (Doctrine §7).
+            raise ProcessError(
+                "route requests tools='none' but the codex adapter has no verified "
+                "tools-off flagset (dashboard design §4) — route tools-off roles "
+                "to the claude CLI"
+            )
         cmd = ["codex", "exec"]
         if resume_session is not None:
             cmd += ["resume", resume_session]
@@ -286,7 +304,9 @@ class StubAdapter(ClaudeAdapter):
     current interpreter; the stub emits claude-shaped NDJSON, so parsing and
     workspace handling are inherited from ClaudeAdapter. AgentRunner binds the
     script path from config; the module-level ADAPTERS['stub'] entry is unbound
-    and refuses to build argv (fail-explicit, never a half-spawn)."""
+    and refuses to build argv (fail-explicit, never a half-spawn).
+    ``ModelRoute.tools`` is ignored (dashboard design §4: the stub spawns no
+    tools to disable; its argv carries no tools flag)."""
 
     def __init__(self, script_path: Path | None = None) -> None:
         self._script_path = script_path
@@ -666,7 +686,7 @@ class AgentRunner:
                 continue
             if not verified_ours:
                 if _leader_alive(pid):
-                    if not _cmdline_matches(pid, rec.cmdline):
+                    if not cmdline_matches(pid, rec.cmdline):
                         continue  # pid reused by a foreign process — never kill strangers
                 elif not _group_alive(pid):
                     continue  # leader and group both gone
@@ -994,10 +1014,14 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
-def _cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
+def cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
     """Compare /proc/<pid>/cmdline against the registry cmdline (§5.5a 'pid alive
     with matching cmdline'). Unreadable/absent /proc ⇒ no match — never kill what
     cannot be identified.
+
+    PUBLIC since CCR-3 (closes the D-0016 disposition): the single tolerant
+    predicate, consumed by both this runner's ``kill_running`` and the
+    scheduler's §5.5a orphan sweep — one source, no drifting copies.
 
     Tolerant form (D-0014 item 2, empirically verified 2026-06-11 on server e9):
     interpreter wrapping rewrites the live argv of script-shebang CLIs —

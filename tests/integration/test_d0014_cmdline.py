@@ -12,7 +12,8 @@ Empirical findings (server e9, 2026-06-11, this wave):
   its process group running unsupervised.
 
 Consequence (applied under the wave-4 bug-fix exception, never silently):
-``runner._cmdline_matches`` accepts the documented tolerant form — the
+``runner.cmdline_matches`` (public since CCR-3) accepts the documented
+tolerant form — the
 recorded argv as a SUFFIX of the live argv with the executable matched by
 basename — and ``scheduler._proc_cmdline_matches`` delegates to it (one
 predicate, Doctrine §9). These tests pin the live-stub exact match, the
@@ -42,7 +43,7 @@ from harness import (
 
 from sf_factory import db as fdb
 from sf_factory.models import ProcessRecord, utc_now
-from sf_factory.runner import AgentRunner, _cmdline_matches
+from sf_factory.runner import AgentRunner, cmdline_matches
 from sf_factory.scheduler import Scheduler, _proc_cmdline_matches
 from sf_factory.statemachine import StateMachine
 
@@ -83,9 +84,9 @@ async def test_stub_child_cmdline_matches_registry_exactly(
         env.track_pid(row["pid"])
         live = _live_argv(row["pid"])
         assert shlex.join(live) == row["cmdline"]  # exact — no wrapping observed
-        assert _cmdline_matches(row["pid"], row["cmdline"]) is True
+        assert cmdline_matches(row["pid"], row["cmdline"]) is True
         # Never-kill-strangers: a divergent recorded argv refuses the match.
-        assert _cmdline_matches(row["pid"], row["cmdline"] + " --extra") is False
+        assert cmdline_matches(row["pid"], row["cmdline"] + " --extra") is False
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -118,19 +119,19 @@ async def test_wrapped_interpreter_child_matches_tolerantly(tmp_path: Path) -> N
         # The runner records what it spawned — claude-style bare argv[0].
         recorded = shlex.join(["fakecli", "--model", "default", "do the thing"])
         assert shlex.join(live) != recorded  # strict equality fails (the bug)
-        assert _cmdline_matches(child.pid, recorded) is True  # tolerant form
+        assert cmdline_matches(child.pid, recorded) is True  # tolerant form
         # Absolutized recorded argv[0] (basename-aligned) also matches.
-        assert _cmdline_matches(
+        assert cmdline_matches(
             child.pid, shlex.join([str(fakecli), "--model", "default", "do the thing"])
         )
         # Never kill strangers: different executable or diverging args refuse.
-        assert not _cmdline_matches(
+        assert not cmdline_matches(
             child.pid, shlex.join(["otherbin", "--model", "default", "do the thing"])
         )
-        assert not _cmdline_matches(
+        assert not cmdline_matches(
             child.pid, shlex.join(["fakecli", "--model", "default", "другое"])
         )
-        assert not _cmdline_matches(child.pid, "")
+        assert not cmdline_matches(child.pid, "")
         # scheduler delegates to the same predicate (no drifting copy).
         assert _proc_cmdline_matches(child.pid, recorded) is True
     finally:

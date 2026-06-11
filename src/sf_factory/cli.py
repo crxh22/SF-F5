@@ -10,6 +10,10 @@ Command contracts (design §4 ``cli.main`` docstring, implemented exactly):
   instance would orphan-sweep the live instance's agents, double-write the DB
   behind busy_timeout, and mask watchdog death detection). Only then
   ``Scheduler.recover()`` + ``run_forever()`` (``resume``: ``run_until_blocked()``).
+  ``run`` also constructs the dashboard (CCR-4, dashboard design §1) and calls
+  ``DashboardServer.start()`` EAGERLY before recovery: a first resolve/bind
+  failure aborts orchestrator start in the foreground, never inside the
+  supervised restart loop. ``resume`` runs with ``dashboard=None``.
 - ``status [--json] [--write]`` — render a generated view from a READ-ONLY db
   connection (``mode=ro`` — legitimately concurrent with a live orchestrator,
   §2) + git (non-canonical, Doctrine §9). ``--write`` also writes the rendered
@@ -83,6 +87,7 @@ from sf_factory.models import (
 from sf_factory.worktrees import commit_paths, run_git
 
 if TYPE_CHECKING:  # import cycle-free typing only; runtime import is lazy (§9 lanes)
+    from sf_factory.dashboard import DashboardServer
     from sf_factory.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -317,14 +322,23 @@ def cmd_init(cfg: FactoryConfig) -> int:
 # ------------------------------------------------------------------ run / resume
 
 
-def _build_scheduler(cfg: FactoryConfig, db: Database) -> Scheduler:
+def _build_scheduler(
+    cfg: FactoryConfig, db: Database, *, with_dashboard: bool
+) -> tuple[Scheduler, DashboardServer | None]:
     """Wire the §4 object graph with the FROZEN constructor signatures.
 
     Imports live here, not at module top: only run/resume need the graph, and
     wave-3 lanes are file-disjoint (design §9) — init/status/decide must not
     depend on sibling-lane modules being importable.
+
+    ``with_dashboard`` (CCR-4, dashboard design §1/§6): ``run`` constructs
+    ``DashboardServer(cfg, db, runner, notify)`` and hands it to the Scheduler
+    (CCR-3 kwarg — ``run_forever`` hosts the supervised serve() task);
+    ``resume`` keeps ``dashboard=None`` (``run_until_blocked`` is a bounded
+    catch-up loop, not the founder-facing steady state).
     """
     from sf_factory.consultation import Consultor
+    from sf_factory.dashboard import DashboardServer
     from sf_factory.notify import NtfyPublisher
     from sf_factory.runner import AgentRunner
     from sf_factory.scheduler import PhaseExecutor, Scheduler, StageExecutor
@@ -342,12 +356,15 @@ def _build_scheduler(cfg: FactoryConfig, db: Database) -> Scheduler:
         Level.STAGE: StageExecutor(db, sm, cfg, runner, wt, thresholds, consultor, notify),
         Level.PHASE: PhaseExecutor(db, sm, cfg, runner, wt, notify),
     }
-    return Scheduler(db, sm, cfg, executors, notify)
+    dashboard = DashboardServer(cfg, db, runner, notify) if with_dashboard else None
+    return Scheduler(db, sm, cfg, executors, notify, dashboard=dashboard), dashboard
 
 
 def cmd_run(cfg: FactoryConfig, *, until_blocked: bool) -> int:
     """``run`` (run_forever) / ``resume`` (run_until_blocked) per §4: flock FIRST,
-    then recover, then the loop. The lock is held for the whole process lifetime."""
+    then (run only) the eager dashboard bind — dashboard design §1: a bind failure
+    aborts start in the foreground — then recover, then the loop. The lock is held
+    for the whole process lifetime."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -361,7 +378,19 @@ def cmd_run(cfg: FactoryConfig, *, until_blocked: bool) -> int:
             applied = db.migrate(MIGRATIONS_DIR)  # idempotent; pending-only
             if applied:
                 print(f"sf-factory: applied pending migration(s) {applied}", file=sys.stderr)
-            scheduler = _build_scheduler(cfg, db)
+            scheduler, dashboard = _build_scheduler(cfg, db, with_dashboard=not until_blocked)
+            if dashboard is not None:
+                # Eager first bind (dashboard design §1): a resolve/bind failure
+                # is a foreground FactoryError abort BEFORE recovery — never
+                # deferred into the §7 supervised restart loop, which would run
+                # the pipeline founder-less behind a retry cycle.
+                dashboard.start()
+                if dashboard.bound_address is not None:
+                    host, port = dashboard.bound_address
+                    print(
+                        f"sf-factory: dashboard bound on http://{host}:{port}/",
+                        file=sys.stderr,
+                    )
             print(f"sf-factory: recovery scan starting (pid {os.getpid()})", file=sys.stderr)
             scheduler.recover()
             print("sf-factory: recovery complete — entering scheduler loop", file=sys.stderr)

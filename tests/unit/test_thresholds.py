@@ -644,6 +644,54 @@ def test_unknown_risk_class_raises_config_error(db, evaluator):
         evaluator.evaluate(stage)
 
 
+def _seed_session_usage(db, process_id: int, stage_id: str, tokens: int) -> None:
+    """token_ledger row under role='decision_session' (founder conversation)."""
+    with db.transaction() as conn:
+        insert_token_usage(
+            conn,
+            process_id=process_id,
+            unit_level="stage",
+            unit_id=stage_id,
+            role="decision_session",
+            model="fable",
+            tokens_in=tokens,
+            tokens_out=0,
+            cost_usd=None,
+        )
+
+
+def test_context_budget_excludes_decision_session_rows(db, evaluator, factory_config):
+    """CCR-3/D-0017 (OPEN-D4): founder Decision-Session burn must NEVER push a
+    blocked stage over its cap — the trigger sums conveyor rows only."""
+    budget = factory_config.budgets.per_stage["routine"]
+    stage = _seed_stage(db, "st-session", risk_class="routine")
+    pid = _seed_process(db, "st-session")
+    _seed_session_usage(db, pid, "st-session", budget * 3)  # far beyond the cap
+    assert evaluator.evaluate(stage) == []
+
+
+def test_context_budget_conveyor_rows_fire_despite_session_noise(
+    db, evaluator, factory_config
+):
+    """The exclusion subtracts ONLY role='decision_session': conveyor rows alone
+    still reach the cap, and the evidence total counts conveyor tokens only —
+    while db.unit_token_total (the §2b dashboard burn figure) keeps summing
+    everything (visibility unchanged)."""
+    from sf_factory.db import unit_token_total
+
+    budget = factory_config.budgets.per_stage["routine"]
+    stage = _seed_stage(db, "st-mixed", risk_class="routine")
+    pid = _seed_process(db, "st-mixed")
+    _seed_session_usage(db, pid, "st-mixed", budget)  # session noise
+    _seed_usage(db, pid, "st-mixed", budget - 1, 0)  # conveyor: one under
+    assert evaluator.evaluate(stage) == []
+    _seed_usage(db, pid, "st-mixed", 1, 0)  # conveyor crosses the cap
+    firings = evaluator.evaluate(stage)
+    assert _triggers(firings) == [Trigger.CONTEXT_BUDGET]
+    assert firings[0].evidence["total_tokens"] == budget  # session rows excluded
+    assert unit_token_total(db.read(), "stage", "st-mixed") == budget * 2
+
+
 # ----------------------------------------------------------- record_validation
 
 

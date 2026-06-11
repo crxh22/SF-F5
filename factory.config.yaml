@@ -28,6 +28,10 @@ models:
   auditor_same_model:    {cli: claude, model: fable,   mode: print}
   auditor_cross_model:   {cli: codex,  model: default, mode: print}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
+  # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
+  # enforcement); founder-facing trade-off reasoning warrants the strongest model
+  # (D-0017, OPEN-D3 resolved).
+  decision_session:      {cli: claude, model: fable,   mode: print, tools: none}
 
 budgets:
   per_stage:                          # tokens per stage by risk class (D-0005); keys mirror risk_classes
@@ -73,10 +77,21 @@ founder_channel:
   dashboard:
     bind: tailscale   # serve only on the tailnet interface
     port: 8377
+    refresh_s: 30               # main page <meta refresh> cadence (D-0017)
+    answer_timeout_s: 60        # bound on every POST thread->loop marshal -> RO 504 on expiry
+    read_timeout_s: 10          # bound on GET marshals + per-socket read timeout
+    max_request_bytes: 65536    # POST body cap
+    restart_delay_s: 30         # supervisor restart backoff after a dashboard crash
+    page_every_n_restarts: 20   # max-priority page on crash 1, then every Nth restart (dedup)
+    bind_recheck_s: 300         # tailscale-IP drift re-check cadence (design §7)
   watchdog:
     check_interval_s: 60
     staleness_threshold_s: 300   # must stay >= 10x process.loop_tick_s
-  decision_session: {}           # dashboard design slice (OPEN-4); placeholder
+  decision_session:              # orchestrator-mediated founder sessions (OPEN-4, D-0017)
+    max_turns: 10
+    turn_timeout_s: 300
+    budget_tokens: 200000
+    poll_s: 3
 
 process:
   agent_timeout_s: 3600

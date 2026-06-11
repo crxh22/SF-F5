@@ -1647,7 +1647,88 @@ async def test_escalation_to_awaiting_human_creates_decision_atomically(
 ) -> None:
     """§9.4: 'awaiting_human' resolution -> AWAITING_HUMAN with the
     escalation-tradeoff decision request inserted in the SAME tx — the gate can
-    never sit with only a stale answered decision to consume."""
+    never sit with only a stale answered decision to consume. Since CCR-3/D-0017
+    the request anchors a ROMANIAN request-wrapper artifact (committed BEFORE
+    the recording tx) that links the payload via /artifact/<ref> and carries NO
+    recommendation line (genuine trade-off)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    unit_dir = env.worktree / "_factory" / "stages" / "ph.s1"
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "spec.md").write_text("spec", encoding="utf-8")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        from sf_factory.artifacts import register_artifact
+
+        spec_ref = register_artifact(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            kind="spec",
+            repo="workspace",
+            repo_root=env.worktree,
+            path=unit_dir / "spec.md",
+            git_commit=None,
+        )
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="cp1_verdict",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, "awaiting_human")
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.AWAITING_HUMAN
+    pending = fdb.pending_decisions(db.read())
+    assert len(pending) == 1 and pending[0].gate_kind == "escalation_tradeoff"
+    assert pending[0].unit_id == "ph.s1"
+    assert [p for p in env.notify.published if "escaladare" in p[0]]
+
+    # §2a wrapper: registered kind='decision_request', committed, Romanian,
+    # payload LINKED (here the spec fallback anchor), no Recomandare line.
+    row = (
+        db.read()
+        .execute(
+            "SELECT * FROM artifact_refs WHERE id = ?",
+            (pending[0].request_artifact_id,),
+        )
+        .fetchone()
+    )
+    assert row["kind"] == "decision_request"
+    assert row["path"].endswith("decision-request-escalation.md")
+    assert row["git_commit"]  # committed BEFORE the recording tx (§7 order)
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", row["path"]],
+        cwd=env.worktree,
+        capture_output=True,
+    )
+    assert tracked.returncode == 0
+    body = (env.worktree / row["path"]).read_text(encoding="utf-8")
+    assert "Cerere de decizie" in body
+    assert "compromis de produs la escaladare (escalation_tradeoff)" in body
+    assert f"/artifact/{spec_ref.id}" in body
+    for token in ("approved", "rework:BUILD", "rework:SPEC"):
+        assert f"- {token} — " in body  # every declared option + consequence
+    assert "Recomandare:" not in body  # never invented for a genuine trade-off
+
+
+async def test_stage_tradeoff_wrapper_replay_is_idempotent(
+    db, config_dict, tmp_path
+) -> None:
+    """§5.5d at-least-once replay: re-running the resolution step re-writes a
+    byte-identical wrapper (commit_paths -> None) and pins the ref to HEAD —
+    never a NULL commit, never a duplicate page-killing failure."""
     env = make_stage_env(db, config_dict, tmp_path)
     unit_dir = env.worktree / "_factory" / "stages" / "ph.s1"
     unit_dir.mkdir(parents=True)
@@ -1685,12 +1766,24 @@ async def test_escalation_to_awaiting_human_creates_decision_atomically(
     with db.transaction() as conn:
         fdb.resolve_escalation(conn, esc_id, "awaiting_human")
     await env.executor.execute("ph.s1")
+    # Simulate the crash-replay: back to ESCALATED, the wrapper file already
+    # committed; the step must converge (commit_paths None -> rev-parse HEAD).
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+    await env.executor.execute("ph.s1")
 
     assert stage_state(db, "ph.s1") is StageState.AWAITING_HUMAN
-    pending = fdb.pending_decisions(db.read())
-    assert len(pending) == 1 and pending[0].gate_kind == "escalation_tradeoff"
-    assert pending[0].unit_id == "ph.s1"
-    assert [p for p in env.notify.published if "escaladare" in p[0]]
+    rows = (
+        db.read()
+        .execute(
+            "SELECT dr.id, ar.git_commit FROM decision_requests dr"
+            " JOIN artifact_refs ar ON ar.id = dr.request_artifact_id"
+            " WHERE dr.unit_id = 'ph.s1' ORDER BY dr.id"
+        )
+        .fetchall()
+    )
+    assert len(rows) == 2  # one pending request per resolution pass
+    assert all(r["git_commit"] for r in rows)  # never NULL (D-0015 contract)
 
 
 async def test_context_budget_reset_then_escalate_ladder(
@@ -1804,6 +1897,227 @@ async def test_phase_signoff_approved_integrates_and_completes(
     assert wt.removed  # phase checkout cleaned up after DONE
     payload = json.loads(events_of(db, "ph", "transition")[-1]["payload_json"])
     assert payload["merge_commit"] == "merge-sha"
+
+
+def test_gate_answers_is_the_one_executor_vocabulary() -> None:
+    """CCR-3 pin: the executors' accepted answers EQUAL models.GATE_ANSWERS —
+    the same object the dashboard renders as buttons (Doctrine §9 one source);
+    the `changes_requested` alias is gone from the vocabulary."""
+    from sf_factory.models import GATE_ANSWERS
+
+    assert set(sched_mod._STAGE_ANSWER_TARGETS) == set(
+        GATE_ANSWERS[("stage", "critical_stage")]
+    )
+    assert set(sched_mod._STAGE_ANSWER_TARGETS) == set(
+        GATE_ANSWERS[("stage", "escalation_tradeoff")]
+    )
+    assert set(sched_mod._PHASE_ANSWER_TARGETS) == set(
+        GATE_ANSWERS[("phase", "escalation_tradeoff")]
+    )
+    assert GATE_ANSWERS[("phase", "phase_signoff")] == ("approved", "changes")
+    for options in GATE_ANSWERS.values():
+        assert "changes_requested" not in options
+
+
+async def test_critical_gate_decision_request_is_romanian_with_recommendation(
+    db, config_dict, tmp_path
+) -> None:
+    """§2a re-authored control-plane template: the critical_stage request the
+    founder sees is Romanian, glosses the gate kind and every option with its
+    consequence, and carries the mechanical machine-readable `Recomandare:
+    approved` marker (R3 contract) — committed before the recording tx."""
+    env = make_stage_env(db, config_dict, tmp_path, risk="critical")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "AUDIT")
+
+    def clean_auditor(role: str):
+        def behavior(cwd: Path, unit_id: str, resume) -> None:
+            d = cwd / "_factory" / "stages" / unit_id
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"audit-{role}.md").write_text("clean\n", encoding="utf-8")
+            (d / f"audit-{role}.json").write_text(
+                json.dumps({"findings": []}), encoding="utf-8"
+            )
+
+        return behavior
+
+    env.runner.behaviors["auditor_same_model"] = clean_auditor("auditor_same_model")
+    env.runner.behaviors["auditor_cross_model"] = clean_auditor("auditor_cross_model")
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.AWAITING_HUMAN
+    (pending,) = fdb.pending_decisions(db.read())
+    assert pending.gate_kind == "critical_stage"
+    row = (
+        db.read()
+        .execute(
+            "SELECT * FROM artifact_refs WHERE id = ?", (pending.request_artifact_id,)
+        )
+        .fetchone()
+    )
+    assert row["git_commit"]  # committed BEFORE the recording tx (§7 order)
+    body = (env.worktree / row["path"]).read_text(encoding="utf-8")
+    assert "Cerere de decizie" in body and "Întrebare" in body
+    assert "etapă critică — aprobare necesară (critical_stage)" in body
+    assert "risc critic (critical)" in body  # risk class glossed, never bare
+    for token in ("approved", "rework:BUILD", "rework:SPEC"):
+        assert f"- {token} — " in body  # option + one-line consequence
+    assert "Recomandare: approved" in body  # R3 machine-readable marker
+    assert "Answer with one of" not in body  # the English template is gone
+    assert "findings closed" not in body  # internal reasons stay in the journal
+
+
+async def test_signoff_request_is_romanian_with_recommendation(
+    db, config_dict, tmp_path
+) -> None:
+    """§2a re-authored phase_signoff template (driven through the real
+    _enter_signoff path)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.INTEGRATING)
+    worktree = tmp_path / "phase-wt"
+    init_repo(worktree)
+    executor = make_phase_executor(db, cfg)
+    await executor._enter_signoff(fdb.get_phase(db.read(), "ph"), worktree)
+
+    assert phase_state(db, "ph") is PhaseState.AWAITING_SIGNOFF
+    (pending,) = fdb.pending_decisions(db.read())
+    assert pending.gate_kind == "phase_signoff"
+    row = (
+        db.read()
+        .execute(
+            "SELECT * FROM artifact_refs WHERE id = ?", (pending.request_artifact_id,)
+        )
+        .fetchone()
+    )
+    assert row["git_commit"]
+    body = (worktree / row["path"]).read_text(encoding="utf-8")
+    assert "semnătură de fază (phase_signoff)" in body
+    assert "- approved — " in body and "- changes — " in body
+    assert "changes_requested" not in body  # the alias is OUT of the vocabulary
+    assert "Recomandare: approved" in body
+    assert "All stages DONE" not in body  # the English template is gone
+
+
+async def test_signoff_changes_requested_alias_is_refused(db, config_dict) -> None:
+    """CCR-3 deliberate behavioral edit (D-0017 rider 4): the signoff executor
+    no longer tolerates `changes_requested` — unknown-answer alert naming the
+    GATE_ANSWERS vocabulary, phase stays blocked; plain `changes` still works."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.AWAITING_SIGNOFF)
+    with db.transaction() as conn:
+        ref_id = _seed_artifact(conn, "ph")
+        fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="phase",
+                unit_id="ph",
+                gate_kind="phase_signoff",
+                request_artifact_id=ref_id,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+        fdb.answer_decision(conn, 1, "changes_requested", None)
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.AWAITING_SIGNOFF  # refused, blocked
+    alerts = events_of(db, "ph", "alert")
+    payload = json.loads(alerts[-1]["payload_json"])
+    assert payload["kind"] == "unknown_decision_answer"
+    assert payload["answer"] == "changes_requested"
+    assert payload["known"] == ["approved", "changes"]
+
+    with db.transaction() as conn:  # the in-vocabulary token still routes
+        fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="phase",
+                unit_id="ph",
+                gate_kind="phase_signoff",
+                request_artifact_id=ref_id,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+        fdb.answer_decision(conn, 2, "changes", None)
+    await executor.execute("ph")
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+
+
+async def test_phase_tradeoff_wrapper_links_payload_no_recommendation(
+    db, config_dict, tmp_path
+) -> None:
+    """§2a phase escalation_tradeoff wrapper: Romanian, resume/replan options
+    with consequences, /artifact/<ref> link to the anchor, no recommendation."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.ESCALATED)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    plan_path = worktree / "_factory" / "phases" / "ph" / "phase-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text("# plan\n", encoding="utf-8")
+    with db.transaction() as conn:
+        from sf_factory.artifacts import register_artifact
+
+        plan_ref = register_artifact(
+            conn,
+            unit_level="phase",
+            unit_id="ph",
+            kind="phase_plan",
+            repo="workspace",
+            repo_root=worktree,
+            path=plan_path,
+            git_commit=None,
+        )
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="phase",
+                unit_id="ph",
+                trigger="internal_error",
+                target="main_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, "awaiting_human")
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.AWAITING_HUMAN
+    (pending,) = fdb.pending_decisions(db.read())
+    assert pending.gate_kind == "escalation_tradeoff"
+    row = (
+        db.read()
+        .execute(
+            "SELECT * FROM artifact_refs WHERE id = ?", (pending.request_artifact_id,)
+        )
+        .fetchone()
+    )
+    assert row["path"].endswith("decision-request-escalation.md")
+    assert row["git_commit"]
+    body = (worktree / row["path"]).read_text(encoding="utf-8")
+    assert "compromis de produs la escaladare (escalation_tradeoff)" in body
+    assert "- resume — " in body and "- replan — " in body
+    assert f"/artifact/{plan_ref.id}" in body
+    assert "Recomandare:" not in body
 
 
 async def test_audit_contest_logs_and_escalates(db, config_dict, tmp_path) -> None:

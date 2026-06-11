@@ -1,0 +1,1627 @@
+"""Unit tests for sf_factory.dashboard (dashboard design §8 unit list).
+
+Covers: hostile-content escaping (R5) + CSP pinning (incl. the session page's
+connect-src 'self'); RO/GLOSS closure (R1/R2 — DDL gate kinds + golden-config
+risk classes); per-card containment; the unmapped `business` gate card;
+fmt_founder_ts golden; R3 recommendation parsing; the §3 answer-path matrix
+(zero writes, never KeyError), idempotent double-tap (sequential + concurrent),
+the cross-process loser, and D-0015 order under fault injection; start()/
+resolve_bind_host failure modes; the §6 dashboard supervisor (containment,
+paging dedup); Decision-Session manager bounds, transcript-before-spawn, resume
+continuity, restart rebuild, cancellation teardown and the tools-off route
+chain (§4); the D-0019 §3.1a answer-path quiesce pins (answer during a busy
+turn -> byte-stable registered transcript + green verify_integrity,
+post_message refused while answering with zero writes, a failed answer clears
+the answering flag).
+
+Fixtures beyond the frozen tests/conftest.py are defined locally (design §9).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import socket
+import stat
+import subprocess
+import urllib.error
+import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from sf_factory import dashboard as dash
+from sf_factory import db as fdb
+from sf_factory import scheduler as sched_mod
+from sf_factory.artifacts import verify_integrity
+from sf_factory.config import FactoryConfig, load_config
+from sf_factory.db import MIGRATIONS_DIR, Database
+from sf_factory.models import (
+    GATE_ANSWERS,
+    DecisionRequest,
+    FactoryError,
+    GitError,
+    NotifyError,
+    Phase,
+    PhaseState,
+    SchedCategory,
+    Stage,
+    StageState,
+    utc_now,
+)
+from sf_factory.runner import ADAPTERS, AgentResult
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ----------------------------------------------------------------- local env
+
+
+def _init_git(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "factory@test"],
+        ["git", "config", "user.name", "factory"],
+    ):
+        subprocess.run(args, cwd=path, check=True, capture_output=True)
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"], cwd=path, check=True, capture_output=True
+    )
+
+
+def _git(path: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=path, check=True, capture_output=True, text=True
+    )
+    return proc.stdout.strip()
+
+
+class FakeNotify:
+    priority_decision = "high"
+    priority_alert = "max"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.published: list[tuple[str, str | None, str]] = []
+        self.fail = fail
+
+    async def publish(self, title, *, link=None, priority="default"):
+        if self.fail:
+            raise NotifyError("ntfy down (fake)")
+        self.published.append((title, link, priority))
+
+
+def _agent_result(
+    *,
+    result_text: str = "răspuns de la agent",
+    session_id: str | None = "sess-1",
+    tokens_in: int | None = 10,
+    tokens_out: int | None = 10,
+    timed_out: bool = False,
+    exit_code: int | None = 0,
+) -> AgentResult:
+    return AgentResult(
+        process_id=1,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        killed=False,
+        declared_failure=False,
+        result_text=result_text,
+        session_id=session_id,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=None,
+        garbage_lines=0,
+        ndjson_log_path="(fake)",
+        stderr_path="(fake)",
+        duration_ms=1,
+    )
+
+
+class FakeSessionRunner:
+    """run_agent stand-in for DecisionSessionManager tests: scripted results,
+    optional hold gate (in-flight turns), records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[SimpleNamespace] = []
+        self.results: list[AgentResult | Exception] = []
+        self.gate: asyncio.Event | None = None
+        self.transcript_at_call: list[str] = []
+        self.transcript_probe: Path | None = None
+
+    async def run_agent(
+        self,
+        role: str,
+        prompt: str,
+        *,
+        unit_level: str,
+        unit_id: str,
+        cwd: Path,
+        kind: str = "agent",
+        cp_id: str | None = None,
+        timeout_s: int | None = None,
+        resume_session: str | None = None,
+    ) -> AgentResult:
+        self.calls.append(
+            SimpleNamespace(
+                role=role,
+                prompt=prompt,
+                unit_id=unit_id,
+                cwd=Path(cwd),
+                timeout_s=timeout_s,
+                resume_session=resume_session,
+            )
+        )
+        if self.transcript_probe is not None:
+            self.transcript_at_call.append(
+                self.transcript_probe.read_text(encoding="utf-8")
+                if self.transcript_probe.is_file()
+                else ""
+            )
+        if self.gate is not None:
+            await self.gate.wait()
+        result = self.results.pop(0) if self.results else _agent_result()
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+@pytest.fixture()
+def denv(config_dict: dict[str, Any], tmp_path: Path):
+    """Dashboard test env: git factory repo at factory.home, the DB at
+    process.db_path (the path GET handlers' ro connections open), fast bounds,
+    a stub decision_session route."""
+    home = Path(config_dict["factory"]["home"])
+    _init_git(home)
+    config_dict["founder_channel"]["dashboard"] = {
+        "bind": "127.0.0.1",
+        "port": 0,
+        "refresh_s": 30,
+        "answer_timeout_s": 5,
+        "read_timeout_s": 2,
+        "max_request_bytes": 4096,
+        "restart_delay_s": 0.02,
+        "page_every_n_restarts": 3,
+        "bind_recheck_s": 60,
+    }
+    config_dict["founder_channel"]["decision_session"] = {
+        "max_turns": 3,
+        "turn_timeout_s": 7,
+        "budget_tokens": 1000,
+        "poll_s": 0.05,
+    }
+    config_dict["models"]["decision_session"] = {
+        "cli": "stub",
+        "model": "stub-model",
+        "mode": "print",
+        "tools": "none",
+    }
+    cfg = FactoryConfig.model_validate(config_dict)
+    database = Database(Path(config_dict["process"]["db_path"]), busy_timeout_ms=5000)
+    database.open()
+    database.migrate(MIGRATIONS_DIR)
+    yield SimpleNamespace(cfg=cfg, db=database, home=home)
+    database.close()
+
+
+def _seed_unit(env, *, stage_id: str = "ph.s1", risk: str = "critical") -> None:
+    now = utc_now()
+    with env.db.transaction() as conn:
+        fdb.insert_phase(
+            conn,
+            Phase(
+                id="ph",
+                project="proj",
+                name="Fundația",
+                state=PhaseState.RUNNING,
+                branch="phase/ph",
+                plan_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+        fdb.insert_stage(
+            conn,
+            Stage(
+                id=stage_id,
+                phase_id="ph",
+                name="Schema de bază",
+                risk_class=risk,
+                state=StageState.AWAITING_HUMAN,
+                branch=f"stage/{stage_id}",
+                worktree_path=None,
+                spec_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+
+def _seed_decision(
+    env,
+    *,
+    stage_id: str = "ph.s1",
+    gate_kind: str = "critical_stage",
+    body: str | None = None,
+    created_at: str | None = None,
+) -> int:
+    """Pending decision whose request artifact is a real factory-repo file."""
+    unit_dir = env.home / "_factory" / "stages" / stage_id
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    path = unit_dir / "decision-request.md"
+    path.write_text(
+        body
+        if body is not None
+        else "# Cerere de decizie\n\nÎntrebare de test.\n\nRecomandare: approved\n",
+        encoding="utf-8",
+    )
+    from sf_factory.artifacts import register_artifact
+
+    with env.db.transaction() as conn:
+        ref = register_artifact(
+            conn,
+            unit_level="stage",
+            unit_id=stage_id,
+            kind="decision_request",
+            repo="factory",
+            repo_root=env.home,
+            path=path,
+            git_commit=None,
+        )
+        return fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="stage",
+                unit_id=stage_id,
+                gate_kind=gate_kind,
+                request_artifact_id=ref.id,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=created_at or utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+
+
+def _write_counts(env) -> tuple[int, int, int]:
+    conn = env.db.read()
+    events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    refs = conn.execute("SELECT COUNT(*) FROM artifact_refs").fetchone()[0]
+    answered = conn.execute(
+        "SELECT COUNT(*) FROM decision_requests WHERE status='answered'"
+    ).fetchone()[0]
+    return int(events), int(refs), int(answered)
+
+
+def _server(env) -> dash.DashboardServer:
+    return dash.DashboardServer(env.cfg, env.db, FakeSessionRunner(), FakeNotify())
+
+
+# ----------------------------------------------------- R1/R2 closure + format
+
+
+def test_gloss_closure_covers_every_rendered_token_set(real_config_path) -> None:
+    for member in (*StageState, *PhaseState, *SchedCategory):
+        assert member.value in dash.GLOSS, member
+    for options in GATE_ANSWERS.values():
+        for token in options:
+            assert token in dash.GLOSS, token
+    for event_type in dash.INCIDENT_EVENT_TYPES:
+        assert event_type in dash.GLOSS, event_type
+    # The FULL DDL gate_kind set — glossed even where no executor consumes it yet.
+    for gate_kind in ("critical_stage", "business", "phase_signoff", "escalation_tradeoff"):
+        assert gate_kind in dash.GLOSS, gate_kind
+    golden = load_config(real_config_path)
+    for risk_class in golden.risk_classes:
+        assert risk_class in dash.GLOSS, risk_class
+
+
+def test_ro_values_carry_no_english_ui_words() -> None:
+    """R1 denylist spot-check over every founder-visible literal."""
+    import re
+
+    denylist = re.compile(
+        r"\b(the|and|answer|decision|request|stage|phase|error|failed|pending|"
+        r"please|click|loading|unknown)\b",
+        re.IGNORECASE,
+    )
+    for table in (dash.RO, dash.GLOSS):
+        for key, value in table.items():
+            match = denylist.search(value)
+            assert match is None, f"{key}: english word {match.group(0)!r} in {value!r}"
+
+
+def test_unknown_token_renders_visible_missing_gloss_marker() -> None:
+    assert dash._glossed("no_such_token") == "no_such_token (etichetă lipsă)"
+
+
+def test_fmt_founder_ts_golden_chisinau() -> None:
+    # Winter (EET, UTC+2) and summer (EEST, UTC+3) — DD-MM-YYYY HH:MM (R4).
+    assert dash.fmt_founder_ts("2026-01-15T10:00:00Z", "Europe/Chisinau") == "15-01-2026 12:00"
+    assert dash.fmt_founder_ts("2026-06-11T10:00:00Z", "Europe/Chisinau") == "11-06-2026 13:00"
+    with pytest.raises(dash.DashboardError):
+        dash.fmt_founder_ts("not-a-timestamp", "Europe/Chisinau")
+
+
+def test_romanian_number_grouping() -> None:
+    assert dash._fmt_int(300000) == "300.000"
+    assert dash._fmt_int(999) == "999"
+
+
+# ------------------------------------------------------------ R3 recommendation
+
+
+def test_recommendation_parsed_only_from_declared_options() -> None:
+    options = ("approved", "rework:BUILD", "rework:SPEC")
+    assert dash._parse_recommendation("text\nRecomandare: approved\n", options) == "approved"
+    assert (
+        dash._parse_recommendation("Recommendation: rework:BUILD\n", options)
+        == "rework:BUILD"
+    )
+    assert dash._parse_recommendation("no marker at all", options) is None
+    # Unmatched token: NEVER invented (R3).
+    assert dash._parse_recommendation("Recomandare: deploy_now\n", options) is None
+    assert dash._parse_recommendation("Recomandare: approved", ()) is None
+
+
+# ------------------------------------------------------- render: hostile + cards
+
+_HOSTILE = (
+    "# Titlu\n<script>alert(1)</script>\n"
+    '<img src=x onerror="alert(2)">\n'
+    "[link](javascript:alert(3))\n"
+    "```\n<svg/onload=alert(4)>\n```\n"
+    "broken utf8 marker: �\n"
+    "Recomandare: approved\n"
+)
+
+
+def test_hostile_artifact_content_is_escaped_never_executable(denv) -> None:
+    _seed_unit(denv)
+    _seed_decision(denv, body=_HOSTILE)
+    view = dash.build_view(denv.cfg)
+    page = dash.render_page(view, denv.cfg)
+    assert "<script" not in page  # zero JS on the main page — escaped or absent
+    assert "<img" not in page  # no live tag — only the &lt;img …&gt; text remains
+    assert "<svg" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page  # visible as text
+    assert "&lt;img src=x onerror=" in page  # escaped, structure preserved (R5)
+    assert "javascript:alert(3)" in page  # plain text, never a hyperlink
+    assert "<a href='javascript:" not in page
+    # The R3 marker still parsed mechanically from the hostile body:
+    assert dash.RO["recommended_badge"] in page
+
+
+def test_broken_utf8_artifact_survives_replacement(denv, tmp_path) -> None:
+    _seed_unit(denv)
+    unit_dir = denv.home / "_factory" / "stages" / "ph.s1"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    raw = unit_dir / "decision-request.md"
+    raw.write_bytes(b"intrebare \xff\xfe invalid bytes\n")
+    from sf_factory.artifacts import register_artifact
+
+    with denv.db.transaction() as conn:
+        ref = register_artifact(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            kind="decision_request",
+            repo="factory",
+            repo_root=denv.home,
+            path=raw,
+            git_commit=None,
+        )
+        fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                gate_kind="critical_stage",
+                request_artifact_id=ref.id,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "invalid bytes" in page  # rendered with replacement, page alive
+
+
+def test_per_card_containment_one_poisoned_card_rest_renders(denv) -> None:
+    _seed_unit(denv)
+    good_id = _seed_decision(denv, body="Întrebare bună.\n")
+    # Poisoned: the request ref resolves to NOTHING (no worktree, no commit, no
+    # file, no HEAD blob) — assembly raises, containment must hold.
+    from sf_factory.models import ArtifactRef
+
+    with denv.db.transaction() as conn:
+        ref_id = fdb.insert_artifact_ref(
+            conn,
+            ArtifactRef(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                kind="decision_request",
+                repo="factory",
+                path="_factory/stages/ph.s1/vanished.md",
+                sha256="2" * 64,
+                git_commit=None,
+                created_at=utc_now(),
+            ),
+        )
+        bad_id = fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                gate_kind="critical_stage",
+                request_artifact_id=ref_id,
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "Întrebare bună." in page  # the good card rendered
+    assert dash.RO["card_error"][:40] in page  # the bad one = explicit RO error card
+    assert f"id='decision/{good_id}'" in page
+    assert f"id='decision/{bad_id}'" in page  # anchor still present (deep links land)
+
+
+def test_unmapped_business_gate_renders_without_buttons_naming_cli_decide(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv, gate_kind="business", body="Decizie de business.\n")
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert f"action='/decision/{request_id}/answer'" not in page  # no buttons
+    assert "cli decide" in page  # RO notice names the emergency path
+    assert "decizie de business (business)" in page  # gate kind glossed (R2)
+
+
+def test_card_title_age_and_anchor_format(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv, created_at="2026-06-11T10:00:00Z")
+    view = dash.build_view(denv.cfg, now="2026-06-11T10:00:45Z")
+    card = next(c for c in view.cards if c.request_id == request_id)
+    assert card.unit_name == "Schema de bază"
+    assert card.created_display.startswith("creată 11-06-2026 13:00 · acum 45s")
+    page = dash.render_page(view, denv.cfg)
+    assert f"Decizia #{request_id} — Etapa: Schema de bază (ph.s1)" in page
+    assert "etapă critică — aprobare necesară (critical_stage)" in page
+
+
+def test_health_strip_budget_and_incident(denv) -> None:
+    _seed_unit(denv)
+    with denv.db.transaction() as conn:
+        pid = fdb.insert_process(
+            conn,
+            __import__("sf_factory.models", fromlist=["ProcessRecord"]).ProcessRecord(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                kind="agent",
+                role="builder_routine",
+                cp_id=None,
+                session_id=None,
+                pid=None,
+                cmdline="stub",
+                cwd=None,
+                state="exited",
+                exit_code=0,
+                ndjson_log_path=None,
+                spawned_at=utc_now(),
+                heartbeat_at=None,
+                ended_at=utc_now(),
+            ),
+        )
+        fdb.insert_token_usage(
+            conn,
+            process_id=pid,
+            unit_level="stage",
+            unit_id="ph.s1",
+            role="builder_routine",
+            model="stub-model",
+            tokens_in=120000,
+            tokens_out=22000,
+            cost_usd=1.25,
+        )
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="usage_missing",
+            actor="control_plane",
+            payload={},
+        )
+    # Fresh liveness file -> no red marker.
+    liveness = denv.home / ".factory" / "liveness"
+    liveness.parent.mkdir(parents=True, exist_ok=True)
+    liveness.write_text("tick\n", encoding="utf-8")
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "142.000" in page  # Romanian grouping of the stage burn (R4)
+    assert "%" in page
+    assert dash.RO["pulse_stale"] not in page
+    assert "consum de tokeni neraportat (usage_missing)" in page  # Ultimul incident
+    # Stale liveness -> red marker.
+    old = 10_000
+    os.utime(liveness, (os.stat(liveness).st_mtime - old, os.stat(liveness).st_mtime - old))
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["pulse_stale"] in page
+
+
+def test_plan_section_groups_and_footer(denv) -> None:
+    _seed_unit(denv)
+    now = utc_now()
+    with denv.db.transaction() as conn:
+        fdb.insert_stage(
+            conn,
+            Stage(
+                id="ph.done",
+                phase_id="ph",
+                name="Etapa gata",
+                risk_class="routine",
+                state=StageState.DONE,
+                branch=None,
+                worktree_path=None,
+                spec_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+        fdb.insert_stage(
+            conn,
+            Stage(
+                id="ph.todo",
+                phase_id="ph",
+                name="Etapa planificată",
+                risk_class="routine",
+                state=StageState.PENDING,
+                branch=None,
+                worktree_path=None,
+                spec_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["plan_done_group"] in page
+    assert dash.RO["plan_pending_group"] in page
+    assert dash.RO["plan_footer"] in page
+
+
+# --------------------------------------------------------------- answer matrix
+
+
+async def test_answer_unknown_request_zero_writes(denv) -> None:
+    server = _server(denv)
+    before = _write_counts(denv)
+    result = await server.answer(424242, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.UNKNOWN_REQUEST
+    assert _write_counts(denv) == before
+
+
+async def test_answer_invalid_option_and_unmapped_gate_zero_writes(denv) -> None:
+    _seed_unit(denv)
+    critical = _seed_decision(denv)
+    business = _seed_decision(denv, gate_kind="business", body="Business.\n")
+    server = _server(denv)
+    before = _write_counts(denv)
+    result = await server.answer(critical, "deploy_now", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.INVALID_OPTION
+    # Unmapped (level, gate_kind): every option -> INVALID_OPTION, never KeyError.
+    for option in ("approved", "yes", ""):
+        result = await server.answer(business, option, via="dashboard")
+        assert result.outcome is dash.AnswerOutcome.INVALID_OPTION
+    assert _write_counts(denv) == before
+
+
+async def test_answer_happy_path_d0015_order_and_redispatch_signal(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    result = await server.answer(request_id, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.ANSWERED
+
+    conn = denv.db.read()
+    row = conn.execute(
+        "SELECT * FROM decision_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    assert row["status"] == "answered" and row["answer"] == "approved"
+    ref = conn.execute(
+        "SELECT * FROM artifact_refs WHERE id = ?", (row["answer_artifact_id"],)
+    ).fetchone()
+    assert ref["kind"] == "decision_answer" and ref["repo"] == "factory"
+    assert ref["git_commit"] == _git(denv.home, "rev-parse", "HEAD")
+    shown = _git(denv.home, "show", f"{ref['git_commit']}:{ref['path']}")
+    assert "answer: approved" in shown and "answered_via: dashboard" in shown
+    events = conn.execute(
+        "SELECT * FROM events WHERE event_type='decision_answered'"
+    ).fetchall()
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload_json"])
+    assert payload["via"] == "dashboard" and events[0]["actor"] == "founder"
+
+
+async def test_answer_double_tap_sequential_and_concurrent(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    first, second = await asyncio.gather(
+        server.answer(request_id, "approved", via="dashboard"),
+        server.answer(request_id, "approved", via="dashboard"),
+    )
+    outcomes = {first.outcome, second.outcome}
+    assert outcomes == {dash.AnswerOutcome.ANSWERED, dash.AnswerOutcome.ALREADY_ANSWERED}
+    third = await server.answer(request_id, "rework:BUILD", via="dashboard")
+    assert third.outcome is dash.AnswerOutcome.ALREADY_ANSWERED
+    conn = denv.db.read()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='decision_answered'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT answer FROM decision_requests WHERE id = ?", (request_id,)
+        ).fetchone()["answer"]
+        == "approved"
+    )
+
+
+async def test_answer_cross_process_loser_maps_to_already_answered(
+    denv, monkeypatch
+) -> None:
+    """§3.3: a cli decide completing its WHOLE commit+tx inside step 2's await
+    window collides only at answer_decision's pending guard -> explicit no-op,
+    never a 500, no second answer row."""
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    real_commit_paths = dash.commit_paths
+
+    async def rival_commit_paths(*args, **kwargs):
+        sha = await real_commit_paths(*args, **kwargs)
+        with denv.db.transaction() as conn:  # the rival lands its full answer here
+            fdb.answer_decision(conn, request_id, "rework:SPEC", None)
+        return sha
+
+    monkeypatch.setattr(dash, "commit_paths", rival_commit_paths)
+    result = await server.answer(request_id, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.ALREADY_ANSWERED
+    conn = denv.db.read()
+    row = conn.execute(
+        "SELECT * FROM decision_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    assert row["answer"] == "rework:SPEC"  # the rival's answer stands
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='decision_answered'"
+        ).fetchone()[0]
+        == 0
+    )  # the dashboard's tx rolled back whole
+
+
+async def test_answer_tx_failure_then_retry_converges_with_head_commit(
+    denv, monkeypatch
+) -> None:
+    """D-0015 order: tx fails -> artifact already committed, row still pending;
+    the retry's commit_paths returns None and the ref pins rev-parse HEAD.
+
+    Time is frozen for the WHOLE test: the artifact embeds a second-granularity
+    answered_at, so the §3.2 byte-identical-retry branch (commit_paths -> None
+    -> rev-parse HEAD) is only deterministic when both answer() calls render
+    the same timestamp — without the freeze, a wall-clock second boundary under
+    suite load produces a (harmless, but HEAD-moving) superseding commit."""
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    monkeypatch.setattr(dash, "utc_now", lambda: "2026-06-11T12:00:00Z")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected tx failure")
+
+    # The boom injection gets its OWN context: undoing it must not undo the
+    # frozen utc_now above (monkeypatch.undo() would drop both).
+    with pytest.MonkeyPatch.context() as boom_patch:
+        boom_patch.setattr(dash.fdb, "answer_decision", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            await server.answer(request_id, "approved", via="dashboard")
+
+    conn = denv.db.read()
+    row = conn.execute(
+        "SELECT status FROM decision_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    assert row["status"] == "pending"  # tx rolled back whole
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM artifact_refs WHERE kind='decision_answer'"
+        ).fetchone()[0]
+        == 0
+    )
+    answer_file = f"_factory/stages/ph.s1/decision-answer-{request_id}.md"
+    head = _git(denv.home, "rev-parse", "HEAD")
+    assert "answer: approved" in _git(denv.home, "show", f"HEAD:{answer_file}")
+
+    result = await server.answer(request_id, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.ANSWERED
+    assert _git(denv.home, "rev-parse", "HEAD") == head  # nothing new to commit
+    ref = (
+        denv.db.read()
+        .execute("SELECT * FROM artifact_refs WHERE kind='decision_answer'")
+        .fetchone()
+    )
+    assert ref["git_commit"] == head  # rev-parse HEAD, never NULL
+
+
+async def test_answer_commit_failure_means_zero_db_writes(denv, monkeypatch) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+
+    async def git_down(*args, **kwargs):
+        raise GitError("index locked (injected)")
+
+    monkeypatch.setattr(dash, "commit_paths", git_down)
+    before = _write_counts(denv)
+    with pytest.raises(GitError):
+        await server.answer(request_id, "approved", via="dashboard")
+    assert _write_counts(denv) == before
+    row = (
+        denv.db.read()
+        .execute("SELECT status FROM decision_requests WHERE id = ?", (request_id,))
+        .fetchone()
+    )
+    assert row["status"] == "pending"
+
+
+# ------------------------------------------------------- bind / start failures
+
+
+def test_resolve_bind_host_literal_stub_and_failure(
+    denv, tmp_path, monkeypatch
+) -> None:
+    assert dash.resolve_bind_host(denv.cfg) == "127.0.0.1"  # literal pass-through
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "tailscale"
+    fake.write_text("#!/bin/sh\necho 100.64.0.7\necho 100.64.0.8\n", encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    cfg_dict = json.loads(denv.cfg.model_dump_json())
+    cfg_dict["founder_channel"]["dashboard"]["bind"] = "tailscale"
+    cfg = FactoryConfig.model_validate(cfg_dict)
+    assert dash.resolve_bind_host(cfg) == "100.64.0.7"  # first address
+
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    with pytest.raises(FactoryError):
+        dash.resolve_bind_host(cfg)
+
+    fake.write_text("#!/bin/sh\necho\n", encoding="utf-8")  # empty output
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    with pytest.raises(FactoryError):
+        dash.resolve_bind_host(cfg)
+
+
+def test_start_on_in_use_port_is_factory_error(denv) -> None:
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        cfg_dict = json.loads(denv.cfg.model_dump_json())
+        cfg_dict["founder_channel"]["dashboard"]["port"] = port
+        cfg = FactoryConfig.model_validate(cfg_dict)
+        server = dash.DashboardServer(cfg, denv.db, FakeSessionRunner(), FakeNotify())
+        with pytest.raises(FactoryError, match="bind"):
+            server.start()
+        assert server.bound_address is None
+    finally:
+        blocker.close()
+
+
+def test_start_sets_bound_address_with_real_ephemeral_port(denv) -> None:
+    server = _server(denv)
+    server.start()
+    try:
+        assert server.bound_address is not None
+        host, port = server.bound_address
+        assert host == "127.0.0.1" and port > 0  # the §6 readiness signal
+        server.start()  # idempotent re-call keeps the same bind
+        assert server.bound_address == (host, port)
+    finally:
+        # Bound but never served: close the socket directly (shutdown() waits
+        # on serve_forever, which only serve() runs).
+        server._server.server_close()
+
+
+# ------------------------------------------------------------- HTTP + CSP pins
+
+
+async def _serving(server: dash.DashboardServer):
+    server.start()
+    task = asyncio.create_task(server.serve())
+    for _ in range(200):
+        if server._loop is not None:
+            break
+        await asyncio.sleep(0.01)
+    return task
+
+
+def _http(method: str, url: str, body: bytes | None = None):
+    request = urllib.request.Request(url, data=body, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, dict(response.headers), response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read().decode("utf-8")
+
+
+async def test_http_csp_pins_and_routes(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        base = f"http://{host}:{port}"
+
+        status, headers, page = await asyncio.to_thread(_http, "GET", f"{base}/")
+        assert status == 200
+        csp = headers["Content-Security-Policy"]
+        # form-action/base-uri/frame-ancestors do NOT fall back to default-src:
+        for directive in (
+            "default-src 'none'",
+            "style-src 'unsafe-inline'",
+            "form-action 'self'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+        ):
+            assert directive in csp
+        assert "script-src" not in csp  # zero JS on the main page
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert f"id='decision/{request_id}'" in page
+
+        status, headers, body = await asyncio.to_thread(
+            _http, "GET", f"{base}/decision/{request_id}/session"
+        )
+        assert status == 200
+        csp = headers["Content-Security-Policy"]
+        assert "connect-src 'self'" in csp  # the only thing keeping the poll alive
+        nonce = csp.split("'nonce-")[1].split("'")[0]
+        assert f"nonce='{nonce}'" in body  # script carries the SAME nonce
+        for directive in ("form-action 'self'", "base-uri 'none'", "frame-ancestors 'none'"):
+            assert directive in csp
+
+        status, headers, body = await asyncio.to_thread(
+            _http, "GET", f"{base}/decision/{request_id}/session/poll?after=0"
+        )
+        assert status == 200
+        assert headers["Content-Type"].startswith("application/json")
+        assert json.loads(body)["turns"] == []
+
+        status, _, body = await asyncio.to_thread(_http, "GET", f"{base}/nu-exista")
+        assert status == 404 and dash.RO["not_found"] in body
+
+        # POST body bounded by max_request_bytes -> 413 RO.
+        status, _, body = await asyncio.to_thread(
+            _http,
+            "POST",
+            f"{base}/decision/{request_id}/answer",
+            b"option=" + b"x" * 8192,
+        )
+        assert status == 413 and dash.RO["request_too_large"] in body
+
+        # Invalid option over HTTP: 400 listing the valid options in Romanian.
+        status, _, body = await asyncio.to_thread(
+            _http, "POST", f"{base}/decision/{request_id}/answer", b"option=deploy"
+        )
+        assert status == 400
+        assert dash.RO["answer_invalid_option"] in body
+        assert "aprobă (approved)" in body
+
+        # The single write path over HTTP: 303 back to the card anchor.
+        status, headers, _ = await asyncio.to_thread(
+            _http, "POST", f"{base}/decision/{request_id}/answer", b"option=approved"
+        )
+        # urllib follows the 303 to GET / -> lands 200 on the page.
+        assert status == 200
+        row = (
+            denv.db.read()
+            .execute("SELECT status FROM decision_requests WHERE id=?", (request_id,))
+            .fetchone()
+        )
+        assert row["status"] == "answered"
+
+        # Double-tap over HTTP: explicit RO no-op page, still 200.
+        status, _, body = await asyncio.to_thread(
+            _http, "POST", f"{base}/decision/{request_id}/answer", b"option=approved"
+        )
+        assert status == 200 and dash.RO["answered_already"] in body
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_artifact_view_escapes_content(denv) -> None:
+    _seed_unit(denv)
+    _seed_decision(denv, body="<script>boom()</script>\n")
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        ref_id = (
+            denv.db.read()
+            .execute("SELECT MIN(id) FROM artifact_refs")
+            .fetchone()[0]
+        )
+        status, _, body = await asyncio.to_thread(
+            _http, "GET", f"http://{host}:{port}/artifact/{ref_id}"
+        )
+        assert status == 200
+        assert "<script>boom" not in body and "&lt;script&gt;boom" in body
+        status, _, body = await asyncio.to_thread(
+            _http, "GET", f"http://{host}:{port}/artifact/999999"
+        )
+        assert status == 404 and dash.RO["artifact_missing"] in body
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_post_negative_content_length_rejected_413(denv) -> None:
+    """A negative Content-Length must never reach rfile.read(): read(-1) is an
+    unbounded read-until-EOF that pins one handler thread while the client
+    keeps the socket open (read_timeout_s bounds stalls, not a fed stream).
+    Rejected 413, exactly like an oversize body."""
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+
+        def raw_post() -> bytes:
+            with socket.create_connection((host, port), timeout=5) as sock:
+                sock.sendall(
+                    (
+                        f"POST /decision/{request_id}/answer HTTP/1.1\r\n"
+                        f"Host: {host}:{port}\r\n"
+                        "Content-Length: -1\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                )
+                chunks = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks += chunk
+                return chunks
+
+        response = await asyncio.to_thread(raw_post)
+        assert b" 413 " in response.split(b"\r\n", 1)[0]
+        assert dash.RO["request_too_large"].encode("utf-8") in response
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+# ------------------------------------------------------------ supervisor (§6/§7)
+
+
+class CrashingDashboard:
+    """Duck-typed stand-in: serve() always crashes; no bind to drift-check."""
+
+    def __init__(self) -> None:
+        self.serves = 0
+        self.bound_address = None
+
+    async def serve(self) -> None:
+        self.serves += 1
+        raise RuntimeError(f"boom #{self.serves}")
+
+
+def _make_scheduler(db, cfg, *, notify: FakeNotify, dashboard) -> sched_mod.Scheduler:
+    from sf_factory.statemachine import StateMachine
+
+    return sched_mod.Scheduler(db, StateMachine(db), cfg, {}, notify, dashboard=dashboard)
+
+
+async def _run_scheduler_until(scheduler, predicate, timeout: float = 10.0) -> None:
+    task = asyncio.create_task(scheduler.run_forever())
+    try:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if predicate():
+                return
+            assert not task.done(), task
+            await asyncio.sleep(0.02)
+        raise AssertionError("supervisor condition not reached in time")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_supervisor_contains_crashes_pages_deduped(denv) -> None:
+    """§7 row 1: crash -> 'alert' event EVERY restart (counter in payload),
+    max-priority page on crash 1 then every Nth (page_every_n_restarts=3),
+    scheduler loop unaffected (it keeps ticking the liveness file)."""
+    crashing = CrashingDashboard()
+    notify = FakeNotify()
+    scheduler = _make_scheduler(denv.db, denv.cfg, notify=notify, dashboard=crashing)
+
+    def four_restarts() -> bool:
+        rows = (
+            denv.db.read()
+            .execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='alert'"
+                " AND json_extract(payload_json, '$.kind')='dashboard_crashed'"
+            )
+            .fetchone()
+        )
+        return int(rows[0]) >= 4
+
+    await _run_scheduler_until(scheduler, four_restarts)
+    rows = (
+        denv.db.read()
+        .execute(
+            "SELECT payload_json FROM events WHERE event_type='alert'"
+            " AND json_extract(payload_json, '$.kind')='dashboard_crashed'"
+            " ORDER BY seq"
+        )
+        .fetchall()
+    )
+    counters = [json.loads(r["payload_json"])["restarts"] for r in rows]
+    assert counters[:4] == [1, 2, 3, 4]  # audit trail on EVERY restart
+    pages = [p for p in notify.published if "Dashboard căzut" in p[0]]
+    # Pages fire on restart 1 then every 3rd — never one per restart; the last
+    # in-flight iteration may have been cancelled between event and publish,
+    # hence the ±1 tolerance.
+    expected = len([c for c in counters if c == 1 or c % 3 == 0])
+    assert expected - 1 <= len(pages) <= expected
+    assert 1 <= len(pages) < len(counters)  # deduplicated, but never silent
+    assert all(p[2] == "max" for p in pages)
+    # The scheduler loop kept ticking: the liveness file exists and is fresh.
+    liveness = denv.home / ".factory" / "liveness"
+    assert liveness.is_file()
+
+
+async def test_supervisor_publish_failure_never_escapes(denv) -> None:
+    """The supervisor's own page follows the §6 NotifyError contract:
+    alert_delivery_failed event, never re-raise — the loop keeps running."""
+    crashing = CrashingDashboard()
+    scheduler = _make_scheduler(
+        denv.db, denv.cfg, notify=FakeNotify(fail=True), dashboard=crashing
+    )
+
+    def delivery_failed_logged() -> bool:
+        rows = (
+            denv.db.read()
+            .execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='alert_delivery_failed'"
+                " AND json_extract(payload_json, '$.kind')='dashboard_crashed'"
+            )
+            .fetchone()
+        )
+        return int(rows[0]) >= 1 and crashing.serves >= 2
+
+    await _run_scheduler_until(scheduler, delivery_failed_logged)
+
+
+async def test_supervisor_publish_unexpected_exception_never_escapes(denv) -> None:
+    """Hardening beyond the declared §6 NotifyError: a publisher defect of ANY
+    exception type is contained the same way (alert_delivery_failed event,
+    supervisor keeps restarting) — nothing escapes into the TaskGroup."""
+
+    class DefectiveNotify(FakeNotify):
+        async def publish(self, title, *, link=None, priority="default"):
+            raise RuntimeError("publisher bug (injected)")
+
+    crashing = CrashingDashboard()
+    scheduler = _make_scheduler(
+        denv.db, denv.cfg, notify=DefectiveNotify(), dashboard=crashing
+    )
+
+    def delivery_failed_logged() -> bool:
+        rows = (
+            denv.db.read()
+            .execute(
+                "SELECT COUNT(*) FROM events WHERE event_type='alert_delivery_failed'"
+                " AND json_extract(payload_json, '$.kind')='dashboard_crashed'"
+            )
+            .fetchone()
+        )
+        return int(rows[0]) >= 1 and crashing.serves >= 2
+
+    await _run_scheduler_until(scheduler, delivery_failed_logged)
+
+
+async def test_reap_serve_task_suppresses_outcome_propagates_own_cancel() -> None:
+    """_reap_serve_task contract: the serve task's OWN outcome (cancelled or
+    crashed) is suppressed, but the supervisor's own cancellation landing
+    during the await re-raises — Scheduler._run cancels the supervisor exactly
+    once, so a swallowed cancel would leave the TaskGroup never closing."""
+    # 1. Cancelled serve task: its CancelledError outcome is suppressed.
+    hung = asyncio.create_task(asyncio.sleep(3600))
+    await asyncio.sleep(0)
+    hung.cancel()
+    await sched_mod.Scheduler._reap_serve_task(hung)  # returns, raises nothing
+
+    # 2. Crashed serve task: its exception is suppressed (and retrieved).
+    async def crash() -> None:
+        raise RuntimeError("serve crashed (injected)")
+
+    crashed = asyncio.create_task(crash())
+    await asyncio.sleep(0)
+    await sched_mod.Scheduler._reap_serve_task(crashed)
+
+    # 3. The reaper's OWN cancellation propagates even while serve_task
+    # resists its cancel — the exact swallowed-shutdown-cancel scenario.
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # ignore the first cancel for a moment
+            raise
+
+    serve = asyncio.create_task(stubborn())
+    await asyncio.sleep(0)  # stubborn parks on its event
+    serve.cancel()
+    reaper = asyncio.create_task(sched_mod.Scheduler._reap_serve_task(serve))
+    await asyncio.sleep(0.05)  # reaper parks on `await serve_task`
+    assert not reaper.done()
+    reaper.cancel()  # the one-shot supervisor.cancel() from Scheduler._run
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reaper
+    assert reaper.cancelled()  # NOT swallowed — shutdown proceeds
+    with pytest.raises(asyncio.CancelledError):
+        await serve
+
+
+async def test_run_until_blocked_cancels_supervisor_and_returns(denv) -> None:
+    """The supervisor task is excluded from quiescence accounting and cancelled
+    on the run_until_blocked exit path — the TaskGroup closes (§6)."""
+    crashing = CrashingDashboard()
+    scheduler = _make_scheduler(denv.db, denv.cfg, notify=FakeNotify(), dashboard=crashing)
+    await asyncio.wait_for(scheduler.run_until_blocked(), timeout=10)
+
+
+# --------------------------------------------------------- decision sessions §4
+
+
+def _session_env(denv) -> SimpleNamespace:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv, body="Întrebare?\n")
+    runner = FakeSessionRunner()
+    manager = dash.DecisionSessionManager(denv.cfg, denv.db, runner)
+    return SimpleNamespace(request_id=request_id, runner=runner, manager=manager)
+
+
+async def test_session_transcript_appended_before_spawn_and_resume_continuity(
+    denv,
+) -> None:
+    env = _session_env(denv)
+    env.runner.transcript_probe = env.manager._transcript_path_for(
+        dash._get_decision(denv.db.read(), env.request_id)
+    )
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        snap = await env.manager.post_message(env.request_id, "Care e riscul?")
+        assert snap.busy is True
+        assert [t.author for t in snap.turns] == ["founder"]
+    # TaskGroup exit waited the turn out.
+    snap = await env.manager.snapshot(env.request_id)
+    assert [t.author for t in snap.turns] == ["founder", "agent"]
+    assert snap.busy is False and snap.locked is None
+    # Crash-durability: the founder message was IN the file before the spawn.
+    assert "Care e riscul?" in env.runner.transcript_at_call[0]
+    first_call = env.runner.calls[0]
+    assert first_call.role == "decision_session"
+    assert first_call.resume_session is None
+    assert "Întrebare?" in first_call.prompt  # request artifact fed to the frame
+    assert str(first_call.cwd).endswith(f".factory/sessions/{env.request_id}")
+    assert first_call.timeout_s == denv.cfg.founder_channel.decision_session.turn_timeout_s
+
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        await env.manager.post_message(env.request_id, "Și costul?")
+    second_call = env.runner.calls[1]
+    assert second_call.resume_session == "sess-1"  # claude --resume continuity
+    assert second_call.prompt == "Și costul?"  # later turns: just the message
+
+
+async def test_session_busy_locked_and_bounds_refuse_explicitly(denv) -> None:
+    env = _session_env(denv)
+    env.runner.gate = asyncio.Event()
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    try:
+        await env.manager.post_message(env.request_id, "primul")
+        with pytest.raises(dash.DashboardError, match="încă răspunde"):
+            await env.manager.post_message(env.request_id, "al doilea")  # busy
+        env.runner.gate.set()
+        await _wait_idle(env.manager, env.request_id)
+
+        # Budget bound: 1000-token budget, each turn burns 20 -> force over.
+        env.runner.results = [_agent_result(tokens_in=600, tokens_out=600)]
+        env.runner.gate = None
+        await env.manager.post_message(env.request_id, "scump")
+        await _wait_idle(env.manager, env.request_id)
+        snap = await env.manager.snapshot(env.request_id)
+        assert snap.locked == dash.RO["session_budget_exhausted"]
+        with pytest.raises(dash.DashboardError):
+            await env.manager.post_message(env.request_id, "după buget")
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+
+async def test_session_max_turns_locks(denv) -> None:
+    env = _session_env(denv)
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    try:
+        for index in range(denv.cfg.founder_channel.decision_session.max_turns):
+            await env.manager.post_message(env.request_id, f"mesaj {index}")
+            await _wait_idle(env.manager, env.request_id)
+        snap = await env.manager.snapshot(env.request_id)
+        assert snap.turns_left == 0
+        assert snap.locked == dash.RO["session_turns_exhausted"]
+        with pytest.raises(dash.DashboardError):
+            await env.manager.post_message(env.request_id, "peste limită")
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+
+async def test_session_cancelled_turn_clears_busy_appends_notice_next_accepted(
+    denv,
+) -> None:
+    """§4/§7: a serve() restart cancels in-flight turns — the try/finally
+    teardown must clear busy and append the failed-turn notice, or the session
+    wedges 'busy' forever."""
+    env = _session_env(denv)
+    env.runner.gate = asyncio.Event()  # never set: the turn hangs until cancelled
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    await env.manager.post_message(env.request_id, "în zbor")
+    await asyncio.sleep(0.02)
+    host.cancel()  # the serve()-restart equivalent
+    with pytest.raises(asyncio.CancelledError):
+        await host
+
+    snap = await env.manager.snapshot(env.request_id)
+    assert snap.busy is False  # never wedged
+    assert snap.turns[-1].text == dash.RO["session_turn_failed"]
+    assert dash.RO["session_turn_failed"] in env.manager.transcript_path(
+        env.request_id
+    ).read_text(encoding="utf-8")
+
+    env.runner.gate = None
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    try:
+        await env.manager.post_message(env.request_id, "după restart")  # accepted
+        await _wait_idle(env.manager, env.request_id)
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+
+async def test_session_failed_turn_notice_not_retried(denv) -> None:
+    env = _session_env(denv)
+    env.runner.results = [RuntimeError("spawn exploded")]
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        await env.manager.post_message(env.request_id, "salut")
+    snap = await env.manager.snapshot(env.request_id)
+    assert snap.busy is False
+    assert snap.turns[-1].text == dash.RO["session_turn_failed"]
+    assert len(env.runner.calls) == 1  # never auto-retried
+
+
+async def test_session_restart_rebuilds_from_transcript(denv) -> None:
+    env = _session_env(denv)
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        await env.manager.post_message(env.request_id, "înainte de restart")
+    # New manager = orchestrator restart (in-memory state lost, file survives).
+    fresh_runner = FakeSessionRunner()
+    fresh = dash.DecisionSessionManager(denv.cfg, denv.db, fresh_runner)
+    snap = await fresh.snapshot(env.request_id)
+    assert [t.author for t in snap.turns] == ["founder", "agent"]
+    assert snap.turns[0].text == "înainte de restart"
+    async with asyncio.TaskGroup() as tg:
+        fresh._set_taskgroup(tg)
+        await fresh.post_message(env.request_id, "după restart")
+    call = fresh_runner.calls[0]
+    assert call.resume_session is None  # CLI session lost with the process
+    assert "înainte de restart" in call.prompt  # transcript fed back as context
+
+
+async def test_session_refused_on_answered_request_and_pending_validation(denv) -> None:
+    env = _session_env(denv)
+    server = dash.DashboardServer(denv.cfg, denv.db, env.runner, FakeNotify())
+    result = await server.answer(env.request_id, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.ANSWERED
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        with pytest.raises(dash.DashboardError, match="deja înregistrată"):
+            await env.manager.post_message(env.request_id, "prea târziu")
+        with pytest.raises(dash.DashboardError):
+            await env.manager.post_message(424242, "nimeni")
+        with pytest.raises(dash.DashboardError, match="gol"):
+            await env.manager.post_message(env.request_id, "   ")
+
+
+async def test_answer_commits_and_registers_transcript_with_answer(denv) -> None:
+    """§3 step 2/3: an existing session transcript rides the SAME commit and the
+    SAME tx as the answer (kind='transcript')."""
+    env = _session_env(denv)
+    async with asyncio.TaskGroup() as tg:
+        env.manager._set_taskgroup(tg)
+        await env.manager.post_message(env.request_id, "discuție înainte")
+    server = dash.DashboardServer(denv.cfg, denv.db, env.runner, FakeNotify())
+    server._sessions = env.manager  # the orchestrator-owned manager instance
+    result = await server.answer(env.request_id, "approved", via="dashboard")
+    assert result.outcome is dash.AnswerOutcome.ANSWERED
+    conn = denv.db.read()
+    transcript_ref = conn.execute(
+        "SELECT * FROM artifact_refs WHERE kind='transcript'"
+    ).fetchone()
+    answer_ref = conn.execute(
+        "SELECT * FROM artifact_refs WHERE kind='decision_answer'"
+    ).fetchone()
+    assert transcript_ref is not None
+    assert transcript_ref["git_commit"] == answer_ref["git_commit"]  # same commit
+    event = conn.execute(
+        "SELECT payload_json FROM events WHERE event_type='decision_answered'"
+    ).fetchone()
+    assert json.loads(event["payload_json"])["transcript_artifact_id"] == transcript_ref["id"]
+
+
+# ----------------------------------------------- answer-path quiesce (D-0019)
+
+
+async def test_answer_during_busy_turn_registers_byte_stable_transcript(denv) -> None:
+    """D-0019 pin (§3.1a): answering while an agent turn is composing cancels
+    and AWAITS the turn, so the registered transcript ref resolves AT its
+    recorded commit (sha256 == committed blob bytes), verify_integrity stays
+    green for the non-terminal unit, and the cancelled-turn notice IS in the
+    committed transcript. Pre-fix, a turn appending inside the commit window
+    registered post-append bytes against the pre-append commit — a ref
+    resolving nowhere, aborting the next orchestrator start."""
+    env = _session_env(denv)
+    # The seeded request artifact must ride a commit too: verify_integrity
+    # checks EVERY latest ref of the non-terminal unit, not only the new ones.
+    _git(denv.home, "add", "-A")
+    _git(denv.home, "commit", "-q", "-m", "seed decision request")
+    env.runner.gate = asyncio.Event()  # the turn composes until cancelled
+    server = dash.DashboardServer(denv.cfg, denv.db, env.runner, FakeNotify())
+    server._sessions = env.manager  # the orchestrator-owned manager instance
+    real_commit_paths = dash.commit_paths
+
+    async def racing_commit_paths(*args, **kwargs):
+        # Inside the §3.2 commit window, give a surviving turn every chance to
+        # append (the reproduced race: git pins pre-append bytes, register
+        # hashes post-append). With the §3.1a quiesce the turn is already
+        # terminated here: the gate release is a no-op and busy is False.
+        sha = await real_commit_paths(*args, **kwargs)
+        env.runner.gate.set()
+        for _ in range(100):
+            if not (await env.manager.snapshot(env.request_id)).busy:
+                break
+            await asyncio.sleep(0.01)
+        return sha
+
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    try:
+        await env.manager.post_message(env.request_id, "întrebare în zbor")
+        await asyncio.sleep(0.02)  # the turn task is genuinely in flight
+        assert (await env.manager.snapshot(env.request_id)).busy is True
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(dash, "commit_paths", racing_commit_paths)
+            result = await server.answer(env.request_id, "approved", via="dashboard")
+        assert result.outcome is dash.AnswerOutcome.ANSWERED
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+    conn = denv.db.read()
+    tref = conn.execute("SELECT * FROM artifact_refs WHERE kind='transcript'").fetchone()
+    assert tref is not None
+    blob = subprocess.run(
+        ["git", "cat-file", "blob", f"{tref['git_commit']}:{tref['path']}"],
+        cwd=denv.home,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(blob).hexdigest() == tref["sha256"]  # resolves AT its commit
+    committed = blob.decode("utf-8")
+    assert "întrebare în zbor" in committed
+    assert dash.RO["session_turn_failed"] in committed  # cancelled-turn notice
+    # The live file never diverged from its registered ref either (§3.1a
+    # rationale for quiesce over register-by-committed-blob).
+    assert (denv.home / tref["path"]).read_bytes() == blob
+    report = verify_integrity(denv.db, {"factory": denv.home})
+    assert report.ok and report.failures == ()
+
+
+async def test_post_message_refused_while_answering_zero_writes(denv) -> None:
+    """D-0019 pin (§4): a founder message landing inside answer()'s commit
+    window -> explicit RO refusal, ZERO writes (no transcript append, no turn
+    spawned, no DB rows) — and the refused text is NOT in the committed
+    transcript."""
+    env = _session_env(denv)
+    server = dash.DashboardServer(denv.cfg, denv.db, env.runner, FakeNotify())
+    server._sessions = env.manager
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+    real_commit_paths = dash.commit_paths
+    probe: dict[str, Any] = {}
+
+    async def window_commit_paths(*args, **kwargs):
+        transcript = env.manager.transcript_path(env.request_id)
+        bytes_before = transcript.read_bytes()
+        counts_before = _write_counts(denv)
+        calls_before = len(env.runner.calls)
+        with pytest.raises(dash.DashboardError) as excinfo:
+            await env.manager.post_message(env.request_id, "mesaj în fereastră")
+        probe["notice"] = str(excinfo.value)
+        probe["bytes_unchanged"] = transcript.read_bytes() == bytes_before
+        probe["db_unchanged"] = _write_counts(denv) == counts_before
+        probe["no_turn_spawned"] = len(env.runner.calls) == calls_before
+        return await real_commit_paths(*args, **kwargs)
+
+    try:
+        await env.manager.post_message(env.request_id, "discuție normală")
+        await _wait_idle(env.manager, env.request_id)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(dash, "commit_paths", window_commit_paths)
+            result = await server.answer(env.request_id, "approved", via="dashboard")
+        assert result.outcome is dash.AnswerOutcome.ANSWERED
+        assert probe["notice"] == dash.RO["session_answering_refuse"]
+        assert probe["bytes_unchanged"] is True
+        assert probe["db_unchanged"] is True
+        assert probe["no_turn_spawned"] is True
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+    tref = (
+        denv.db.read()
+        .execute("SELECT * FROM artifact_refs WHERE kind='transcript'")
+        .fetchone()
+    )
+    committed = _git(denv.home, "show", f"{tref['git_commit']}:{tref['path']}")
+    assert "mesaj în fereastră" not in committed
+    assert "discuție normală" in committed
+
+
+async def test_answer_failure_clears_answering_flag_session_not_wedged(denv) -> None:
+    """D-0019 pin: a FAILED answer (commit explodes mid-path) clears the
+    answering flag on the failure exit too — the quiesced session is not
+    wedged read-only: a later post_message is accepted and spawns a turn."""
+    env = _session_env(denv)
+    server = dash.DashboardServer(denv.cfg, denv.db, env.runner, FakeNotify())
+    server._sessions = env.manager
+    env.runner.gate = asyncio.Event()  # never set: the first turn hangs
+    host = asyncio.create_task(_host_sessions(env.manager))
+    await asyncio.sleep(0.01)
+
+    async def git_down(*args, **kwargs):
+        raise GitError("index locked (injected)")
+
+    try:
+        await env.manager.post_message(env.request_id, "primul mesaj")
+        await asyncio.sleep(0.02)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(dash, "commit_paths", git_down)
+            with pytest.raises(GitError):
+                await server.answer(env.request_id, "approved", via="dashboard")
+        # Quiesce ran (turn cancelled + notice), the flag is cleared, and the
+        # request is still pending (commit failure = zero DB writes).
+        snap = await env.manager.snapshot(env.request_id)
+        assert snap.busy is False
+        assert snap.turns[-1].text == dash.RO["session_turn_failed"]
+        env.runner.gate = None
+        snap = await env.manager.post_message(env.request_id, "după eșecul răspunsului")
+        assert snap.busy is True  # accepted, not refused
+        await _wait_idle(env.manager, env.request_id)
+        assert len(env.runner.calls) == 2  # cancelled first + accepted second
+    finally:
+        host.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await host
+
+
+async def _host_sessions(manager: dash.DecisionSessionManager) -> None:
+    """serve()-shaped session host: the turn TaskGroup lives (and dies) here."""
+    async with asyncio.TaskGroup() as tg:
+        manager._set_taskgroup(tg)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            manager._set_taskgroup(None)
+
+
+async def _wait_idle(
+    manager: dash.DecisionSessionManager, request_id: int, timeout: float = 5.0
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        snap = await manager.snapshot(request_id)
+        if not snap.busy:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("session turn never finished")
+
+
+# -------------------------------------------------------- tools-off chain (§4)
+
+
+def test_decision_session_route_is_tools_off_claude_in_golden_config(
+    real_config_path,
+) -> None:
+    """OPEN-D3/D-0017: the ratified route — and the closure of the §4 claim:
+    session turns spawn role='decision_session' (pinned above), whose route is
+    tools='none' on the claude CLI, whose argv carries the verified tools-off
+    flagset (pinned here + in test_runner's adapter tests)."""
+    golden = load_config(real_config_path)
+    route = golden.models["decision_session"]
+    assert route.cli == "claude" and route.model == "fable" and route.tools == "none"
+    argv = ADAPTERS["claude"].build_cmd(route, "discuss")
+    index = argv.index("--tools")
+    assert argv[index + 1] == ""  # the FULL built-in set disabled
+
+
+def test_session_page_render_includes_confirm_buttons_and_textcontent_only(
+    denv,
+) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    view = dash.build_view(denv.cfg)
+    card = next(c for c in view.cards if c.request_id == request_id)
+    snap = dash.SessionSnapshot(
+        request_id=request_id,
+        turns=(dash.Turn(n=1, author="founder", text="<b>bold</b>", at=utc_now()),),
+        busy=False,
+        locked=None,
+        turns_left=3,
+    )
+    html_page = dash.render_session_page(snap, card, denv.cfg, "NONCE123")
+    assert "&lt;b&gt;bold&lt;/b&gt;" in html_page  # founder echo escaped (R5)
+    assert f"action='/decision/{request_id}/answer'" in html_page  # §3 confirm path
+    assert "textContent" in html_page and "innerHTML" not in html_page
+    assert dash.RO["session_confirm_label"] in html_page

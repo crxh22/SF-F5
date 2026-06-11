@@ -24,12 +24,14 @@ thresholds/consultation, plus notify (design §1).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shlex
 import shutil
 import signal
 import sqlite3
+import sys
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -50,8 +52,15 @@ from sf_factory.artifacts import (
 )
 from sf_factory.config import ConsultationPointCfg, FactoryConfig, ProjectCfg
 from sf_factory.consultation import _canonical_payload
+
+# Scheduler imports dashboard — never the reverse (dashboard design §6, no cycle):
+# DashboardServer for the optional CCR-3 wiring, GLOSS for the R2-glossed tokens
+# inside the re-authored Romanian decision-request templates, resolve_bind_host
+# for the §7 IP-drift re-check.
+from sf_factory.dashboard import GLOSS, DashboardServer, resolve_bind_host
 from sf_factory.db import Database
 from sf_factory.models import (
+    GATE_ANSWERS,
     ArtifactContractError,
     ConfigError,
     DecisionRequest,
@@ -75,8 +84,7 @@ from sf_factory.models import (
     utc_now,
 )
 from sf_factory.notify import NtfyPublisher, dashboard_link
-from sf_factory.runner import AgentResult, AgentRunner
-from sf_factory.runner import _cmdline_matches as _runner_cmdline_matches
+from sf_factory.runner import AgentResult, AgentRunner, cmdline_matches
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
 from sf_factory.worktrees import StaleGateError, WorktreeManager, commit_paths, run_git
@@ -127,19 +135,57 @@ _PHASE_RESOLUTIONS: Mapping[str, PhaseState] = {
     "cancelled": PhaseState.CANCELLED,
 }
 
-#: AWAITING_HUMAN answer vocabulary at stage level (DoD §9 gate answers).
-_STAGE_ANSWERS: Mapping[str, StageState] = {
+#: Target-state ROUTING for the models.GATE_ANSWERS vocabulary (CCR-3/D-0017:
+#: GATE_ANSWERS is the one answer-token source consumed by the executors AND
+#: the dashboard; these private maps only route an ACCEPTED token to its §3
+#: transition target — membership is always checked against GATE_ANSWERS, and a
+#: pin test asserts these keys equal it). The pre-CCR-3 `changes_requested`
+#: alias is dropped (deliberate behavioral edit, D-0017 rider item 4).
+_STAGE_ANSWER_TARGETS: Mapping[str, StageState] = {
     "approved": StageState.MERGE_GATE,
     "rework:BUILD": StageState.BUILD,
     "rework:SPEC": StageState.SPEC,
 }
-#: Phase AWAITING_HUMAN / AWAITING_SIGNOFF answers.
-_PHASE_HUMAN_ANSWERS: Mapping[str, PhaseState] = {
+_PHASE_ANSWER_TARGETS: Mapping[str, PhaseState] = {
     "resume": PhaseState.RUNNING,
     "replan": PhaseState.PLANNING,
 }
 
 _ACTOR = "control_plane"
+
+
+def _ro_glossed(token: str) -> str:
+    """'<gloss> (<token>)' via the dashboard GLOSS table (R2 one-source);
+    unknown token -> visible '<token> (etichetă lipsă)' marker."""
+    gloss = GLOSS.get(token)
+    if gloss is None:
+        return f"{token} (etichetă lipsă)"
+    return f"{gloss} ({token})"
+
+
+#: One-line Romanian consequence per gate-answer token (§2a: every declared
+#: option rendered with its consequence in the founder's terms).
+_ANSWER_CONSEQUENCES_RO: Mapping[str, str] = {
+    "approved": "aprobă — lucrarea merge mai departe spre integrare",
+    "rework:BUILD": (
+        "refă construcția — implementarea se reface pe aceeași specificație"
+    ),
+    "rework:SPEC": (
+        "refă specificația — specificația se rescrie, apoi implementarea se reface"
+    ),
+    "changes": "cere modificări — faza se redeschide pentru lucru",
+    "resume": "reia — faza continuă din starea curentă",
+    "replan": "replanifică — planul fazei se reface, apoi etapele rezultate",
+}
+
+
+def _ro_options_block(level: str, gate_kind: str) -> str:
+    """'## Opțiuni' body: each declared GATE_ANSWERS token + its consequence."""
+    lines = []
+    for token in GATE_ANSWERS.get((level, gate_kind), ()):
+        consequence = _ANSWER_CONSEQUENCES_RO.get(token, _ro_glossed(token))
+        lines.append(f"- {token} — {consequence}.")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------- private SQL read helpers
@@ -1481,16 +1527,20 @@ class StageExecutor:
         self, stage: Stage, worktree: Path, *, from_reason: str, gate_kind: str
     ) -> None:
         """Write + register the decision-request artifact, insert the pending
-        decision row, transition to AWAITING_HUMAN — then publish (off-tx)."""
+        decision row, transition to AWAITING_HUMAN — then publish (off-tx).
+
+        The artifact is founder-visible verbatim (the dashboard card body), so
+        it is authored in Romanian per the founder protocol (dashboard design
+        §2a, D-0017): question + glossed unit/gate context + every declared
+        option with its one-line consequence + a mechanical ``Recomandare:
+        approved`` marker — justified, not fabricated: this gate fires only
+        after every validation/audit gate passed (the marker line is the R3
+        machine-readable contract ratified with the design)."""
         unit_dir = self._unit_dir(worktree, stage)
         unit_dir.mkdir(parents=True, exist_ok=True)
         path = unit_dir / "decision-request.md"
-        options = " | ".join(sorted(_STAGE_ANSWERS))
         path.write_text(
-            f"# Decision request — stage {stage.id}\n\n"
-            f"Gate: {gate_kind}\nReason: {from_reason}\n\n"
-            f"Artifacts: see `_factory/stages/{stage.id}/` on branch"
-            f" `{stage.branch}`.\n\nAnswer with one of: {options}\n",
+            self._decision_request_body(stage, gate_kind=gate_kind),
             encoding="utf-8",
         )
         # Committed BEFORE the recording tx (§7 fixed step sequence) — an
@@ -1544,6 +1594,40 @@ class StageExecutor:
         # already pending, so a failed publish is caught by the latency alert.
         await self._publish_decision(request_id, f"Decizie necesară: etapa {stage.name}")
 
+    def _decision_request_body(self, stage: Stage, *, gate_kind: str) -> str:
+        """Romanian decision-request template for the stage human gate (§2a).
+        The founder protocol binds this content verbatim: no internal English
+        text leaks in — the machine reason stays in the transition event."""
+        recommendation = ""
+        if gate_kind == "critical_stage":
+            recommendation = (
+                "Recomandare: approved\n"
+                "(Recomandare mecanică: toate verificările automate au trecut —"
+                " validare și audituri închise; nu a fost exercitată judecată de"
+                " produs.)\n\n"
+            )
+        return (
+            f"# Cerere de decizie — Etapa: {stage.name} ({stage.id})\n\n"
+            f"Tip poartă: {_ro_glossed(gate_kind)}\n\n"
+            "## Întrebare\n"
+            f"Aprobi rezultatul etapei „{stage.name}” ({stage.id}) pentru"
+            " integrare?\n\n"
+            "## Context\n"
+            "Toate porțile mecanice au trecut până aici: validarea a trecut,"
+            " constatările de audit sunt închise. Etapa este de clasă"
+            f" {_ro_glossed(stage.risk_class)} — politica fabricii cere aprobarea"
+            " fondatorului înainte de integrare.\n\n"
+            "## Opțiuni\n"
+            f"{_ro_options_block(Level.STAGE.value, gate_kind)}\n\n"
+            f"{recommendation}"
+            "## Legături\n"
+            f"Artefactele etapei (specificație, rapoarte): directorul"
+            f" `_factory/stages/{stage.id}/` pe ramura `{stage.branch}` —"
+            " vizibile și în panou, la cardul deciziei.\n\n"
+            "Răspunde din panou (butoanele de opțiuni) sau, în caz de urgență,"
+            " din terminal cu „cli decide”.\n"
+        )
+
     async def _publish_decision(self, request_id: int | None, title: str) -> None:
         """Publish a decision request (priority_decision); delivery failure =
         'alert_delivery_failed' event, state unchanged (§6 NotifyError row)."""
@@ -1587,11 +1671,18 @@ class StageExecutor:
 
     async def _step_awaiting_human(self, stage: Stage) -> bool:
         """AWAITING_HUMAN: consume the latest ANSWERED decision for this stage;
-        an unknown answer is reported and leaves the stage blocked (Doctrine §7)."""
+        an unknown answer is reported and leaves the stage blocked (Doctrine §7).
+        Accepted answers = models.GATE_ANSWERS[(level, gate_kind)] — the same
+        object the dashboard renders as buttons (CCR-3 one source)."""
         decision = _latest_decision(self._db.read(), Level.STAGE.value, stage.id)
         if decision is None or decision.status != "answered" or decision.answer is None:
             return False
-        target = _STAGE_ANSWERS.get(decision.answer)
+        allowed = GATE_ANSWERS.get((Level.STAGE.value, decision.gate_kind), ())
+        target = (
+            _STAGE_ANSWER_TARGETS.get(decision.answer)
+            if decision.answer in allowed
+            else None
+        )
         if target is None:
             with self._db.transaction() as conn:
                 fdb.insert_event(
@@ -1604,7 +1695,7 @@ class StageExecutor:
                         "kind": "unknown_decision_answer",
                         "decision_request_id": decision.id,
                         "answer": decision.answer,
-                        "known": sorted(_STAGE_ANSWERS),
+                        "known": list(allowed),
                     },
                 )
             return False
@@ -1648,6 +1739,37 @@ class StageExecutor:
         if stage.worktree_path:
             await self._archive_sentinels(stage, Path(stage.worktree_path), last)
 
+        # §2a/D-0017: the escalation-tradeoff gate gets a minimal ROMANIAN
+        # request-wrapper artifact (question + glossed options + /artifact/<ref>
+        # link to the payload — linked, never inlined), written + COMMITTED
+        # before the recording tx (§7 fixed step order) and registered as the
+        # request anchor. No recommendation line: a genuine product trade-off.
+        wrapper_path: Path | None = None
+        wrapper_sha: str | None = None
+        if target is StageState.AWAITING_HUMAN:
+            worktree = self._worktree(stage)
+            payload_ref = self._escalation_anchor_ref(stage, last)
+            unit_dir = self._unit_dir(worktree, stage)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            wrapper_path = unit_dir / "decision-request-escalation.md"
+            wrapper_path.write_text(
+                self._tradeoff_request_body(stage, last, payload_ref),
+                encoding="utf-8",
+            )
+            wrapper_sha = await self._commit_unit_paths(
+                stage,
+                worktree,
+                [wrapper_path],
+                f"stage {stage.id}: escalation trade-off decision request",
+            )
+            if wrapper_sha is None:  # byte-identical replay: pin to HEAD
+                code, out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
+                if code != 0:
+                    raise GitError(
+                        f"git rev-parse HEAD failed in {worktree}: {(err or out).strip()}"
+                    )
+                wrapper_sha = out.strip()
+
         request_id: int | None = None
 
         def coupled(tx: sqlite3.Connection) -> None:
@@ -1668,8 +1790,35 @@ class StageExecutor:
                 # inserted in the SAME tx as the transition, so the unit can
                 # never sit in AWAITING_HUMAN with only a stale answered
                 # decision to (mis)consume.
+                assert wrapper_path is not None
+                ref = register_artifact(
+                    tx,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    kind="decision_request",
+                    repo="workspace",
+                    repo_root=self._worktree(stage),
+                    path=wrapper_path,
+                    git_commit=wrapper_sha,
+                )
+                assert ref.id is not None
                 nonlocal request_id
-                request_id = self._insert_escalation_decision(tx, stage, last)
+                request_id = fdb.insert_decision_request(
+                    tx,
+                    DecisionRequest(
+                        id=None,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        gate_kind="escalation_tradeoff",
+                        request_artifact_id=ref.id,
+                        status="pending",
+                        answer=None,
+                        answer_artifact_id=None,
+                        created_at=utc_now(),
+                        alerted_at=None,
+                        answered_at=None,
+                    ),
+                )
 
         self._sm.transition(
             Level.STAGE,
@@ -1686,40 +1835,48 @@ class StageExecutor:
             )
         return True
 
-    def _insert_escalation_decision(
-        self, tx: sqlite3.Connection, stage: Stage, escalation: Escalation
-    ) -> int:
-        """Insert the escalation-tradeoff decision request (in the caller's tx),
-        anchored on the best available artifact (payload -> spec)."""
+    def _escalation_anchor_ref(self, stage: Stage, escalation: Escalation) -> int:
+        """artifact_refs.id of the escalation payload the wrapper links to
+        (payload -> latest escalation_payload -> spec; none = fail-explicit)."""
+        conn = self._db.read()
         payload_ref = escalation.payload_artifact_id
         if payload_ref is None:
             latest = fdb.latest_artifact(
-                tx, Level.STAGE.value, stage.id, "escalation_payload"
+                conn, Level.STAGE.value, stage.id, "escalation_payload"
             )
             payload_ref = latest.id if latest else None
         if payload_ref is None:
-            spec = fdb.latest_artifact(tx, Level.STAGE.value, stage.id, "spec")
+            spec = fdb.latest_artifact(conn, Level.STAGE.value, stage.id, "spec")
             payload_ref = spec.id if spec else None
         if payload_ref is None:
             raise FactoryError(
                 f"stage {stage.id}: no artifact to anchor the escalation"
                 " trade-off decision request"
             )
-        return fdb.insert_decision_request(
-            tx,
-            DecisionRequest(
-                id=None,
-                unit_level=Level.STAGE.value,
-                unit_id=stage.id,
-                gate_kind="escalation_tradeoff",
-                request_artifact_id=payload_ref,
-                status="pending",
-                answer=None,
-                answer_artifact_id=None,
-                created_at=utc_now(),
-                alerted_at=None,
-                answered_at=None,
-            ),
+        return payload_ref
+
+    def _tradeoff_request_body(
+        self, stage: Stage, escalation: Escalation, payload_ref: int
+    ) -> str:
+        """Romanian escalation-tradeoff request wrapper (§2a): question + glossed
+        options + /artifact/<ref> link; NO recommendation line (genuine
+        trade-off — the options' substance lives in the linked payload)."""
+        return (
+            f"# Cerere de decizie — Etapa: {stage.name} ({stage.id})\n\n"
+            f"Tip poartă: {_ro_glossed('escalation_tradeoff')}\n\n"
+            "## Întrebare\n"
+            f"Etapa „{stage.name}” ({stage.id}) a fost escaladată — mecanismele"
+            " automate nu pot decide singure. Cum continuăm?\n\n"
+            "## Context\n"
+            f"Declanșator: {_ro_glossed(escalation.trigger)} — escaladarea"
+            f" #{escalation.id}. Dovezile mecanice sunt în dosarul legat mai"
+            " jos — citește-l înainte de a alege.\n\n"
+            "## Opțiuni\n"
+            f"{_ro_options_block(Level.STAGE.value, 'escalation_tradeoff')}\n\n"
+            "## Legături\n"
+            f"Dosarul escaladării (dovezi mecanice): /artifact/{payload_ref}\n\n"
+            "Răspunde din panou (butoanele de opțiuni) sau, în caz de urgență,"
+            " din terminal cu „cli decide”.\n"
         )
 
     async def _archive_sentinels(
@@ -2938,15 +3095,36 @@ class PhaseExecutor:
 
     async def _enter_signoff(self, phase: Phase, worktree: Path) -> None:
         """Phase merge gates passed -> AWAITING_SIGNOFF + decision request
-        (gate_kind='phase_signoff', DoD §9.3) + founder push."""
+        (gate_kind='phase_signoff', DoD §9.3) + founder push.
+
+        The artifact is founder-visible verbatim (dashboard card body) — authored
+        in Romanian per the founder protocol (§2a, D-0017), with the mechanical
+        ``Recomandare: approved`` marker (R3): this gate fires only after every
+        stage finished and both phase merge gates passed."""
         unit_dir = self._unit_dir(worktree, phase)
         unit_dir.mkdir(parents=True, exist_ok=True)
         path = unit_dir / "signoff-request.md"
         path.write_text(
-            f"# Phase sign-off — {phase.id} ({phase.name})\n\n"
-            "All stages DONE; Tier-1 + Tier-2 phase gates passed.\n"
-            f"Plan + reports: `_factory/phases/{phase.id}/` on `{self._branch(phase)}`.\n\n"
-            "Answer with one of: approved | changes\n",
+            f"# Cerere de decizie — Faza: {phase.name} ({phase.id})\n\n"
+            f"Tip poartă: {_ro_glossed('phase_signoff')}\n\n"
+            "## Întrebare\n"
+            f"Închizi faza „{phase.name}” ({phase.id})? Toate etapele sunt gata"
+            " și porțile de integrare ale fazei au trecut.\n\n"
+            "## Context\n"
+            "Toate etapele fazei sunt finalizate; porțile mecanice de integrare"
+            " (rebazare + toată suita de teste, plus verificarea semantică"
+            " încrucișată) au trecut.\n\n"
+            "## Opțiuni\n"
+            f"{_ro_options_block(Level.PHASE.value, 'phase_signoff')}\n\n"
+            "Recomandare: approved\n"
+            "(Recomandare mecanică: toate porțile automate au trecut; nu a fost"
+            " exercitată judecată de produs.)\n\n"
+            "## Legături\n"
+            f"Planul și rapoartele fazei: directorul `_factory/phases/{phase.id}/`"
+            f" pe ramura `{self._branch(phase)}` — vizibile și în panou, la"
+            " cardul deciziei.\n\n"
+            "Răspunde din panou (butoanele de opțiuni) sau, în caz de urgență,"
+            " din terminal cu „cli decide”.\n",
             encoding="utf-8",
         )
         sha = await commit_paths(
@@ -3046,7 +3224,10 @@ class PhaseExecutor:
                         payload={"kind": "worktree_remove_failed", "error": str(exc)},
                     )
             return True
-        if decision.answer in ("changes", "changes_requested"):
+        if decision.answer == "changes":
+            # CCR-3/D-0017: the pre-swap `changes_requested` alias is DROPPED —
+            # GATE_ANSWERS[('phase','phase_signoff')] is the one vocabulary the
+            # dashboard buttons and this executor share.
             self._sm.transition(
                 Level.PHASE,
                 phase.id,
@@ -3067,7 +3248,9 @@ class PhaseExecutor:
                     "kind": "unknown_decision_answer",
                     "decision_request_id": decision.id,
                     "answer": decision.answer,
-                    "known": ["approved", "changes"],
+                    "known": list(
+                        GATE_ANSWERS[(Level.PHASE.value, "phase_signoff")]
+                    ),
                 },
             )
         return False
@@ -3076,7 +3259,12 @@ class PhaseExecutor:
         decision = _latest_decision(self._db.read(), Level.PHASE.value, phase.id)
         if decision is None or decision.status != "answered" or decision.answer is None:
             return False
-        target = _PHASE_HUMAN_ANSWERS.get(decision.answer)
+        allowed = GATE_ANSWERS.get((Level.PHASE.value, decision.gate_kind), ())
+        target = (
+            _PHASE_ANSWER_TARGETS.get(decision.answer)
+            if decision.answer in allowed
+            else None
+        )
         if target is None:
             with self._db.transaction() as conn:
                 fdb.insert_event(
@@ -3089,7 +3277,7 @@ class PhaseExecutor:
                         "kind": "unknown_decision_answer",
                         "decision_request_id": decision.id,
                         "answer": decision.answer,
-                        "known": sorted(_PHASE_HUMAN_ANSWERS),
+                        "known": list(allowed),
                     },
                 )
             return False
@@ -3133,14 +3321,82 @@ class PhaseExecutor:
         worktree = self._worktree(phase)
         if worktree.is_dir():
             await self._archive_sentinels(phase, worktree, last)
+
+        # §2a/D-0017: Romanian request-wrapper artifact for the phase trade-off
+        # gate — written + COMMITTED before the recording tx (§7 step order),
+        # registered as the request anchor; payload linked, never inlined; no
+        # recommendation line.
+        wrapper_path: Path | None = None
+        wrapper_sha: str | None = None
+        if target is PhaseState.AWAITING_HUMAN:
+            if not worktree.is_dir():
+                # The phase checkout is derived, recomputable state — recreate it
+                # (idempotent attach of the existing branch, the merge-gate rule).
+                project = _project_for_phase(self._cfg, phase)
+                worktree = await self._wt.create(
+                    Path(project.workspace),
+                    phase.id,
+                    self._branch(phase),
+                    project.integration_branch,
+                )
+            anchor_ref = self._tradeoff_anchor_ref(phase, last)
+            unit_dir = self._unit_dir(worktree, phase)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            wrapper_path = unit_dir / "decision-request-escalation.md"
+            wrapper_path.write_text(
+                self._tradeoff_request_body(phase, last, anchor_ref),
+                encoding="utf-8",
+            )
+            wrapper_sha = await commit_paths(
+                worktree,
+                [wrapper_path],
+                f"phase {phase.id}: escalation trade-off decision request",
+                trailers={"Factory-Unit": f"phase/{phase.id}"},
+            )
+            if wrapper_sha is None:  # byte-identical replay: pin to HEAD
+                code, out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
+                if code != 0:
+                    raise GitError(
+                        f"git rev-parse HEAD failed in {worktree}: {(err or out).strip()}"
+                    )
+                wrapper_sha = out.strip()
+
         request_id: int | None = None
+        wrapper_root = worktree
 
         def coupled(tx: sqlite3.Connection) -> None:
             if target is PhaseState.AWAITING_HUMAN:
                 # Same crash-safety rule as the stage path: the gate's decision
                 # request lands in the SAME tx as the transition.
+                assert wrapper_path is not None
+                ref = register_artifact(
+                    tx,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    kind="decision_request",
+                    repo="workspace",
+                    repo_root=wrapper_root,
+                    path=wrapper_path,
+                    git_commit=wrapper_sha,
+                )
+                assert ref.id is not None
                 nonlocal request_id
-                request_id = self._insert_tradeoff_decision(tx, phase)
+                request_id = fdb.insert_decision_request(
+                    tx,
+                    DecisionRequest(
+                        id=None,
+                        unit_level=Level.PHASE.value,
+                        unit_id=phase.id,
+                        gate_kind="escalation_tradeoff",
+                        request_artifact_id=ref.id,
+                        status="pending",
+                        answer=None,
+                        answer_artifact_id=None,
+                        created_at=utc_now(),
+                        alerted_at=None,
+                        answered_at=None,
+                    ),
+                )
 
         self._sm.transition(
             Level.PHASE,
@@ -3156,6 +3412,46 @@ class PhaseExecutor:
                 request_id, f"Decizie necesară (escaladare): faza {phase.name}"
             )
         return True
+
+    def _tradeoff_anchor_ref(self, phase: Phase, escalation: Escalation) -> int:
+        """artifact_refs.id the phase wrapper links to: the escalation payload
+        when recorded, else the newest phase artifact (plan -> request ->
+        contract); none = fail-explicit (a phase with no artifact cannot pose a
+        trade-off)."""
+        if escalation.payload_artifact_id is not None:
+            return escalation.payload_artifact_id
+        conn = self._db.read()
+        for kind in ("phase_plan_sidecar", "phase_plan", "decision_request", "contract"):
+            ref = fdb.latest_artifact(conn, Level.PHASE.value, phase.id, kind)
+            if ref is not None:
+                assert ref.id is not None
+                return ref.id
+        raise FactoryError(
+            f"phase {phase.id}: no artifact to anchor the escalation"
+            " trade-off decision request"
+        )
+
+    def _tradeoff_request_body(
+        self, phase: Phase, escalation: Escalation, payload_ref: int
+    ) -> str:
+        """Romanian escalation-tradeoff request wrapper for a phase (§2a)."""
+        return (
+            f"# Cerere de decizie — Faza: {phase.name} ({phase.id})\n\n"
+            f"Tip poartă: {_ro_glossed('escalation_tradeoff')}\n\n"
+            "## Întrebare\n"
+            f"Faza „{phase.name}” ({phase.id}) a fost escaladată — mecanismele"
+            " automate nu pot decide singure. Cum continuăm?\n\n"
+            "## Context\n"
+            f"Declanșator: {_ro_glossed(escalation.trigger)} — escaladarea"
+            f" #{escalation.id}. Dovezile sunt în artefactul legat mai jos —"
+            " citește-l înainte de a alege.\n\n"
+            "## Opțiuni\n"
+            f"{_ro_options_block(Level.PHASE.value, 'escalation_tradeoff')}\n\n"
+            "## Legături\n"
+            f"Contextul escaladării (artefact): /artifact/{payload_ref}\n\n"
+            "Răspunde din panou (butoanele de opțiuni) sau, în caz de urgență,"
+            " din terminal cu „cli decide”.\n"
+        )
 
     async def _archive_sentinels(
         self, phase: Phase, worktree: Path, escalation: Escalation
@@ -3182,38 +3478,6 @@ class PhaseExecutor:
                 f"phase {phase.id}: archive resolved sentinel(s)",
                 trailers={"Factory-Unit": f"phase/{phase.id}"},
             )
-
-    def _insert_tradeoff_decision(self, tx: sqlite3.Connection, phase: Phase) -> int:
-        """Escalation-tradeoff decision request for a phase (in the caller's tx,
-        same crash-safety rule as the stage path), anchored on the newest phase
-        artifact — a phase with no artifact yet cannot pose a trade-off."""
-        anchor = None
-        for kind in ("phase_plan_sidecar", "phase_plan", "decision_request", "contract"):
-            ref = fdb.latest_artifact(tx, Level.PHASE.value, phase.id, kind)
-            if ref is not None:
-                anchor = ref.id
-                break
-        if anchor is None:
-            raise FactoryError(
-                f"phase {phase.id}: no artifact to anchor the escalation"
-                " trade-off decision request"
-            )
-        return fdb.insert_decision_request(
-            tx,
-            DecisionRequest(
-                id=None,
-                unit_level=Level.PHASE.value,
-                unit_id=phase.id,
-                gate_kind="escalation_tradeoff",
-                request_artifact_id=anchor,
-                status="pending",
-                answer=None,
-                answer_artifact_id=None,
-                created_at=utc_now(),
-                alerted_at=None,
-                answered_at=None,
-            ),
-        )
 
     async def _publish_signoff_decision(self, request_id: int, title: str) -> None:
         try:
@@ -3268,14 +3532,20 @@ class Scheduler:
         cfg: FactoryConfig,
         executors: Mapping[Level, UnitExecutor],
         notify: NtfyPublisher,
+        dashboard: DashboardServer | None = None,
     ) -> None:
         """Level-agnostic loop over sched categories + dag_edges; max
-        process.max_parallel_agents concurrent units."""
+        process.max_parallel_agents concurrent units. ``dashboard`` (CCR-3,
+        optional, default None — tests/run_until_blocked unaffected): when
+        present, ``_run`` hosts the contained ``_dashboard_supervisor``."""
         self._db = db
         self._sm = sm
         self._cfg = cfg
         self._executors = dict(executors)
         self._notify = notify
+        self._dashboard = dashboard
+        #: Total dashboard supervisor restarts (paging-dedup counter, design §6).
+        self._dashboard_restarts = 0
         #: Internal worktree manager for recover()'s §5.5b git healing — a
         #: mechanics helper, not an executor dependency.
         self._wt = WorktreeManager(cfg)
@@ -3639,17 +3909,27 @@ class Scheduler:
 
     async def _run(self, *, stop_when_blocked: bool) -> None:
         async with asyncio.TaskGroup() as tg:
-            while True:
-                self._touch_liveness()
-                self._refresh_pidfile()
-                self._reap()
-                scan = self._scan_units()
-                await self._stall_detector(scan)
-                await self._decision_latency_alerts()
-                dispatched = self._dispatch(tg, scan)
-                if stop_when_blocked and not self._tasks and dispatched == 0:
-                    return
-                await asyncio.sleep(self._cfg.process.loop_tick_s)
+            # CCR-3: the dashboard supervisor task is EXCLUDED from self._tasks /
+            # quiescence accounting and cancelled on every _run exit path — else
+            # run_until_blocked's TaskGroup would never close (design §6).
+            supervisor: asyncio.Task | None = None
+            if self._dashboard is not None:
+                supervisor = tg.create_task(self._dashboard_supervisor())
+            try:
+                while True:
+                    self._touch_liveness()
+                    self._refresh_pidfile()
+                    self._reap()
+                    scan = self._scan_units()
+                    await self._stall_detector(scan)
+                    await self._decision_latency_alerts()
+                    dispatched = self._dispatch(tg, scan)
+                    if stop_when_blocked and not self._tasks and dispatched == 0:
+                        return
+                    await asyncio.sleep(self._cfg.process.loop_tick_s)
+            finally:
+                if supervisor is not None:
+                    supervisor.cancel()
 
     def _levels(self) -> list[Level]:
         return sorted(self._executors, key=lambda level: level.value)
@@ -3909,6 +4189,153 @@ class Scheduler:
                             payload={"kind": "stall", "error": str(exc)},
                         )
 
+    # ------------------------------------------------- dashboard supervisor (CCR-3)
+
+    async def _dashboard_supervisor(self) -> None:
+        """Containment + restart loop for the dashboard serve() task (design
+        §6/§7 row 1): contains ALL exceptions per iteration — NOTHING ever
+        escapes into the TaskGroup except cancellation. Paging is deduplicated
+        (first crash, then every dashboard.page_every_n_restarts-th; an 'alert'
+        event lands on EVERY restart, restart counter in the payload). Between
+        restarts the bind is re-checked every dashboard.bind_recheck_s (§7
+        IP-drift row): a drifted tailscale IP restarts serve() to re-resolve."""
+        dashboard = self._dashboard
+        assert dashboard is not None
+        dcfg = self._cfg.founder_channel.dashboard
+        while True:
+            serve_task = asyncio.create_task(dashboard.serve())
+            reason = "dashboard serve() returned unexpectedly"
+            try:
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {serve_task}, timeout=dcfg.bind_recheck_s
+                    )
+                    if done:
+                        exc = serve_task.exception()
+                        if exc is not None:
+                            reason = repr(exc)
+                        break
+                    drift = await self._dashboard_bind_drift(dashboard)
+                    if drift is not None:
+                        reason = drift
+                        serve_task.cancel()
+                        await self._reap_serve_task(serve_task)
+                        break
+            except asyncio.CancelledError:
+                serve_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await serve_task
+                raise
+            except Exception as exc:  # noqa: BLE001 — supervisor's own defect: contained
+                reason = f"dashboard supervisor internal error: {exc!r}"
+                serve_task.cancel()
+                await self._reap_serve_task(serve_task)
+            self._dashboard_restarts += 1
+            await self._dashboard_crash_alert(reason)
+            try:
+                await asyncio.sleep(dcfg.restart_delay_s)
+            except asyncio.CancelledError:
+                raise
+
+    @staticmethod
+    async def _reap_serve_task(serve_task: asyncio.Task) -> None:
+        """Await a just-cancelled serve task, suppressing only ITS outcome —
+        its CancelledError result or any crash. The supervisor's OWN
+        cancellation, if it lands during this await, re-raises
+        (current_task().cancelling() > 0): Scheduler._run's finally calls
+        supervisor.cancel() exactly once, so a suppress(BaseException) here
+        could swallow that single cancel on the drift / internal-error
+        branches, keep the loop running and leave the TaskGroup never closing
+        (shutdown hang)."""
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise  # the supervisor itself is being cancelled — propagate
+        except Exception:  # noqa: BLE001 — serve_task's crash: contained (§7 row 1)
+            pass
+
+    async def _dashboard_bind_drift(self, dashboard: DashboardServer) -> str | None:
+        """§7 IP-drift row: re-resolve the bind host (off-loop — `tailscale ip`
+        is a subprocess) and compare against bound_address; mismatch OR a
+        resolve failure = drift (restart re-resolves, loudly). Never raises."""
+        bound = dashboard.bound_address
+        if bound is None:
+            return None  # not bound (serve restarting) — nothing to compare
+        try:
+            current = await asyncio.to_thread(resolve_bind_host, self._cfg)
+        except Exception as exc:  # noqa: BLE001 — drift check must never escape
+            return f"dashboard bind re-check failed: {exc!r}"
+        if current != bound[0]:
+            return (
+                f"dashboard bind address drifted: bound {bound[0]!r},"
+                f" resolved {current!r}"
+            )
+        return None
+
+    async def _dashboard_crash_alert(self, reason: str) -> None:
+        """'alert' event on EVERY restart (audit trail) + DEDUPLICATED
+        max-priority page (first crash, then every Nth — alarm fatigue degrades
+        the DoD §9 minimal-attention channel). The publish follows the §6
+        NotifyError contract: 'alert_delivery_failed' event, NEVER re-raise —
+        an unwrapped publish would tear down the orchestrator exactly when the
+        founder channel is already down. The guard is `except Exception`
+        (hardening beyond the declared §6 NotifyError): a publisher defect of
+        any type is contained the same way, never escaping into the TaskGroup
+        (§7 row 1's 'nothing ever escapes'). DB failures degrade to stderr —
+        the supervisor never lets anything escape (§7 row 1)."""
+        restarts = self._dashboard_restarts
+        try:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={
+                        "kind": "dashboard_crashed",
+                        "reason": reason,
+                        "restarts": restarts,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 — containment boundary (§7 row 1)
+            print(
+                f"sf-factory: dashboard crash event write failed: {exc!r}",
+                file=sys.stderr,
+            )
+        every_n = self._cfg.founder_channel.dashboard.page_every_n_restarts
+        if not (restarts == 1 or restarts % every_n == 0):
+            return
+        try:
+            await self._notify.publish(
+                "Dashboard căzut — decizia pe telefon nu funcționează;"
+                " fallback: cli decide",
+                link=dashboard_link(self._cfg, "health"),
+                priority=self._notify.priority_alert,
+            )
+        except Exception as exc:  # noqa: BLE001 — any publisher defect: contained (§7 row 1)
+            try:
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert_delivery_failed",
+                        actor=_ACTOR,
+                        payload={
+                            "kind": "dashboard_crashed",
+                            "restarts": restarts,
+                            "error": str(exc),
+                        },
+                    )
+            except Exception as db_exc:  # noqa: BLE001 — never escape (§7 row 1)
+                print(
+                    f"sf-factory: alert_delivery_failed write failed: {db_exc!r}",
+                    file=sys.stderr,
+                )
+
 
 # ------------------------------------------------------------ process predicates
 
@@ -3938,9 +4365,10 @@ def _proc_cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
     the registry cmdline (recorded as shlex.join(argv) at spawn). Unreadable
     /proc => no match — never kill what cannot be identified.
 
-    Delegates to ``runner._cmdline_matches`` — the single tolerant predicate
-    (D-0014 item 2): interpreter wrapping (codex = ``#!/usr/bin/env node``
-    script, observed live as ``node /…/bin/codex …``) breaks strict equality,
-    and a drifting second copy here would silently exempt the §5.5a orphan
-    sweep from that fix (Doctrine §9: index -> source)."""
-    return _runner_cmdline_matches(pid, recorded_cmdline)
+    Delegates to the PUBLIC ``runner.cmdline_matches`` (promoted by CCR-3,
+    closing the D-0016 disposition) — the single tolerant predicate (D-0014
+    item 2): interpreter wrapping (codex = ``#!/usr/bin/env node`` script,
+    observed live as ``node /…/bin/codex …``) breaks strict equality, and a
+    drifting second copy here would silently exempt the §5.5a orphan sweep from
+    that fix (Doctrine §9: index -> source)."""
+    return cmdline_matches(pid, recorded_cmdline)

@@ -11,6 +11,12 @@ run/resume tests inject fake ``sf_factory.scheduler`` / ``sf_factory.consultatio
 modules into ``sys.modules`` (wave-3 lanes are file-disjoint; the fakes also
 keep these tests hermetic once the real modules land) — cli must construct them
 with the exact frozen constructor signatures.
+
+CCR-4 (dashboard design §1/§9): ``cli run`` wires the REAL ``DashboardServer``
+and ``start()``s it eagerly before recovery; the test config overrides
+``founder_channel.dashboard`` to ``127.0.0.1`` + port ``0`` so unit tests bind
+loopback/ephemeral only — NEVER a real tailnet socket. ``resume`` stays
+``dashboard=None``.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from sf_factory import watchdog
 from sf_factory.artifacts import sha256_file
 from sf_factory.cli import main
 from sf_factory.config import FactoryConfig
+from sf_factory.dashboard import DashboardServer
 from sf_factory.db import (
     Database,
     insert_artifact_ref,
@@ -48,6 +55,7 @@ from sf_factory.models import (
     ArtifactRef,
     DecisionRequest,
     Escalation,
+    FactoryError,
     Level,
     Phase,
     PhaseState,
@@ -71,6 +79,11 @@ def cli_env(tmp_path: Path, config_dict: dict[str, Any]) -> SimpleNamespace:
         path = home / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("canon body\n", encoding="utf-8")
+    # CCR-4 (dashboard design §9): unit tests must NEVER bind a real tailnet
+    # socket — `cli run`'s eager DashboardServer.start() binds loopback on an
+    # ephemeral port instead (conftest's `bind: tailscale` is production truth).
+    config_dict["founder_channel"]["dashboard"]["bind"] = "127.0.0.1"
+    config_dict["founder_channel"]["dashboard"]["port"] = 0
     config_path = tmp_path / "factory.config.yaml"
     config_path.write_text(yaml.safe_dump(config_dict), encoding="utf-8")
     return SimpleNamespace(
@@ -94,11 +107,27 @@ def _install_fake_graph(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     record: dict[str, Any] = {}
 
     class FakeScheduler:
-        def __init__(self, db: Any, sm: Any, cfg: Any, executors: Any, notify: Any) -> None:
+        def __init__(
+            self,
+            db: Any,
+            sm: Any,
+            cfg: Any,
+            executors: Any,
+            notify: Any,
+            dashboard: Any = None,
+        ) -> None:
             record["scheduler_args"] = (db, sm, cfg, executors, notify)
+            # CCR-3 kwarg: the (real) DashboardServer cli run wires, None on resume.
+            record["scheduler_dashboard"] = dashboard
+            self._dashboard = dashboard
 
         def recover(self) -> SimpleNamespace:
             record["recovered"] = True
+            # Pins the §1 eager-start order: the dashboard is already BOUND
+            # when the recovery scan begins (None = no dashboard wired).
+            record["dashboard_bound_at_recover"] = (
+                None if self._dashboard is None else self._dashboard.bound_address
+            )
             return SimpleNamespace()
 
         async def run_forever(self) -> None:
@@ -360,7 +389,8 @@ def test_run_wires_frozen_graph_recovers_and_runs_forever(
     assert record["recovered"] is True
     assert record["ran"] == "forever"
 
-    # Frozen §4 constructor wiring (positional): Scheduler(db, sm, cfg, executors, notify).
+    # Frozen §4 constructor wiring (positional): Scheduler(db, sm, cfg, executors,
+    # notify) + the CCR-3 dashboard kwarg (asserted separately below).
     db, sm, cfg, executors, notify = record["scheduler_args"]
     assert isinstance(db, Database)
     assert isinstance(sm, StateMachine)
@@ -374,6 +404,17 @@ def test_run_wires_frozen_graph_recovers_and_runs_forever(
     assert len(record["consultor_args"]) == 3
     assert record["consultor_args"][0] is cfg
     assert record["consultor_args"][1] is db
+
+    # CCR-4 production wiring (dashboard design §1/§6): run constructs the REAL
+    # DashboardServer, hands the same instance to Scheduler(dashboard=...), and
+    # start()s it EAGERLY — already bound when recover() began, on the loopback/
+    # ephemeral test bind (never a tailnet socket; port 0 was requested).
+    dashboard = record["scheduler_dashboard"]
+    assert isinstance(dashboard, DashboardServer)
+    assert record["dashboard_bound_at_recover"] is not None
+    host, port = record["dashboard_bound_at_recover"]
+    assert host == "127.0.0.1"
+    assert port > 0
 
     # Pidfile per the watchdog content contract: pid line + normalized cmdline line.
     pid_line, cmdline_line = cli_env.pid_file.read_text(encoding="utf-8").splitlines()[:2]
@@ -399,6 +440,38 @@ def test_resume_runs_until_blocked(
     assert _cli(cli_env, "resume") == 0
     assert record["recovered"] is True
     assert record["ran"] == "until_blocked"
+    # CCR-4: resume keeps dashboard=None — no DashboardServer, no bind at all.
+    assert record["scheduler_dashboard"] is None
+    assert record["dashboard_bound_at_recover"] is None
+
+
+def test_run_aborts_in_foreground_when_dashboard_bind_fails(
+    cli_env: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Dashboard design §1: `run` start()s the dashboard EAGERLY — a first
+    resolve/bind FactoryError aborts orchestrator start in the foreground
+    (clear message, rc 1) BEFORE the recovery scan, never inside the §7
+    supervised restart loop; the instance lock is released on the way out."""
+    assert _cli(cli_env, "init") == 0
+    record = _install_fake_graph(monkeypatch)
+
+    def boom(self: DashboardServer) -> None:
+        raise FactoryError("dashboard bind failed on 127.0.0.1:0: (test) — start aborts")
+
+    monkeypatch.setattr(DashboardServer, "start", boom)
+    assert _cli(cli_env, "run") == 1
+    err = capsys.readouterr().err
+    assert "sf-factory: dashboard bind failed" in err
+    assert "recovered" not in record  # aborted BEFORE recovery / the loop
+    assert record.get("ran") is None
+    # The flock is not left held by the aborted instance.
+    probe_fd = os.open(cli_env.pid_file, os.O_RDWR)
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must not raise
+    finally:
+        os.close(probe_fd)
 
 
 def test_run_without_init_fails_after_lock(

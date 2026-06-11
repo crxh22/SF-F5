@@ -149,6 +149,58 @@ def test_claude_build_cmd_minimal() -> None:
     ]
 
 
+# ------------------------------------------------- ModelRoute.tools (CCR-3/D-0017)
+
+
+def test_claude_tools_off_flagset() -> None:
+    """The decision_session tools-off spawn (dashboard design §4): tools='none'
+    -> the installed CLI's verified flagset `--tools ""` (disables the FULL
+    built-in set); resume/canon flags unaffected."""
+    route = ModelRoute(cli="claude", model="fable", mode="print", tools="none")
+    cmd = ClaudeAdapter().build_cmd(
+        route, "discuss", system_append="CANON", resume_session="sid-7"
+    )
+    assert cmd == [
+        "claude",
+        "--model",
+        "fable",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--append-system-prompt",
+        "CANON",
+        "--resume",
+        "sid-7",
+        "-p",
+        "discuss",
+    ]
+
+
+def test_claude_tools_default_all_adds_no_flag() -> None:
+    """Default tools='all' preserves every existing route's argv byte-for-byte."""
+    route = ModelRoute(cli="claude", model="sonnet", mode="print")
+    assert route.tools == "all"
+    assert "--tools" not in ClaudeAdapter().build_cmd(route, "hi")
+
+
+def test_codex_tools_off_is_fail_explicit() -> None:
+    """No VERIFIED codex tools-off flagset exists — spawning tools-on under a
+    tools-off contract would silently void the §4 structural no-write guarantee."""
+    route = ModelRoute(cli="codex", model="default", mode="print", tools="none")
+    with pytest.raises(ProcessError, match="tools"):
+        CodexAdapter().build_cmd(route, "x")
+
+
+def test_stub_ignores_tools_field(tmp_path: Path) -> None:
+    """The stub spawns no tools to disable; its argv carries no tools flag
+    (design §4: 'stub ignores it')."""
+    route = ModelRoute(cli="stub", model="stub-model", mode="print", tools="none")
+    cmd = StubAdapter(tmp_path / "stub.py").build_cmd(route, "x")
+    assert "--tools" not in cmd
+
+
 def test_claude_parse_lines() -> None:
     adapter = ClaudeAdapter()
     init = adapter.parse_line({"type": "system", "subtype": "init", "session_id": "s-1"})

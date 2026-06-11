@@ -27,11 +27,14 @@ class _StrictModel(BaseModel):
 
 
 class ModelRoute(_StrictModel):
-    """cli: Literal['claude','codex','stub']; model: str; mode: Literal['print','interactive']."""
+    """cli: Literal['claude','codex','stub']; model: str; mode: Literal['print','interactive'];
+    tools: Literal['all','none'] = 'all' (CCR-3/D-0017: tools-off Decision Sessions —
+    structural no-write enforcement; honored by the runner adapters)."""
 
     cli: Literal["claude", "codex", "stub"]
     model: str
     mode: Literal["print", "interactive"]
+    tools: Literal["all", "none"] = "all"
 
 
 class ConsultationPointCfg(_StrictModel):
@@ -118,8 +121,35 @@ class NtfyCfg(_StrictModel):
 
 
 class DashboardCfg(_StrictModel):
+    """founder_channel.dashboard — keys ratified by D-0017 (dashboard design §6).
+
+    Defaults are the ratified values; ``port`` admits 0 (ephemeral bind — the
+    dashboard-design §8 integration tests bind 127.0.0.1:0 and read the real
+    port from ``DashboardServer.bound_address``). Durations are floats so tests
+    may run sub-second (config ints coerce losslessly).
+    """
+
     bind: str
-    port: int = Field(gt=0, lt=65536)
+    port: int = Field(ge=0, lt=65536)
+    refresh_s: int = Field(default=30, ge=1)
+    #: Bounds every POST thread→loop marshal (answer + session message) — §1/§6.
+    answer_timeout_s: float = Field(default=60, gt=0)
+    #: Bounds GET marshals (session page/poll snapshots) AND the per-socket
+    #: read timeout (slow/hung clients tie up one daemon thread, bounded).
+    read_timeout_s: float = Field(default=10, gt=0)
+    max_request_bytes: int = Field(default=65536, ge=1)
+    restart_delay_s: float = Field(default=30, gt=0)
+    page_every_n_restarts: int = Field(default=20, ge=1)
+    bind_recheck_s: float = Field(default=300, gt=0)
+
+
+class DecisionSessionCfg(_StrictModel):
+    """founder_channel.decision_session (OPEN-4 slice, ratified D-0017)."""
+
+    max_turns: int = Field(default=10, ge=1)
+    turn_timeout_s: int = Field(default=300, ge=1)
+    budget_tokens: int = Field(default=200000, ge=1)
+    poll_s: float = Field(default=3, gt=0)
 
 
 class WatchdogCfg(_StrictModel):
@@ -131,8 +161,7 @@ class FounderChannelCfg(_StrictModel):
     ntfy: NtfyCfg
     dashboard: DashboardCfg
     watchdog: WatchdogCfg
-    # Placeholder for the dashboard design slice (OPEN-4); content deliberately unvalidated here.
-    decision_session: dict[str, object]
+    decision_session: DecisionSessionCfg
 
 
 class ProcessCfg(_StrictModel):

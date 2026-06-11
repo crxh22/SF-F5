@@ -27,7 +27,6 @@ from sf_factory.db import (
     bump_churn,
     insert_fix_iteration,
     open_escalation,
-    unit_token_total,
 )
 from sf_factory.models import (
     ConfigError,
@@ -111,6 +110,21 @@ _CONTEXT_RESETS_SQL = """
 SELECT COUNT(*)
 FROM events
 WHERE unit_level = 'stage' AND unit_id = :s AND event_type = 'context_reset'
+"""
+
+#: Runner role of orchestrator-mediated founder Decision Sessions — a config
+#: models.* key referenced by name (the CP1_ID pattern). The §2 context_budget
+#: trigger excludes its ledger rows (CCR-3/D-0017, OPEN-D4): the cap governs the
+#: conveyor, not founder conversation; dashboard burn figures still sum everything
+#: (db.unit_token_total is unchanged).
+_DECISION_SESSION_ROLE = "decision_session"
+
+# §2 context_budget sum — per-aggregate COALESCE (an all-NULL column reads 0,
+# never NULLing the total), MINUS role='decision_session' rows (CCR-3 amendment).
+_CONTEXT_BUDGET_TOKENS_SQL = """
+SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0)
+FROM token_ledger
+WHERE unit_level = 'stage' AND unit_id = :s AND role <> :excluded_role
 """
 
 # ------------------------------------------------------- unified-diff parsing
@@ -327,9 +341,12 @@ class ThresholdEvaluator:
     def _check_context_budget(self, conn: sqlite3.Connection, stage: Stage) -> dict | None:
         """§2: per-aggregate COALESCE token sum >= budgets.per_stage[risk_class].
 
-        Estimated rows count toward the total (they are ordinary ledger rows).
-        The evidence carries context_resets vs escalation.max_context_resets so
-        the caller can apply the §2 reset-then-escalate rule mechanically.
+        Estimated rows count toward the total (they are ordinary ledger rows);
+        ``role='decision_session'`` rows are EXCLUDED (CCR-3/D-0017, OPEN-D4):
+        founder conversation must never push a blocked stage into a spurious
+        context reset. The evidence carries context_resets vs
+        escalation.max_context_resets so the caller can apply the §2
+        reset-then-escalate rule mechanically.
         """
         budget = self._cfg.budgets.per_stage.get(stage.risk_class)
         if budget is None:
@@ -337,7 +354,12 @@ class ThresholdEvaluator:
                 f"stage {stage.id!r} has risk_class {stage.risk_class!r} with no "
                 "budgets.per_stage entry — config/DB drift, cannot evaluate context_budget"
             )
-        total = unit_token_total(conn, Level.STAGE.value, stage.id)
+        total = int(
+            conn.execute(
+                _CONTEXT_BUDGET_TOKENS_SQL,
+                {"s": stage.id, "excluded_role": _DECISION_SESSION_ROLE},
+            ).fetchone()[0]
+        )
         if total < budget:
             return None
         resets = int(conn.execute(_CONTEXT_RESETS_SQL, {"s": stage.id}).fetchone()[0])
