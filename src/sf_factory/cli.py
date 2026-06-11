@@ -16,8 +16,11 @@ Command contracts (design §4 ``cli.main`` docstring, implemented exactly):
   view to ``<factory.home>/STATUS.md`` (DoD §6: STATUS.md is a generated view).
 - ``decide <request_id> <option>`` — emergency-fallback decision-answer path
   (DoD §9 plumbing; the expected founder path is the dashboard answer
-  endpoint, §1): writes the answer artifact, then in ONE transaction registers
-  it (``artifacts.register_artifact``) + ``db.answer_decision`` + event.
+  endpoint, §1): writes the answer artifact, commits it in the factory repo
+  (D-0015), then in ONE transaction registers it
+  (``artifacts.register_artifact``) + ``db.answer_decision`` + event. The
+  direct DB write from a second OS process is the D-0015-ratified emergency
+  exception to the §2 sole-writer rule.
 
 Pidfile content contract (shared with ``watchdog.py``, the reader): line 1 =
 orchestrator pid (decimal); line 2 (optional) = its command line —
@@ -32,10 +35,11 @@ escalations list, recent-events tail) — presentation queries over the §2 DDL
 on the ``mode=ro`` connection, with no business rules and no writes.
 
 May import: all (design §1). The run/resume object graph (scheduler,
-consultation, runner, worktrees, thresholds, statemachine, notify) is imported
-inside ``_build_scheduler`` — only those commands need it, and wave-3 builds
-are file-disjoint (§9): ``init``/``status``/``decide`` stay importable and
-testable independently of sibling-lane modules.
+consultation, runner, thresholds, statemachine, notify) is imported inside
+``_build_scheduler`` — only those commands need it, and wave-3 builds are
+file-disjoint (§9): ``init``/``status``/``decide`` stay importable and
+testable independently of sibling-lane modules. ``worktrees`` (wave 2, no
+lane concern) is imported at module level: ``decide`` commits its artifact.
 """
 
 from __future__ import annotations
@@ -70,11 +74,13 @@ from sf_factory.db import (
 from sf_factory.models import (
     DecisionRequest,
     FactoryError,
+    GitError,
     Level,
     Phase,
     Stage,
     utc_now,
 )
+from sf_factory.worktrees import commit_paths, run_git
 
 if TYPE_CHECKING:  # import cycle-free typing only; runtime import is lazy (§9 lanes)
     from sf_factory.scheduler import Scheduler
@@ -665,11 +671,40 @@ def _render_decision_answer(dr: DecisionRequest, answer: str, answered_at: str) 
     )
 
 
+async def _commit_decision_answer(
+    home: Path, artifact_path: Path, dr: DecisionRequest
+) -> str:
+    """Commit the decision-answer artifact in the factory repo BEFORE the
+    recording tx (D-0015): an uncommitted-but-registered factory-repo ref has
+    no worktree, no commit and no HEAD blob to resolve against, so the §5.5c
+    verify_integrity pass would abort the next orchestrator start while the
+    unit is non-terminal. Git-side safety: the orchestrator commits workspace
+    worktrees only, never the factory repo, so this cross-process git write
+    races none of §7's; commit_paths scopes add+commit to the named path. A
+    re-run after a failed recording tx finds the identical content already
+    committed (commit_paths returns None) and pins the ref to current HEAD."""
+    sha = await commit_paths(
+        home,
+        [artifact_path],
+        f"decision {dr.id}: answer recorded via cli decide",
+        trailers={"Factory-Unit": f"{dr.unit_level}/{dr.unit_id}"},
+    )
+    if sha is not None:
+        return sha
+    code, out, err = await run_git("rev-parse", "HEAD", cwd=home)
+    if code != 0:
+        raise GitError(f"git rev-parse HEAD failed in {home}: {(err or out).strip()}")
+    return out.strip()
+
+
 def cmd_decide(cfg: FactoryConfig, request_id: int, option: str) -> int:
-    """Emergency decision-answer path (§4): artifact file first, then ONE
-    transaction = register_artifact + answer_decision + event (§7 step order).
-    No flock: a single short write is sanctioned alongside a live orchestrator
-    (WAL + busy_timeout serialize it); the scheduler picks the answer up on its
+    """Emergency decision-answer path (§4): artifact file first, committed to
+    the factory repo (D-0015 — verify_integrity must resolve the ref at the
+    next recover), then ONE transaction = register_artifact + answer_decision
+    + event (§7 step order). No flock: the single short DB write from a second
+    OS process is the D-0015-ratified emergency exception to the §2
+    sole-writer rule (WAL + busy_timeout serialize it; busy database = explicit
+    error, never a partial answer); the scheduler picks the answer up on its
     next tick."""
     answer = option.strip()
     if not answer:
@@ -698,10 +733,12 @@ def cmd_decide(cfg: FactoryConfig, request_id: int, option: str) -> int:
         unit_dir.mkdir(parents=True, exist_ok=True)
         answered_at = utc_now()
         artifact_path = unit_dir / f"decision-answer-{dr.id}.md"
-        # §7 fixed step order: artifact file on disk BEFORE the recording tx.
+        # §7 fixed step order: artifact file on disk, committed (D-0015),
+        # BEFORE the recording tx.
         artifact_path.write_text(
             _render_decision_answer(dr, answer, answered_at), encoding="utf-8"
         )
+        sha = asyncio.run(_commit_decision_answer(home, artifact_path, dr))
         try:
             with db.transaction() as conn:
                 ref = register_artifact(
@@ -712,7 +749,7 @@ def cmd_decide(cfg: FactoryConfig, request_id: int, option: str) -> int:
                     repo="factory",
                     repo_root=home,
                     path=artifact_path,
-                    git_commit=None,
+                    git_commit=sha,
                 )
                 answer_decision(conn, request_id, answer, ref.id)
                 insert_event(

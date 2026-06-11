@@ -80,7 +80,11 @@ def _extract_json_objects(text: str) -> list[dict]:
 def _canonical_payload(inputs: Mapping[str, str]) -> bytes:
     """Canonical input payload — the §2 ``input_digest`` preimage and the
     ``max_input_bytes`` measure: key-sorted compact JSON, UTF-8. Key order of
-    the caller's mapping never changes the digest."""
+    the caller's mapping never changes the digest.
+
+    Also imported by scheduler's ``_fit_consultation_inputs`` so CP callers
+    bound their assembled inputs with EXACTLY this measure (a drifting copy
+    would re-open the false-breach path the §6 backstop is meant to catch)."""
     return json.dumps(
         dict(inputs), sort_keys=True, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")

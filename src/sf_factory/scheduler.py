@@ -49,6 +49,7 @@ from sf_factory.artifacts import (
     verify_integrity,
 )
 from sf_factory.config import ConsultationPointCfg, FactoryConfig, ProjectCfg
+from sf_factory.consultation import _canonical_payload
 from sf_factory.db import Database
 from sf_factory.models import (
     ArtifactContractError,
@@ -79,7 +80,7 @@ from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
 from sf_factory.worktrees import StaleGateError, WorktreeManager, commit_paths, run_git
 
-if TYPE_CHECKING:  # wave-3 sibling module; only instances are received at runtime
+if TYPE_CHECKING:  # type-only: Consultor/Verdict instances are injected, never built here
     from sf_factory.consultation import Consultor, Verdict
 
 # ------------------------------------------------------------------ vocabulary
@@ -88,10 +89,13 @@ if TYPE_CHECKING:  # wave-3 sibling module; only instances are received at runti
 #: by name, like config role keys; the registry itself stays in config.
 CP1_ID = "CP-1"
 
-#: CLIs with verified session resume (OPEN-3: claude native; codex verified by
-#: the D-0011 smoke test; the stub echoes --resume). A route outside this set
-#: executes `continue_session` as `rebuild` + `verdict_downgraded` (§3.1).
-RESUME_VERIFIED_CLIS = frozenset({"claude", "codex", "stub"})
+#: CLIs with verified session resume (OPEN-3: claude native; the stub echoes
+#: --resume). codex stays OUT until its resume is verified against the real
+#: CLI: D-0011 smoke-tested `codex exec resume` syntax only, and the §3.1
+#: hard gate holds until verified in code — wave-4 A2 integration territory,
+#: like the D-0014(2) cmdline check. A route outside this set executes
+#: `continue_session` as `rebuild` + `verdict_downgraded` (§3.1).
+RESUME_VERIFIED_CLIS = frozenset({"claude", "stub"})
 
 #: Sentinel artifact kind -> (filename, events.event_type, escalations.trigger).
 _SENTINEL_EVENTS: Mapping[str, tuple[str, str]] = {
@@ -306,6 +310,36 @@ def _reresolve_artifact_commits(
 # ----------------------------------------------------------------- misc helpers
 
 
+async def _dispose_worktree(
+    db: Database,
+    wt: WorktreeManager,
+    repo_root: Path,
+    worktree: Path,
+    *,
+    unit_level: str,
+    unit_id: str,
+) -> None:
+    """Best-effort worktree disposal: failure is an 'alert' event, never an
+    exception. Used (a) for scratch worktrees on EVERY exit of a gate step —
+    a leaked scratch gets reused by WorktreeManager.create, which re-syncs
+    TRACKED content only, so an untracked stale sentinel (or a previous
+    validator's derived tests) would survive into every later run and re-fire
+    the §5.4 always-fire triggers forever — and (b) for post-DONE unit
+    checkouts, where cleanup must never un-done a merged unit."""
+    try:
+        await wt.remove(repo_root, worktree)
+    except GitError as exc:
+        with db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=unit_level,
+                unit_id=unit_id,
+                event_type="alert",
+                actor=_ACTOR,
+                payload={"kind": "worktree_remove_failed", "error": str(exc)},
+            )
+
+
 def _resolve(home: Path, path: Path) -> Path:
     """Anchor a relative config path at factory.home (same rule as watchdog/runner)."""
     return path if path.is_absolute() else home / path
@@ -316,6 +350,38 @@ def _bounded(text: str, max_bytes: int) -> str:
     if len(data) <= max_bytes:
         return text
     return data[:max_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+
+
+def _fit_consultation_inputs(
+    inputs: Mapping[str, str], max_input_bytes: int
+) -> dict[str, str]:
+    """Bound the ASSEMBLED consultation inputs to the registry's
+    ``max_input_bytes`` exactly as the Consultor measures it
+    (``consultation._canonical_payload``: key-sorted compact JSON, UTF-8):
+    truncate the largest input until the canonical payload fits. A
+    legitimately oversized input (a huge validation report, say) then consults
+    bounded instead of landing a ``cp_breach_attempt`` governance event in the
+    DoD §13 creep scan; the Consultor-side breach check stays as the backstop
+    for actual caller bugs (§6) — this caller just never trips it on size.
+
+    Termination: each pass removes at least ``excess + 32`` raw bytes from the
+    largest value, and removed raw bytes shrink the canonical payload by at
+    least their own count, while the truncation marker adds < 32 — so the
+    canonical size strictly decreases. ConfigError when even empty inputs
+    cannot fit (the JSON envelope alone exceeds the registry bound)."""
+    fitted = dict(inputs)
+    while (excess := len(_canonical_payload(fitted)) - max_input_bytes) > 0:
+        key = max(fitted, key=lambda k: len(fitted[k].encode("utf-8")))
+        size = len(fitted[key].encode("utf-8"))
+        if size == 0:
+            raise ConfigError(
+                f"consultation max_input_bytes={max_input_bytes} is smaller than"
+                f" the canonical JSON envelope of its empty inputs {sorted(fitted)}"
+                " — registry bound unusable"
+            )
+        keep = size - excess - 32
+        fitted[key] = _bounded(fitted[key], keep) if keep > 0 else ""
+    return fitted
 
 
 def _read_text(path: Path, *, what: str) -> str:
@@ -626,7 +692,7 @@ class StageExecutor:
         budget firing past the reset allowance) = escalation rows + one
         transition to ESCALATED. Returns True when the stage escalated."""
         firings = self._thresholds.evaluate(stage)
-        escalating = []
+        escalating: list[tuple[str, dict]] = []
         for firing in firings:
             if firing.trigger is Trigger.CONTEXT_BUDGET:
                 read = self._db.read()
@@ -651,16 +717,21 @@ class StageExecutor:
                             payload=firing.evidence,
                         )
                     continue
-            escalating.append(firing)
+            escalating.append((firing.trigger.value, firing.evidence))
+        # D-0014(1): budgets.usage_missing_policy='escalate_after' is owned by
+        # the StageExecutor as a direct events-table count — a usage-blind
+        # stage must still hit a budget (Doctrine §20). NOT a Trigger enum
+        # member: the enum stays the set of §8 SQL-evaluated triggers.
+        breach = self._usage_missing_breach(stage)
+        if breach is not None:
+            escalating.append(("usage_missing", breach))
         if not escalating:
             return False
         payload_ref_id = await self._escalation_payload(stage, worktree, escalating)
 
         def coupled(conn: sqlite3.Connection) -> None:
-            for firing in escalating:
-                if fdb.open_escalation(
-                    conn, Level.STAGE.value, stage.id, firing.trigger.value
-                ):
+            for trigger, evidence in escalating:
+                if fdb.open_escalation(conn, Level.STAGE.value, stage.id, trigger):
                     continue  # uq_open_escalation: one open row per trigger
                 fdb.insert_escalation(
                     conn,
@@ -668,10 +739,10 @@ class StageExecutor:
                         id=None,
                         unit_level=Level.STAGE.value,
                         unit_id=stage.id,
-                        trigger=firing.trigger.value,
+                        trigger=trigger,
                         target="phase_architect",
                         payload_artifact_id=payload_ref_id,
-                        event_seq=firing.evidence.get("event_seq"),
+                        event_seq=evidence.get("event_seq"),
                         status="open",
                         resolution=None,
                         created_at=utc_now(),
@@ -685,13 +756,38 @@ class StageExecutor:
             StageState.ESCALATED.value,
             actor=_ACTOR,
             reason="threshold trigger(s) fired",
-            payload={"triggers": [f.trigger.value for f in escalating]},
+            payload={"triggers": [t for t, _ in escalating]},
             coupled=coupled,
         )
         return True
 
+    def _usage_missing_breach(self, stage: Stage) -> dict | None:
+        """D-0014(1) check, executor-owned (same pattern as 'internal_error'):
+        under 'escalate_after', count this stage's 'usage_missing' events (the
+        runner writes them, §5.1); past budgets.usage_missing_max_per_stage the
+        executor escalates directly. Returns the evidence dict, or None."""
+        if self._cfg.budgets.usage_missing_policy != "escalate_after":
+            return None
+        row = self._db.read().execute(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM events"
+            " WHERE unit_level = 'stage' AND unit_id = ?"
+            " AND event_type = 'usage_missing'",
+            (stage.id,),
+        ).fetchone()
+        count, last_seq = int(row[0]), int(row[1])
+        if count <= self._cfg.budgets.usage_missing_max_per_stage:
+            return None
+        return {
+            "usage_missing_events": count,
+            "max_per_stage": self._cfg.budgets.usage_missing_max_per_stage,
+            "event_seq": last_seq,
+        }
+
     async def _escalation_payload(
-        self, stage: Stage, worktree: Path | None, firings: Sequence
+        self,
+        stage: Stage,
+        worktree: Path | None,
+        escalating: Sequence[tuple[str, dict]],
     ) -> int | None:
         """Escalation payload = artifacts, not narrative (DoD §8): the firing
         evidence lands as a committed stage artifact when a worktree exists."""
@@ -701,10 +797,10 @@ class StageExecutor:
         unit_dir.mkdir(parents=True, exist_ok=True)
         path = unit_dir / "escalation-payload.md"
         body = ["# Escalation payload (mechanical trigger evidence)", ""]
-        for firing in firings:
-            body.append(f"## {firing.trigger.value}")
+        for trigger, evidence in escalating:
+            body.append(f"## {trigger}")
             body.append("```json")
-            body.append(json.dumps(firing.evidence, indent=2, sort_keys=True))
+            body.append(json.dumps(evidence, indent=2, sort_keys=True))
             body.append("```")
         path.write_text("\n".join(body) + "\n", encoding="utf-8")
         sha = await self._commit_unit_paths(
@@ -890,32 +986,53 @@ class StageExecutor:
         scratch = await self._wt.create(
             repo_root, f"{stage.id}-validate", branch, branch, new_branch=False
         )
-        await self._run_step_agent(
-            stage, validator_role, self._validate_prompt(stage, scratch), cwd=scratch
-        )
-        if await self._apply_thresholds(stage, worktree):
-            return False  # e.g. validator declared failure / contract change
+        try:
+            await self._run_step_agent(
+                stage, validator_role, self._validate_prompt(stage, scratch), cwd=scratch
+            )
+            if await self._apply_thresholds(stage, worktree):
+                return False  # e.g. validator declared failure / contract change
 
-        # Only the two reports cross the isolation boundary (§3.1).
-        scratch_dir = self._unit_dir(scratch, stage)
-        unit_dir = self._unit_dir(worktree, stage)
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        copied: list[Path] = []
-        for kind in ("validation_report", "validation_sidecar"):
-            src = scratch_dir / STAGE_ARTIFACTS[kind]
-            if not src.is_file():
-                raise ArtifactContractError(
-                    f"validator produced no {STAGE_ARTIFACTS[kind]} for stage {stage.id}"
-                    f" (expected at {src})"
-                )
-            shutil.copyfile(src, unit_dir / STAGE_ARTIFACTS[kind])
-            copied.append(unit_dir / STAGE_ARTIFACTS[kind])
-        report_path, sidecar_path = copied
-        summary = read_validation_sidecar(sidecar_path)
-        sha = await self._commit_unit_paths(
-            stage, worktree, copied, f"stage {stage.id}: validation report"
-        )
-        await self._wt.remove(repo_root, scratch)
+            # Only the two reports cross the isolation boundary (§3.1).
+            scratch_dir = self._unit_dir(scratch, stage)
+            unit_dir = self._unit_dir(worktree, stage)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            sources: list[Path] = []
+            for kind in ("validation_report", "validation_sidecar"):
+                src = scratch_dir / STAGE_ARTIFACTS[kind]
+                if not src.is_file():
+                    raise ArtifactContractError(
+                        f"validator produced no {STAGE_ARTIFACTS[kind]} for stage {stage.id}"
+                        f" (expected at {src})"
+                    )
+                sources.append(src)
+            # Strict-parse in the SCRATCH worktree BEFORE anything crosses into the
+            # stage worktree: a contract-violating sidecar escalates without
+            # leaving uncommitted files behind that would later trip the §3.1
+            # BUILD-isolation assertion after a 'rework:BUILD' resolution.
+            summary = read_validation_sidecar(sources[1])
+            copied: list[Path] = []
+            for src in sources:
+                dst = unit_dir / src.name
+                shutil.copyfile(src, dst)
+                copied.append(dst)
+            report_path, sidecar_path = copied
+            sha = await self._commit_unit_paths(
+                stage, worktree, copied, f"stage {stage.id}: validation report"
+            )
+        finally:
+            # §5.4 sentinel lifecycle: dispose the scratch on EVERY exit (the
+            # escalation and contract-violation exits included) — a leaked
+            # scratch would resurrect its untracked stale sentinel at the next
+            # create() and re-escalate after every subsequent validator run.
+            await _dispose_worktree(
+                self._db,
+                self._wt,
+                repo_root,
+                scratch,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+            )
 
         with self._db.transaction() as conn:
             register_artifact(
@@ -977,7 +1094,11 @@ class StageExecutor:
     async def _consult_cp1(
         self, stage: Stage, report_path: Path, worktree: Path, target_branch: str
     ) -> Verdict:
-        """Assemble CP-1 inputs exactly per the config registry declaration."""
+        """Assemble CP-1 inputs exactly per the config registry declaration,
+        bounded HERE to the registry's max_input_bytes: every assembled input
+        is raw-capped, then the canonical payload is fitted as a whole — a
+        legitimately oversized validation report must consult (truncated), not
+        register as a cp_breach_attempt governance breach (§6 backstop)."""
         cp = _cp_point(self._cfg, CP1_ID)
         spec_ref = fdb.latest_artifact(
             self._db.read(), Level.STAGE.value, stage.id, "spec"
@@ -988,11 +1109,13 @@ class StageExecutor:
             else ""
         )
         sources = {
-            "validation_report": _read_text(report_path, what="validation report"),
+            "validation_report": _bounded(
+                _read_text(report_path, what="validation report"), cp.max_input_bytes
+            ),
             "diff_digest": await self._wt.diff_digest(
                 worktree, target_branch, cp.max_input_bytes
             ),
-            "spec": spec_text,
+            "spec": _bounded(spec_text, cp.max_input_bytes),
         }
         unknown = [key for key in cp.inputs if key not in sources]
         if unknown:
@@ -1000,7 +1123,9 @@ class StageExecutor:
                 f"consultation point {cp.id} declares inputs {unknown} that the"
                 " stage executor cannot assemble"
             )
-        inputs = {key: sources[key] for key in cp.inputs}
+        inputs = _fit_consultation_inputs(
+            {key: sources[key] for key in cp.inputs}, cp.max_input_bytes
+        )
         return await self._consultor.consult(
             cp.id, unit_level=Level.STAGE.value, unit_id=stage.id, inputs=inputs
         )
@@ -1642,19 +1767,12 @@ class StageExecutor:
                 ),
             )
             return True
-        if tier1.tests_failed:
-            self._sm.transition(
-                Level.STAGE,
-                stage.id,
-                StageState.BUILD.value,
-                actor=_ACTOR,
-                reason="Tier-1 test suite failed",
-                payload={"test_output_path": tier1.test_output_path},
-            )
-            return True
-
         # Rebase rewrote history: re-resolve this stage's artifact commits at
         # the new head (§4 tier1_gate caller duty) — mechanical, same path+sha.
+        # Runs whenever the rebase succeeded, EVEN when the suite then failed:
+        # the pre-rebase commits are already reflog-only, and waiting for a
+        # later full pass would leave verify_integrity hostage to reflog/GC
+        # timing across the rework loop.
         code, head_out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
         if code != 0:
             raise GitError(f"git rev-parse HEAD failed in {worktree}: {err.strip()}")
@@ -1671,6 +1789,17 @@ class StageExecutor:
                 actor=_ACTOR,
                 payload={"new_head": new_head, "updated": updated},
             )
+
+        if tier1.tests_failed:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.BUILD.value,
+                actor=_ACTOR,
+                reason="Tier-1 test suite failed",
+                payload={"test_output_path": tier1.test_output_path},
+            )
+            return True
 
         findings = await self._tier2(stage, phase, worktree, repo_root, target_branch)
         if findings is None:
@@ -1729,18 +1858,14 @@ class StageExecutor:
     ) -> None:
         """Post-DONE cleanup; failure is reported as an event, never an
         exception (the stage IS merged — cleanup must not un-done it)."""
-        try:
-            await self._wt.remove(repo_root, worktree)
-        except GitError as exc:
-            with self._db.transaction() as conn:
-                fdb.insert_event(
-                    conn,
-                    unit_level=Level.STAGE.value,
-                    unit_id=stage.id,
-                    event_type="alert",
-                    actor=_ACTOR,
-                    payload={"kind": "worktree_remove_failed", "error": str(exc)},
-                )
+        await _dispose_worktree(
+            self._db,
+            self._wt,
+            repo_root,
+            worktree,
+            unit_level=Level.STAGE.value,
+            unit_id=stage.id,
+        )
 
     async def _tier2(
         self, stage: Stage, phase: Phase, worktree: Path, repo_root: Path, target_branch: str
@@ -1765,34 +1890,59 @@ class StageExecutor:
         scratch = await self._wt.create(
             repo_root, f"{stage.id}-tier2", branch, branch, new_branch=False
         )
-        prompt = self._tier2_prompt(
-            stage, contracts, plan_texts, full_diff, sibling_diffs
-        )
-        await self._run_step_agent(stage, "integration_validator", prompt, cwd=scratch)
-        if await self._apply_thresholds(stage, worktree):
-            return None  # e.g. validator declared failure mid-gate — escalated
-        scratch_dir = self._unit_dir(scratch, stage)
-        report = scratch_dir / "integration-report.md"
-        sidecar = scratch_dir / "integration-report.json"
-        if not sidecar.is_file():
-            raise ArtifactContractError(
-                f"integration validator produced no findings sidecar at {sidecar}"
+        try:
+            prompt = self._tier2_prompt(
+                stage, contracts, plan_texts, full_diff, sibling_diffs
             )
-        findings = _read_findings_sidecar(sidecar, auditor_role="integration_validator")
-        # Only the report crosses into the stage worktree (§3.1 isolation).
-        unit_dir = self._unit_dir(worktree, stage)
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        copied = [unit_dir / report.name, unit_dir / sidecar.name]
-        if report.is_file():
-            shutil.copyfile(report, copied[0])
-        else:
-            copied[0].write_text("(no prose report)\n", encoding="utf-8")
-        shutil.copyfile(sidecar, copied[1])
-        sha = await self._commit_unit_paths(
-            stage, worktree, copied, f"stage {stage.id}: tier2 report"
-        )
-        await self._wt.remove(repo_root, scratch)
+            await self._run_step_agent(stage, "integration_validator", prompt, cwd=scratch)
+            if await self._apply_thresholds(stage, worktree):
+                return None  # e.g. validator declared failure mid-gate — escalated
+            scratch_dir = self._unit_dir(scratch, stage)
+            report = scratch_dir / "integration-report.md"
+            sidecar = scratch_dir / "integration-report.json"
+            if not sidecar.is_file():
+                raise ArtifactContractError(
+                    f"integration validator produced no findings sidecar at {sidecar}"
+                )
+            findings = _read_findings_sidecar(sidecar, auditor_role="integration_validator")
+            # Only the report crosses into the stage worktree (§3.1 isolation).
+            unit_dir = self._unit_dir(worktree, stage)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            copied = [unit_dir / report.name, unit_dir / sidecar.name]
+            if report.is_file():
+                shutil.copyfile(report, copied[0])
+            else:
+                copied[0].write_text("(no prose report)\n", encoding="utf-8")
+            shutil.copyfile(sidecar, copied[1])
+            sha = await self._commit_unit_paths(
+                stage, worktree, copied, f"stage {stage.id}: tier2 report"
+            )
+        finally:
+            # §5.4: dispose on EVERY exit (escalation + contract-violation
+            # included) — a leaked tier2 scratch re-detects its stale sentinel
+            # after every later gate run and the stage can never merge again.
+            await _dispose_worktree(
+                self._db,
+                self._wt,
+                repo_root,
+                scratch,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+            )
         with self._db.transaction() as conn:
+            # Canonical-output registration uniform with _step_audit: prose
+            # report AND findings sidecar both register as kind='audit_report'
+            # (findings keep referencing the sidecar ref, as before).
+            register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="audit_report",
+                repo="workspace",
+                repo_root=worktree,
+                path=copied[0],
+                git_commit=sha,
+            )
             ref = register_artifact(
                 conn,
                 unit_level=Level.STAGE.value,
@@ -1836,7 +1986,23 @@ class StageExecutor:
 
     def _contract_freeze_commit(self, phase: Phase) -> str:
         """The contract-freeze commit = the commit that captured the phase plan
-        sidecar (PLANNING -> CONTRACTS_FROZEN registration)."""
+        sidecar, read from the PLANNING -> CONTRACTS_FROZEN transition payload
+        ('commit'). The events table is the durable anchor: the sidecar's
+        artifact_refs.git_commit gets mechanically re-resolved to the rebased
+        head after the phase-level Tier-1 rebase, which would silently void
+        the §3.1 sibling window for stage gates re-run after an
+        AWAITING_SIGNOFF 'changes' loop. The registered sidecar ref stays as
+        the fallback for rows frozen before the payload carried the anchor;
+        no anchor at all stays fail-loud."""
+        payload = _last_transition_payload(
+            self._db.read(),
+            Level.PHASE.value,
+            phase.id,
+            PhaseState.CONTRACTS_FROZEN.value,
+        )
+        commit = payload.get("commit")
+        if isinstance(commit, str) and commit:
+            return commit
         ref = fdb.latest_artifact(
             self._db.read(), Level.PHASE.value, phase.id, "phase_plan_sidecar"
         )
@@ -2083,6 +2249,7 @@ class PhaseExecutor:
         reason: str,
         payload: dict,
         event_seq: int | None = None,
+        payload_artifact_id: int | None = None,
         transition: bool = True,
     ) -> None:
         """Escalation row (+ ESCALATED transition when legal from the current
@@ -2099,7 +2266,7 @@ class PhaseExecutor:
                         unit_id=phase.id,
                         trigger=trigger,
                         target=target,
-                        payload_artifact_id=None,
+                        payload_artifact_id=payload_artifact_id,
                         event_seq=event_seq,
                         status="open",
                         resolution=None,
@@ -2133,10 +2300,14 @@ class PhaseExecutor:
             )
             insert_row(conn)
 
-    async def _detect_phase_sentinels(self, phase: Phase, cwd: Path) -> bool:
+    async def _detect_phase_sentinels(
+        self, phase: Phase, cwd: Path, *, actor: str = "phase_architect"
+    ) -> bool:
         """§5.4 post-conditions at phase level (no ThresholdEvaluator here — it
         is stage-scoped by its frozen signature): sentinel file -> event ->
-        escalation to the owning (main) architect. Returns True if escalated."""
+        escalation to the owning (main) architect. Returns True if escalated.
+        ``actor`` attributes the event to the role that wrote the sentinel —
+        the tier-2 caller passes 'integration_validator' (§6 audit trail)."""
         unit_dir = self._unit_dir(cwd, phase)
         sentinels = detect_sentinels(unit_dir)
         if not sentinels:
@@ -2149,7 +2320,7 @@ class PhaseExecutor:
                     unit_level=Level.PHASE.value,
                     unit_id=phase.id,
                     event_type=event_type,
-                    actor="phase_architect",
+                    actor=actor,
                     payload={"sentinel": str(unit_dir / STAGE_ARTIFACTS[kind])},
                 )
             self._escalate(
@@ -2236,6 +2407,19 @@ class PhaseExecutor:
             f"phase {phase.id}: plan + frozen contracts",
             trailers={"Factory-Unit": f"phase/{phase.id}"},
         )
+        if sha is None:
+            # §5.5d at-least-once replay: a crash between this commit and the
+            # CONTRACTS_FROZEN tx re-runs the step, and a byte-identical plan
+            # leaves nothing to commit — but the freeze anchor (payload
+            # ['commit'], read by _contract_freeze_commit at every stage
+            # MERGE_GATE) must never be None: pin it to the current HEAD,
+            # the same pattern as cli._commit_decision_answer.
+            code, out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
+            if code != 0:
+                raise GitError(
+                    f"git rev-parse HEAD failed in {worktree}: {(err or out).strip()}"
+                )
+            sha = out.strip()
 
         def coupled(conn: sqlite3.Connection) -> None:
             register_artifact(
@@ -2276,6 +2460,10 @@ class PhaseExecutor:
             PhaseState.CONTRACTS_FROZEN.value,
             actor=_ACTOR,
             reason="plan + contracts registered & committed",
+            # payload['commit'] is the DURABLE §3.1 freeze anchor:
+            # _contract_freeze_commit reads it from this append-only event —
+            # the sidecar's artifact_refs.git_commit gets re-resolved after
+            # the phase-level rebase and cannot anchor the sibling window.
             payload={"contracts": len(contract_paths), "commit": sha},
             coupled=coupled,
         )
@@ -2400,6 +2588,19 @@ class PhaseExecutor:
                 payload={"error": str(exc)},
             )
             return False
+        # §3.1 sibling-window anchor, read BEFORE the Tier-1 rebase moves it:
+        # after a successful rebase the fork point IS the target head, so a
+        # post-rebase merge-base would return an empty window — every sibling
+        # merged into the target pre-gate would vanish from the Tier-2 inputs
+        # (exactly the DoD §5.3 structurally-uncatchable failure mode).
+        code, base_out, err = await run_git(
+            "merge-base", self._branch(phase), target, cwd=repo_root
+        )
+        if code != 0:
+            raise GitError(
+                f"git merge-base failed in {repo_root}: {(err or base_out).strip()}"
+            )
+        sibling_since = base_out.strip()
         started_at = utc_now()
         tier1 = await self._wt.tier1_gate(
             worktree, target, test_cmd, self._cfg.process.test_suite_timeout_s
@@ -2439,21 +2640,49 @@ class PhaseExecutor:
                     "test_output_path": tier1.test_output_path,
                 },
             )
-        if not tier1.passed:
+        if tier1.rebase_conflict:
+            # Conflict payload = committed phase artifact (DoD §8) — never
+            # inlined into events.payload_json (§2: small facts only); same
+            # pattern as the stage merge gate's tier1-conflict.md.
+            unit_dir = self._unit_dir(worktree, phase)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            conflict_path = unit_dir / "tier1-conflict.md"
+            conflict_path.write_text(tier1.conflict_payload, encoding="utf-8")
+            sha = await commit_paths(
+                worktree,
+                [conflict_path],
+                f"phase {phase.id}: tier1 conflict",
+                trailers={"Factory-Unit": f"phase/{phase.id}"},
+            )
+            with self._db.transaction() as conn:
+                ref = register_artifact(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    kind="tier1_conflict",
+                    repo="workspace",
+                    repo_root=worktree,
+                    path=conflict_path,
+                    git_commit=sha,
+                )
             self._escalate(
                 phase,
                 trigger="integration_conflict",
                 target="main_architect",
                 reason="phase Tier-1 gate failed",
                 payload={
-                    "rebase_conflict": tier1.rebase_conflict,
+                    "rebase_conflict": True,
                     "tests_failed": tier1.tests_failed,
-                    "conflict_payload": _bounded(tier1.conflict_payload, 20000),
+                    "conflict_artifact": str(conflict_path),
                     "test_output_path": tier1.test_output_path,
                 },
+                payload_artifact_id=ref.id,
             )
             return False
 
+        # Rebase rewrote history: re-resolve at the new head even when the
+        # suite then failed (§4 tier1_gate caller duty — the pre-rebase
+        # commits are already reflog-only; same rule as the stage gate).
         code, head_out, err = await run_git("rev-parse", "HEAD", cwd=worktree)
         if code != 0:
             raise GitError(f"git rev-parse HEAD failed in {worktree}: {err.strip()}")
@@ -2462,7 +2691,23 @@ class PhaseExecutor:
                 conn, Level.PHASE.value, phase.id, worktree, head_out.strip()
             )
 
-        findings = await self._tier2(phase, project, worktree, repo_root, target)
+        if tier1.tests_failed:
+            self._escalate(
+                phase,
+                trigger="integration_conflict",
+                target="main_architect",
+                reason="phase Tier-1 gate failed",
+                payload={
+                    "rebase_conflict": False,
+                    "tests_failed": True,
+                    "test_output_path": tier1.test_output_path,
+                },
+            )
+            return False
+
+        findings = await self._tier2(
+            phase, project, worktree, repo_root, target, sibling_since
+        )
         if findings is None:
             return False  # validator declared failure — already escalated
         if findings:
@@ -2485,11 +2730,13 @@ class PhaseExecutor:
         worktree: Path,
         repo_root: Path,
         target: str,
+        since_ref: str,
     ) -> list[dict] | None:
         """Phase-level §3.1 Tier-2 contract on the same code path. The sibling
-        window opens at this phase's fork point from the integration branch
-        (cross-phase contract freeze is a planning artifact in MVP — DoD §3.2
-        scopes phase-level execution as first production use)."""
+        window opens at this phase's fork point from the integration branch —
+        ``since_ref``, the merge-base the CALLER captured BEFORE the Tier-1
+        rebase moved it (cross-phase contract freeze is a planning artifact in
+        MVP — DoD §3.2 scopes phase-level execution as first production use)."""
         max_bytes = self._cfg.process.tier2_max_diff_bytes_per_unit
         contracts = {}
         contracts_dir = Path(worktree) / "_factory" / "contracts"
@@ -2506,15 +2753,8 @@ class PhaseExecutor:
             if p.is_file()
         }
         full_diff = await self._wt.full_diff(worktree, target, max_bytes)
-        code, base_out, err = await run_git(
-            "merge-base", self._branch(phase), target, cwd=repo_root
-        )
-        if code != 0:
-            raise GitError(
-                f"git merge-base failed in {repo_root}: {(err or base_out).strip()}"
-            )
         sibling_diffs = await self._wt.merged_unit_diffs(
-            repo_root, target, base_out.strip(), max_bytes
+            repo_root, target, since_ref, max_bytes
         )
         sibling_diffs = {uid: d for uid, d in sibling_diffs.items() if uid != phase.id}
 
@@ -2549,42 +2789,71 @@ class PhaseExecutor:
         scratch = await self._wt.create(
             repo_root, f"{phase.id}-tier2", branch, branch, new_branch=False
         )
-        await self._runner.run_agent(
-            "integration_validator",
-            "\n".join(parts),
-            unit_level=Level.PHASE.value,
-            unit_id=phase.id,
-            cwd=scratch,
-        )
-        if await self._detect_phase_sentinels(phase, scratch):
-            return None  # sentinel path already escalated — no second escalation
-        scratch_dir = self._unit_dir(scratch, phase)
-        sidecar_src = scratch_dir / "integration-report.json"
-        if not sidecar_src.is_file():
-            raise ArtifactContractError(
-                f"integration validator produced no findings sidecar at {sidecar_src}"
+        try:
+            await self._runner.run_agent(
+                "integration_validator",
+                "\n".join(parts),
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+                cwd=scratch,
             )
-        findings = _read_findings_sidecar(
-            sidecar_src, auditor_role="integration_validator"
-        )
-        unit_dir = self._unit_dir(worktree, phase)
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        report_src = scratch_dir / "integration-report.md"
-        report_dst = unit_dir / "integration-report.md"
-        sidecar_dst = unit_dir / "integration-report.json"
-        if report_src.is_file():
-            shutil.copyfile(report_src, report_dst)
-        else:
-            report_dst.write_text("(no prose report)\n", encoding="utf-8")
-        shutil.copyfile(sidecar_src, sidecar_dst)
-        await commit_paths(
-            worktree,
-            [report_dst, sidecar_dst],
-            f"phase {phase.id}: tier2 report",
-            trailers={"Factory-Unit": f"phase/{phase.id}"},
-        )
-        await self._wt.remove(repo_root, scratch)
+            if await self._detect_phase_sentinels(
+                phase, scratch, actor="integration_validator"
+            ):
+                return None  # sentinel path already escalated — no second escalation
+            scratch_dir = self._unit_dir(scratch, phase)
+            sidecar_src = scratch_dir / "integration-report.json"
+            if not sidecar_src.is_file():
+                raise ArtifactContractError(
+                    f"integration validator produced no findings sidecar at {sidecar_src}"
+                )
+            findings = _read_findings_sidecar(
+                sidecar_src, auditor_role="integration_validator"
+            )
+            unit_dir = self._unit_dir(worktree, phase)
+            unit_dir.mkdir(parents=True, exist_ok=True)
+            report_src = scratch_dir / "integration-report.md"
+            report_dst = unit_dir / "integration-report.md"
+            sidecar_dst = unit_dir / "integration-report.json"
+            if report_src.is_file():
+                shutil.copyfile(report_src, report_dst)
+            else:
+                report_dst.write_text("(no prose report)\n", encoding="utf-8")
+            shutil.copyfile(sidecar_src, sidecar_dst)
+            sha = await commit_paths(
+                worktree,
+                [report_dst, sidecar_dst],
+                f"phase {phase.id}: tier2 report",
+                trailers={"Factory-Unit": f"phase/{phase.id}"},
+            )
+        finally:
+            # §5.4: dispose on EVERY exit (sentinel + contract-violation
+            # included) — a leaked phase tier2 scratch re-detects its stale
+            # sentinel at every later integration gate run.
+            await _dispose_worktree(
+                self._db,
+                self._wt,
+                repo_root,
+                scratch,
+                unit_level=Level.PHASE.value,
+                unit_id=phase.id,
+            )
         with self._db.transaction() as conn:
+            # Same canonical-output treatment as the stage gates (_step_audit /
+            # stage Tier-2): both reports register as phase-level audit_report
+            # refs — verify_integrity guards them and findings stay event-only
+            # (audit_findings.stage_id is NOT NULL by design).
+            for path in (report_dst, sidecar_dst):
+                register_artifact(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    kind="audit_report",
+                    repo="workspace",
+                    repo_root=worktree,
+                    path=path,
+                    git_commit=sha,
+                )
             fdb.insert_event(
                 conn,
                 unit_level=Level.PHASE.value,
@@ -2766,6 +3035,9 @@ class PhaseExecutor:
         return True
 
     async def _step_escalated(self, phase: Phase) -> bool:
+        """ESCALATED: blocked while any escalation is open; on resolution,
+        archive sentinels (§5.4, same rule as the stage path) and route per
+        the resolution vocabulary."""
         conn = self._db.read()
         if _open_escalation_count(conn, Level.PHASE.value, phase.id) > 0:
             return False
@@ -2789,6 +3061,9 @@ class PhaseExecutor:
                     },
                 )
             return False
+        worktree = self._worktree(phase)
+        if worktree.is_dir():
+            await self._archive_sentinels(phase, worktree, last)
         request_id: int | None = None
 
         def coupled(tx: sqlite3.Connection) -> None:
@@ -2812,6 +3087,32 @@ class PhaseExecutor:
                 request_id, f"Decizie necesară (escaladare): faza {phase.name}"
             )
         return True
+
+    async def _archive_sentinels(
+        self, phase: Phase, worktree: Path, escalation: Escalation
+    ) -> None:
+        """§5.4 sentinel lifecycle at phase level, mirroring the stage path:
+        archive (rename + commit) any present sentinel in the DURABLE phase
+        worktree BEFORE re-running steps — a stale PLANNING sentinel would
+        otherwise be re-detected after a 'replan'/'resume' resolution as a NEW
+        events.seq past the escalations.event_seq cursor and re-escalate
+        forever; a NEW sentinel written after rework fires again by design."""
+        unit_dir = self._unit_dir(worktree, phase)
+        renamed = False
+        for kind in detect_sentinels(unit_dir):
+            src = unit_dir / STAGE_ARTIFACTS[kind]
+            dst = src.with_name(f"{src.stem}.resolved-{escalation.id}.md")
+            src.rename(dst)
+            renamed = True
+        if renamed:
+            # Commit the whole unit artifact dir: it stages the rename pair even
+            # when the sentinel was never tracked (same rule as the stage path).
+            await commit_paths(
+                worktree,
+                [unit_dir],
+                f"phase {phase.id}: archive resolved sentinel(s)",
+                trailers={"Factory-Unit": f"phase/{phase.id}"},
+            )
 
     def _insert_tradeoff_decision(self, tx: sqlite3.Connection, phase: Phase) -> int:
         """Escalation-tradeoff decision request for a phase (in the caller's tx,
@@ -3072,10 +3373,22 @@ class Scheduler:
                 actions = await self._wt.heal_git_state(checkout)
                 healed[str(checkout)] = tuple(actions)
             except GitError as exc:
-                heal_errors.append(f"{checkout}: {exc}")
+                self._record_heal_failure(
+                    heal_errors,
+                    unit_level="factory",
+                    unit_id=None,
+                    path=checkout,
+                    error=str(exc),
+                )
             code, out, err = await run_git("worktree", "prune", cwd=checkout)
             if code != 0:
-                heal_errors.append(f"{checkout}: worktree prune: {(err or out).strip()}")
+                self._record_heal_failure(
+                    heal_errors,
+                    unit_level="factory",
+                    unit_id=None,
+                    path=checkout,
+                    error=f"worktree prune: {(err or out).strip()}",
+                )
             self._touch_liveness()
         for label, worktree in unit_worktrees:
             try:
@@ -3084,9 +3397,41 @@ class Scheduler:
                 if await self._canonicalize_worktree(label, worktree):
                     dirty_reset.append(str(worktree))
             except GitError as exc:
-                heal_errors.append(f"{worktree}: {exc}")
+                level, _, unit_id = label.partition(":")
+                self._record_heal_failure(
+                    heal_errors,
+                    unit_level=level,
+                    unit_id=unit_id,
+                    path=worktree,
+                    error=str(exc),
+                )
             self._touch_liveness()
         return healed, heal_errors, dirty_reset
+
+    def _record_heal_failure(
+        self,
+        heal_errors: list[str],
+        *,
+        unit_level: str,
+        unit_id: str | None,
+        path: Path,
+        error: str,
+    ) -> None:
+        """§6 fail-explicit at §5.5b: a failed heal must leave durable evidence
+        at recovery time — RecoveryReport.heal_errors alone is in-memory only
+        (cli.cmd_run discards recover()'s return). One 'alert' event per
+        failure, same transaction-on-the-loop-thread pattern as the
+        dirty_worktree_reset event."""
+        heal_errors.append(f"{path}: {error}")
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level=unit_level,
+                unit_id=unit_id,
+                event_type="alert",
+                actor=_ACTOR,
+                payload={"kind": "heal_failed", "path": str(path), "error": error},
+            )
 
     async def _canonicalize_worktree(self, label: str, worktree: Path) -> bool:
         """§5.5b worktree canonicalization: dirty unit worktree -> evidence file

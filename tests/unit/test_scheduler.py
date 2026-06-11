@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from sf_factory.models import (
     ProcessRecord,
     Stage,
     StageState,
+    Trigger,
     utc_now,
 )
 from sf_factory.runner import AgentResult
@@ -282,6 +284,9 @@ class FakeWorktrees:
 
     async def remove(self, repo_root, worktree):
         self.removed.append(Path(worktree))
+        # Real disposal semantics (§5.4): a removed scratch leaves no untracked
+        # residue behind — the next create() starts from a clean dir.
+        shutil.rmtree(worktree, ignore_errors=True)
 
     async def diff_digest(self, worktree, target_branch, max_bytes):
         return "== diffstat ==\n(fake digest)"
@@ -869,6 +874,302 @@ async def test_phase_planning_sentinel_escalates(db, config_dict) -> None:
     assert rows[0]["event_seq"] == events_of(db, "ph", "declared_failure")[0]["seq"]
 
 
+_VALID_PLAN_JSON = json.dumps(
+    {
+        "stages": [
+            {"id": "s1", "name": "one", "risk_class": "routine", "acceptance": "a"}
+        ],
+        "dag_edges": [],
+    }
+)
+
+
+async def test_phase_planning_sentinel_archived_on_resolution_no_reescalate(
+    db, config_dict
+) -> None:
+    """§5.4 at phase level (wave-3 fix round): a _DECLARED_FAILURE.md written
+    by the phase architect into the DURABLE phase worktree during PLANNING is
+    archived (rename + commit) when the escalation resolves to 'replan' — the
+    re-run must not re-detect the stale sentinel (a NEW events.seq past the
+    cursor) and re-escalate forever even though the agent now succeeds."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.PLANNING)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    runner = FakeRunner(db)
+    calls = [0]
+
+    def architect(cwd: Path, unit_id: str, resume) -> None:
+        calls[0] += 1
+        d = cwd / "_factory" / "phases" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        if calls[0] == 1:
+            (d / "_DECLARED_FAILURE.md").write_text("cannot decompose", encoding="utf-8")
+            return
+        (d / "phase-plan.md").write_text("plan\n", encoding="utf-8")
+        (d / "phase-plan.json").write_text(_VALID_PLAN_JSON, encoding="utf-8")
+
+    runner.behaviors["phase_architect"] = architect
+    executor = make_phase_executor(db, cfg, runner=runner)
+    await executor.execute("ph")
+    assert phase_state(db, "ph") is PhaseState.ESCALATED
+    (esc,) = open_escalations(db, "ph")
+
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc["id"], "replan")
+    await executor.execute("ph")
+
+    unit_dir = worktree / "_factory" / "phases" / "ph"
+    assert not (unit_dir / "_DECLARED_FAILURE.md").exists()
+    archived = unit_dir / f"_DECLARED_FAILURE.resolved-{esc['id']}.md"
+    assert archived.is_file()  # renamed + committed BEFORE the replan re-run
+    assert calls[0] == 2
+    assert len(events_of(db, "ph", "declared_failure")) == 1  # stale never re-fired
+    assert open_escalations(db, "ph") == []
+    assert phase_state(db, "ph") is PhaseState.RUNNING  # replan completed + ingested
+
+
+async def test_phase_planning_replay_identical_plan_anchors_freeze_on_head(
+    db, config_dict
+) -> None:
+    """§5.5d at-least-once replay (wave-3 fix round): orchestrator died after
+    the plan commit but before the CONTRACTS_FROZEN tx; the re-run produces
+    byte-identical plan files, so commit_paths returns None — the freeze
+    anchor must fall back to the current HEAD (cli._commit_decision_answer
+    pattern), never record {'commit': None}, which would leave
+    _contract_freeze_commit anchorless at the first stage MERGE_GATE."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.PLANNING)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    plan_dir = worktree / "_factory" / "phases" / "ph"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "phase-plan.md").write_text("plan\n", encoding="utf-8")
+    (plan_dir / "phase-plan.json").write_text(_VALID_PLAN_JSON, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "pre-crash plan commit"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    executor = make_phase_executor(db, cfg)  # re-run agent writes nothing new
+    await executor.execute("ph")
+
+    frozen = [
+        e
+        for e in events_of(db, "ph", "transition")
+        if e["to_state"] == "CONTRACTS_FROZEN"
+    ]
+    assert json.loads(frozen[0]["payload_json"])["commit"] == head
+    ref = fdb.latest_artifact(db.read(), "phase", "ph", "phase_plan_sidecar")
+    assert ref is not None and ref.git_commit == head
+    assert phase_state(db, "ph") is PhaseState.RUNNING  # replay continued cleanly
+
+
+async def test_phase_tier2_sibling_window_survives_tier1_rebase(
+    db, config_dict, tmp_path
+) -> None:
+    """§3.1 phase-INTEGRATING regression (wave-3 fix round): a sibling unit
+    merged into the target BEFORE the gate must reach the Integration
+    Validator as a full diff. The Tier-1 rebase moves this phase's fork point
+    to the target head, so the sibling-window anchor must be captured
+    PRE-rebase — a post-rebase merge-base yields an empty window and the DoD
+    §5.3 seeded scenario becomes structurally uncatchable."""
+    from sf_factory.worktrees import WorktreeManager, commit_paths
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    config_dict["projects"]["proj"]["test_command"] = "true"
+    cfg = make_config(config_dict)
+    workspace = Path(cfg.projects["proj"].workspace)
+    init_repo(workspace)
+    wt = WorktreeManager(cfg)
+
+    insert_phase(db, "ph", PhaseState.INTEGRATING)
+    phase_wt = await wt.create(workspace, "ph", "phase/ph", "main")
+    plan = phase_wt / "_factory" / "phases" / "ph" / "phase-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("plan body\n", encoding="utf-8")
+    await commit_paths(
+        phase_wt, [plan], "phase ph: plan", trailers={"Factory-Unit": "phase/ph"}
+    )
+
+    # Sibling unit merged into main AFTER ph forked and BEFORE the gate runs —
+    # the rebase will absorb it, so only the pre-rebase anchor can see it.
+    git("switch", "-q", "-c", "phase/sib", cwd=workspace)
+    (workspace / "sibling.py").write_text("SIBLING_MARKER = 'windowed'\n", encoding="utf-8")
+    git("add", "--", "sibling.py", cwd=workspace)
+    git("commit", "-q", "-m", "sibling work", cwd=workspace)
+    git("switch", "-q", "main", cwd=workspace)
+    await wt.integrate(workspace, "phase/sib", "main")
+
+    runner = FakeRunner(db)
+
+    def validator(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "phases" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "integration-report.md").write_text("clean\n", encoding="utf-8")
+        (d / "integration-report.json").write_text('{"findings": []}', encoding="utf-8")
+
+    runner.behaviors["integration_validator"] = validator
+    executor = PhaseExecutor(db, StateMachine(db), cfg, runner, wt, FakeNotify())
+    await executor.execute("ph")
+
+    calls = [c for c in runner.calls if c.role == "integration_validator"]
+    assert len(calls) == 1
+    prompt = calls[0].prompt
+    assert "--- merged unit sib ---" in prompt  # the sibling reached Tier 2
+    assert "SIBLING_MARKER" in prompt  # ...as a full diff body, not a header
+    assert "(none)" not in prompt  # the pre-fix symptom: empty sibling window
+    (gate,) = events_of(db, "ph", "tier2_gate")
+    assert json.loads(gate["payload_json"])["siblings"] == ["sib"]
+    assert phase_state(db, "ph") is PhaseState.AWAITING_SIGNOFF  # gates passed
+    # Wave-3 fix round: both phase Tier-2 reports register as phase-level
+    # audit_report refs (uniform with _step_audit), and the scratch is gone.
+    refs = (
+        db.read()
+        .execute(
+            "SELECT path FROM artifact_refs WHERE unit_level='phase'"
+            " AND unit_id='ph' AND kind='audit_report' ORDER BY id"
+        )
+        .fetchall()
+    )
+    assert [Path(r["path"]).name for r in refs] == [
+        "integration-report.md",
+        "integration-report.json",
+    ]
+    assert not (Path(cfg.projects["proj"].worktrees_dir) / "ph-tier2").exists()
+
+
+async def test_phase_tier2_sentinel_attributed_to_integration_validator(
+    db, config_dict, tmp_path
+) -> None:
+    """§6 audit-trail attribution: a _DECLARED_FAILURE.md written by the
+    Integration Validator at the phase Tier-2 gate must be recorded with
+    actor='integration_validator' in the append-only events trail — not
+    misattributed to the phase architect (the pre-fix symptom)."""
+    from sf_factory.worktrees import WorktreeManager
+
+    config_dict["projects"]["proj"]["test_command"] = "true"
+    cfg = make_config(config_dict)
+    workspace = Path(cfg.projects["proj"].workspace)
+    init_repo(workspace)
+    wt = WorktreeManager(cfg)
+
+    insert_phase(db, "ph", PhaseState.INTEGRATING)
+    await wt.create(workspace, "ph", "phase/ph", "main")
+
+    runner = FakeRunner(db)
+
+    def validator(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "phases" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "_DECLARED_FAILURE.md").write_text("cannot validate", encoding="utf-8")
+
+    runner.behaviors["integration_validator"] = validator
+    executor = PhaseExecutor(db, StateMachine(db), cfg, runner, wt, FakeNotify())
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.ESCALATED
+    (event,) = events_of(db, "ph", "declared_failure")
+    assert event["actor"] == "integration_validator"
+    rows = open_escalations(db, "ph")
+    assert [r["trigger"] for r in rows] == ["agent_declared_failure"]
+    assert rows[0]["target"] == "main_architect"
+    # Wave-3 fix round: the scratch is disposed on the ESCALATION exit too —
+    # a leaked tier2 scratch would re-detect this stale sentinel (untracked,
+    # so create()'s tracked-content re-sync never clears it) at every later
+    # integration gate run, and the phase could never pass Tier 2 again.
+    assert not (Path(cfg.projects["proj"].worktrees_dir) / "ph-tier2").exists()
+
+
+async def test_stage_merge_gate_tier2_registers_both_reports_and_disposes_scratch(
+    db, config_dict, tmp_path
+) -> None:
+    """Stage Tier-2 gate (wave-3 fix round): the prose integration report is
+    registered ALONGSIDE the findings sidecar (both kind='audit_report',
+    uniform with _step_audit — committed-but-unregistered output would escape
+    verify_integrity), and the '-tier2' scratch worktree is disposed before
+    the gate concludes."""
+    from sf_factory.worktrees import WorktreeManager
+
+    config_dict["projects"]["proj"]["test_command"] = "true"
+    cfg = make_config(config_dict)
+    workspace = Path(cfg.projects["proj"].workspace)
+    init_repo(workspace)
+    wt = WorktreeManager(cfg)
+
+    insert_phase(db, "ph", PhaseState.RUNNING, branch="main")
+    worktree = await wt.create(workspace, "ph.s1", "stage/ph.s1", "main")
+    insert_stage(db, "ph.s1", "ph", StageState.MERGE_GATE, worktree=worktree)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with db.transaction() as conn:  # the §3.1 freeze anchor the stage gate reads
+        fdb.insert_event(
+            conn,
+            unit_level="phase",
+            unit_id="ph",
+            event_type="transition",
+            actor="control_plane",
+            from_state="PLANNING",
+            to_state="CONTRACTS_FROZEN",
+            payload={"contracts": 0, "commit": head},
+        )
+
+    runner = FakeRunner(db)
+
+    def validator(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "integration-report.md").write_text("clean\n", encoding="utf-8")
+        (d / "integration-report.json").write_text('{"findings": []}', encoding="utf-8")
+
+    runner.behaviors["integration_validator"] = validator
+    executor = StageExecutor(
+        db,
+        StateMachine(db),
+        cfg,
+        runner,
+        wt,
+        ThresholdEvaluator(db, cfg),
+        FakeConsultor([]),
+        FakeNotify(),
+    )
+    await executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.DONE
+    refs = (
+        db.read()
+        .execute(
+            "SELECT path, git_commit FROM artifact_refs WHERE unit_level='stage'"
+            " AND unit_id='ph.s1' AND kind='audit_report' ORDER BY id"
+        )
+        .fetchall()
+    )
+    assert [Path(r["path"]).name for r in refs] == [
+        "integration-report.md",
+        "integration-report.json",
+    ]
+    assert all(r["git_commit"] for r in refs)
+    assert events_of(db, "ph.s1", "tier2_gate")
+    assert not (Path(cfg.projects["proj"].worktrees_dir) / "ph.s1-tier2").exists()
+
+
 # --------------------------------------------------------- StageExecutor paths
 
 
@@ -1014,6 +1315,181 @@ async def test_cp1_continue_session_downgrades_without_session(
     assert payload["executed_as"] == "rebuild" and "session" in payload["reason"]
 
 
+async def test_cp1_continue_session_downgrades_on_unverified_resume_route(
+    db, config_dict, tmp_path
+) -> None:
+    """§3.1/OPEN-3 hard gate: a builder route whose CLI lacks verified session
+    resume (codex, until wave-4 A2 verifies it against the real CLI) executes
+    continue_session as rebuild + explicit verdict_downgraded — even though a
+    finalized, resumable builder session exists."""
+    config_dict["models"]["builder_routine"]["cli"] = "codex"
+    env = make_stage_env(db, config_dict, tmp_path)
+    env.runner.behaviors["validator"] = validator_writing(failing=2)
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+    env.consultor.verdicts = ["continue_session", "escalate"]
+    with db.transaction() as conn:  # finalized session: the route is the ONLY reason
+        pid = fdb.insert_process(
+            conn,
+            ProcessRecord(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                kind="agent",
+                role="builder_routine",
+                cp_id=None,
+                session_id=None,
+                pid=None,
+                cmdline="codex",
+                cwd=None,
+                state="spawned",
+                exit_code=None,
+                ndjson_log_path=None,
+                spawned_at=utc_now(),
+                heartbeat_at=None,
+                ended_at=None,
+            ),
+        )
+        fdb.finalize_process(
+            conn, pid, state="exited", exit_code=0, ended_at=utc_now(), session_id="sess-1"
+        )
+    await env.executor.execute("ph.s1")
+
+    builder_calls = [c for c in env.runner.calls if c.role == "builder_routine"]
+    assert len(builder_calls) == 1 and builder_calls[0].resume_session is None  # rebuild ran
+    downgrades = events_of(db, "ph.s1", "verdict_downgraded")
+    assert len(downgrades) == 1
+    payload = json.loads(downgrades[0]["payload_json"])
+    assert payload["executed_as"] == "rebuild"
+    assert "codex" in payload["reason"] and "OPEN-3" in payload["reason"]
+    entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "BUILD"
+    ]
+    assert json.loads(entry[0]["payload_json"])["executed_as"] == "rebuild"
+
+
+async def test_usage_missing_escalate_after_escalates_stage(
+    db, config_dict, tmp_path
+) -> None:
+    """D-0014(1): under budgets.usage_missing_policy='escalate_after' the
+    StageExecutor itself counts the runner's 'usage_missing' events and, past
+    budgets.usage_missing_max_per_stage, inserts the escalation row directly
+    (trigger string, like 'internal_error' — NO Trigger enum member) and
+    transitions the stage to ESCALATED: a usage-blind stage must still hit a
+    budget (Doctrine §20)."""
+    config_dict["budgets"]["usage_missing_policy"] = "escalate_after"
+    env = make_stage_env(db, config_dict, tmp_path)
+    allowance = env.cfg.budgets.usage_missing_max_per_stage
+    with db.transaction() as conn:
+        for _ in range(allowance + 1):  # strictly MORE than the allowance
+            fdb.insert_event(
+                conn,
+                unit_level="stage",
+                unit_id="ph.s1",
+                event_type="usage_missing",
+                actor="runner",
+                payload={"policy": "escalate_after"},
+            )
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    rows = open_escalations(db, "ph.s1")
+    assert [r["trigger"] for r in rows] == ["usage_missing"]
+    assert rows[0]["target"] == "phase_architect"
+    assert rows[0]["event_seq"] == events_of(db, "ph.s1", "usage_missing")[-1]["seq"]
+    assert rows[0]["payload_artifact_id"] is not None  # evidence artifact (DoD §8)
+    assert "usage_missing" not in {t.value for t in Trigger}  # D-0014: no enum member
+    payload = json.loads(events_of(db, "ph.s1", "transition")[-1]["payload_json"])
+    assert payload["triggers"] == ["usage_missing"]
+    assert env.consultor.calls == []  # escalated before any CP-1 consult
+
+
+async def test_stage_sibling_anchor_survives_phase_artifact_reresolve(
+    db, config_dict, tmp_path
+) -> None:
+    """§3.1 secondary regression (wave-3 fix round): the stage-gate sibling
+    anchor is read from the append-only CONTRACTS_FROZEN transition payload.
+    The phase-level Tier-1 rebase re-resolves the phase_plan_sidecar ref's
+    git_commit to the rebased HEAD — anchoring on the ref would silently void
+    the sibling window for stage gates re-run after a signoff 'changes' loop."""
+    from sf_factory.artifacts import register_artifact
+
+    env = make_stage_env(db, config_dict, tmp_path)
+    phase = fdb.get_phase(db.read(), "ph")
+    assert phase is not None
+    sidecar = env.worktree / "_factory" / "phases" / "ph" / "phase-plan.json"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text('{"stages": [], "dag_edges": []}', encoding="utf-8")
+    with db.transaction() as conn:
+        # What _step_planning writes at PLANNING -> CONTRACTS_FROZEN: the
+        # registered sidecar ref AND the transition payload carrying 'commit'.
+        register_artifact(
+            conn,
+            unit_level="phase",
+            unit_id="ph",
+            kind="phase_plan_sidecar",
+            repo="workspace",
+            repo_root=env.worktree,
+            path=sidecar,
+            git_commit="c0ffee0",
+        )
+        fdb.insert_event(
+            conn,
+            unit_level="phase",
+            unit_id="ph",
+            event_type="transition",
+            actor="control_plane",
+            from_state="PLANNING",
+            to_state="CONTRACTS_FROZEN",
+            payload={"contracts": 0, "commit": "c0ffee0"},
+        )
+    assert env.executor._contract_freeze_commit(phase) == "c0ffee0"
+
+    with db.transaction() as conn:  # the phase-level post-rebase re-resolve
+        updated = sched_mod._reresolve_artifact_commits(
+            conn, "phase", "ph", env.worktree, "rebased1"
+        )
+    assert updated == 1
+    ref = fdb.latest_artifact(db.read(), "phase", "ph", "phase_plan_sidecar")
+    assert ref is not None and ref.git_commit == "rebased1"  # the ref DID move
+    # ...but the anchor did not: the window still opens at contract freeze.
+    assert env.executor._contract_freeze_commit(phase) == "c0ffee0"
+
+
+async def test_cp1_inputs_bounded_to_registry_max_before_consult(
+    db, config_dict, tmp_path
+) -> None:
+    """CP-1 caller-side bound (wave-3 fix round): a validation report larger
+    than the registry's max_input_bytes consults TRUNCATED — the canonical
+    payload (exactly what Consultor.consult measures for the §6 breach check)
+    fits the bound, so a legitimately oversized input is an input-size fact,
+    never a recorded cp_breach_attempt polluting the DoD §13 creep scan."""
+    from sf_factory.consultation import _canonical_payload
+
+    config_dict["consultation_points"][0]["max_input_bytes"] = 4096
+    env = make_stage_env(db, config_dict, tmp_path)
+    big = "failing=2 report\n" + ("validator evidence line\n" * 4096)
+
+    def validator(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "validation-report.md").write_text(big, encoding="utf-8")
+        (d / "validation-report.json").write_text(
+            json.dumps({"failing": 2, "passing": 3, "total": 5}), encoding="utf-8"
+        )
+
+    env.runner.behaviors["validator"] = validator
+    env.consultor.verdicts = ["escalate"]
+    await env.executor.execute("ph.s1")
+
+    assert len(env.consultor.calls) == 1
+    _, inputs = env.consultor.calls[0]
+    assert set(inputs) == {"validation_report", "diff_digest", "spec"}
+    assert len(_canonical_payload(inputs)) <= 4096  # the Consultor's measure
+    assert inputs["validation_report"].startswith("failing=2 report")
+    assert inputs["validation_report"].endswith("[truncated]")
+    assert events_of(db, "ph.s1", "cp_breach_attempt") == []
+
+
 async def test_validator_runs_isolated_and_only_reports_cross(
     db, config_dict, tmp_path
 ) -> None:
@@ -1118,6 +1594,52 @@ async def test_escalation_resolution_routes_and_archives_sentinel(
     assert not (unit_dir / "_DECLARED_FAILURE.md").exists()
     archived = unit_dir / f"_DECLARED_FAILURE.resolved-{esc_id}.md"
     assert archived.is_file()  # §5.4 archive: stale sentinel can never re-fire
+
+
+async def test_validator_declared_failure_scratch_disposed_next_pass_completes(
+    db, config_dict, tmp_path
+) -> None:
+    """§5.4 sentinel lifecycle regression (wave-3 fix round): a validator
+    _DECLARED_FAILURE.md lands in the VALIDATE scratch worktree, so the
+    escalation exit must DISPOSE the scratch — a leaked scratch is reused by
+    create() with only TRACKED content re-synced, so the untracked stale
+    sentinel would be re-detected after EVERY later validator run (a NEW
+    events.seq past the escalations.event_seq cursor) and the stage could
+    never pass VALIDATE again."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    calls = [0]
+
+    def validator(cwd: Path, unit_id: str, resume) -> None:
+        calls[0] += 1
+        if calls[0] == 1:
+            d = cwd / "_factory" / "stages" / unit_id
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "_DECLARED_FAILURE.md").write_text("cannot test", encoding="utf-8")
+        else:
+            validator_writing(0)(cwd, unit_id, resume)
+
+    env.runner.behaviors["validator"] = validator
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_declared_failure"
+    scratch = env.wt.scratch_root / "ph.s1-validate"
+    assert env.wt.removed == [scratch]  # disposed on the ESCALATION exit too
+    assert not scratch.exists()
+
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc["id"], "rework:VALIDATE")
+    # Next pass: the re-created scratch is clean, the validator succeeds and
+    # the stage must leave VALIDATE (pre-fix: the stale sentinel survived the
+    # scratch reuse, re-fired the always-fire trigger and re-escalated).
+    with pytest.raises(Exception):  # noqa: B017 — MERGE_GATE hits OPEN-2 (ConfigError)
+        await env.executor.execute("ph.s1")
+
+    assert calls[0] == 2
+    assert stage_state(db, "ph.s1") is StageState.MERGE_GATE
+    assert len(events_of(db, "ph.s1", "declared_failure")) == 1  # never re-detected
+    assert open_escalations(db, "ph.s1") == []
 
 
 async def test_escalation_to_awaiting_human_creates_decision_atomically(
@@ -1526,3 +2048,30 @@ def test_recover_clean_state_reports_requeue_only(db, config_dict, tmp_path) -> 
     # RUNNING-category units re-enter the queue; AWAITING_* stay blocked (§5.5d).
     assert set(report.requeued) == {"phase:ph", "stage:s2"}
     assert report.integrity_checked == 0 and report.heal_errors == ()
+
+
+def test_recover_failed_heal_persists_heal_failed_alert(
+    db, config_dict, tmp_path
+) -> None:
+    """§6 fail-explicit at §5.5b: a failed git heal must leave durable evidence
+    at recovery time — an 'alert' event with kind='heal_failed' — because
+    RecoveryReport.heal_errors is in-memory only (cli.cmd_run discards
+    recover()'s return value)."""
+    cfg = make_config(config_dict)
+    not_a_repo = tmp_path / "wt-broken"
+    not_a_repo.mkdir()  # exists on disk, but holds no git state to heal
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.BUILD, worktree=not_a_repo)
+
+    scheduler, _ = make_recovery_scheduler(db, cfg)
+    report = scheduler.recover()
+
+    assert len(report.heal_errors) == 1
+    assert str(not_a_repo) in report.heal_errors[0]
+    (event,) = events_of(db, "s1", "alert")
+    assert event["unit_level"] == "stage"
+    assert event["actor"] == "control_plane"
+    payload = json.loads(event["payload_json"])
+    assert payload["kind"] == "heal_failed"
+    assert payload["path"] == str(not_a_repo)
+    assert "not a git worktree" in payload["error"]

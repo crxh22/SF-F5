@@ -3,7 +3,8 @@ checks; run/resume hold the single-instance flock — SECOND-INSTANCE REFUSAL is
 the §8-mandated case — and wire the frozen §4 object graph; status renders the
 generated view from a mode=ro connection without ever opening a write
 transaction; decide answers a pending decision through answer_decision +
-artifact registration + event, atomically.
+artifact registration + event, atomically, with the answer artifact committed
+in the factory repo first (D-0015).
 
 tests/conftest.py is frozen (design §9): all extra fixtures live here. The
 run/resume tests inject fake ``sf_factory.scheduler`` / ``sf_factory.consultation``
@@ -210,6 +211,25 @@ def _seed_decision(env: SimpleNamespace, *, stage_state: StageState = StageState
     finally:
         db.close()
     return request_id
+
+
+def _git_init_home(home: Path) -> None:
+    """factory.home as a git repo — production truth (factory.config.yaml
+    points home at the SF-F5 repo): `decide` commits its answer artifact there
+    (D-0015), so the decide tests need a real repo with an initial commit."""
+    for args in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "factory@test"],
+        ["git", "config", "user.name", "factory"],
+    ):
+        subprocess.run(args, cwd=home, check=True, capture_output=True)
+    (home / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "--", "seed.txt"], cwd=home, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"], cwd=home, check=True, capture_output=True
+    )
 
 
 # ------------------------------------------------------------------------- init
@@ -604,6 +624,7 @@ def test_decide_answers_pending_decision_atomically(
     cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert _cli(cli_env, "init") == 0
+    _git_init_home(cli_env.home)
     request_id = _seed_decision(cli_env, stage_state=StageState.AWAITING_HUMAN)
     assert _cli(cli_env, "decide", str(request_id), "approve") == 0
     assert "answered decision" in capsys.readouterr().out
@@ -632,6 +653,26 @@ def test_decide_answers_pending_decision_atomically(
         assert ref["repo"] == "factory"
         assert ref["path"] == f"_factory/stages/st-demo/decision-answer-{request_id}.md"
         assert ref["sha256"] == sha256_file(artifact_path)  # registered ref matches disk
+        # D-0015: committed in the factory repo BEFORE the recording tx — the
+        # ref must resolve at the recorded commit (else the next recover()'s
+        # verify_integrity pass would abort the orchestrator start).
+        assert ref["git_commit"]
+        shown = subprocess.run(
+            ["git", "show", f"{ref['git_commit']}:{ref['path']}"],
+            cwd=cli_env.home,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert shown == body
+        message = subprocess.run(
+            ["git", "log", "-1", "--format=%B", ref["git_commit"]],
+            cwd=cli_env.home,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "Factory-Unit: stage/st-demo" in message
         event = conn.execute(
             "SELECT * FROM events WHERE event_type = 'decision_answered'"
         ).fetchone()
@@ -649,6 +690,7 @@ def test_decide_rejects_unknown_and_already_answered(
     cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert _cli(cli_env, "init") == 0
+    _git_init_home(cli_env.home)
     request_id = _seed_decision(cli_env)
     assert _cli(cli_env, "decide", str(request_id + 999), "approve") == 1
     err = capsys.readouterr().err

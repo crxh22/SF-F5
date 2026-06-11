@@ -492,7 +492,9 @@ async def test_crash_usage_missing_escalate_after_policy(
     )
     (ledger,) = _ledger_rows(db)
     assert ledger["tokens_in"] is None and ledger["tokens_out"] is None
-    assert ledger["estimated"] == 0  # NULL row; B1's event scan applies the policy
+    # NULL row; StageExecutor's direct events-count check applies the
+    # escalate_after policy (D-0014).
+    assert ledger["estimated"] == 0
     (event,) = _events(db, "usage_missing")
     assert json.loads(event["payload_json"])["policy"] == "escalate_after"
 
