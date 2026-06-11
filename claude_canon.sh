@@ -21,6 +21,9 @@
 #   Override: SFF5_CANON_FILE=<path>   inject a specific file instead.
 #   Override binary: CLAUDE_BIN=<path>   (default: claude on PATH).
 #   Override tmux session name: SFF5_TMUX_SESSION=<name>.
+#   Effort: every launch passes --effort ${SFF5_EFFORT:-max} (the persisted
+#   settings.json effortLevel caps at xhigh; only the flag/command reach max).
+#   Override: SFF5_EFFORT=low|medium|high|xhigh|max.
 # Fail-fast: any canon file missing/empty -> abort launch (a partial canon in
 # the system prompt is worse than a noisy stop). tmux missing -> abort with a
 # hint (persistence is this script's contract; SFF5_NO_TMUX=1 to bypass).
@@ -60,7 +63,7 @@ fi
 
 # Direct exec when explicitly requested or when already inside tmux (no nesting).
 if [ -n "${SFF5_NO_TMUX:-}" ] || [ -n "${TMUX:-}" ]; then
-  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" "$@"
+  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --effort "${SFF5_EFFORT:-max}" "$@"
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -68,6 +71,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" "$@")"
+CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --effort "${SFF5_EFFORT:-max}" "$@")"
 echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
 exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"
