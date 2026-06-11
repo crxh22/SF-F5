@@ -96,3 +96,17 @@ Closeout dispositions:
 - Watchdog systemd units written to `deploy/` and installed **disarmed** (copied + daemon-reload, NOT enabled): a watchdog armed while no orchestrator has ever started pages immediately by design (missing pidfile/liveness "fails toward paging"). Arming (`sudo systemctl enable --now sf-factory-watchdog.timer`) is coupled to the first long-running `cli run`.
 
 Next slice: dashboard design (per OPEN-4 boundary: read views + the single decision-answer endpoint + orchestrator-spawned Decision Sessions), then DoD §12 criteria demos, then Etapa 5 (ERP intake with founder).
+
+## D-0017 — 2026-06-11 — main architect — Dashboard design v1.1 approved (CCR-3); OPEN dispositions; build launched
+
+`docs/design/dashboard-design.md` v1.1 approved after adversarial review (two reviewers, 18/18 findings applied, 0 rejected). Key catches: the control-plane decision-request templates were English machine text with bare tokens — re-authored in Romanian **within this build**, so the first card the founder ever sees obeys the founder protocol; the pinned CSP would have silently killed the session poll script; the dashboard supervisor now contractually contains every exception (incl. its own ntfy publish failures) with paging dedup.
+
+Ratification rider recorded:
+1. **DoD §14 deviation, accepted:** the Decision-Session page is the rendering of the card's inline input (JS-free reload page = §14 baseline; the poll script is a convenience inside §14's "refresh/poll is enough" allowance) — not a richer session UI.
+2. **CCR-3** (control-plane §4 additive amendments, design v1.3→v1.4 — annotated there per Doctrine §19): `models.GATE_ANSWERS` (deliberate alias drop: `changes_requested`), `Scheduler.__init__(dashboard=None)` + contained `_dashboard_supervisor`, `config.ModelRoute.tools` (tools-off Decision Sessions — structural no-write enforcement, not prompt-level), `thresholds` `context_budget` excludes `role='decision_session'` (OPEN-D4 resolved mechanically, Doctrine §20), `runner.cmdline_matches` promoted public (closes the D-0016 disposition).
+3. **OPEN-D1:** the `Recomandare: <option-token>` marker contract is ratified now and exercised by the re-authored control-plane templates; architect role prompts adopt it at Etapa 5.
+4. **OPEN-D2 resolved — abort on bind failure stands:** the dashboard is tailnet-only; a degraded localhost bind would serve a page the founder cannot reach anyway. Abort is the honest failure.
+5. **OPEN-D3 resolved:** `decision_session` routes to fable (rare, turn-bounded, tools-off; founder-facing trade-off reasoning warrants the strongest model).
+6. **Config keys ratified as proposed** (design §6 list); the values land in `factory.config.yaml` inside the D1 build delta, atomically with `config.py` (golden test stays green at every commit).
+
+Build: single builder D1 with enumerated deltas only + non-executor verification including a live founder-protocol conformance pass, per D-0008.
