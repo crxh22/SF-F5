@@ -110,3 +110,7 @@ Ratification rider recorded:
 6. **Config keys ratified as proposed** (design §6 list); the values land in `factory.config.yaml` inside the D1 build delta, atomically with `config.py` (golden test stays green at every commit).
 
 Build: single builder D1 with enumerated deltas only + non-executor verification including a live founder-protocol conformance pass, per D-0008.
+
+## D-0018 — 2026-06-11 — main architect — CCR-4: dashboard build lane extension approved
+
+D1 built the full dashboard slice (uncommitted, 631 tests green incl. live Romanian-conformance render; claude tools-off flagset verified against the installed CLI: `--tools ""`) and STOPped exactly at its lane boundary instead of touching unowned files. Approved extensions: (1) `tests/unit/test_cli.py` — FakeScheduler gains the CCR-3 `dashboard=` kwarg and the test env binds `127.0.0.1`/ephemeral (unit tests must never bind a real tailnet socket) — unblocking the ~10-line `cli.py` wiring (eager `dashboard.start()` before recover/run_forever; resume passes None); (2) `tests/integration/test_d0014_cmdline.py` — imports migrate to the public `runner.cmdline_matches`, the temporary private alias in runner.py is deleted; (3) ratified: the integration test file is `test_dashboard_integration.py` (pytest prepend-import mode refuses duplicate basenames). Finisher + full non-executor verification + commit follow.
