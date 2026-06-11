@@ -37,3 +37,7 @@ seed one PENDING phase row (project `b8`). Expected: A → DONE clean; B → gat
 - The run also flushed two factory defects, both fixed: codex sandbox write access
   (`--sandbox workspace-write`, commit 470f4ad) and bytecode droppings tripping the
   Validator-isolation assertion (`process.isolation_ignore_globs`, commit c50bf37).
+- Keep `plan_md` IN-WORLD (describe the intended deliverable, never the seeding mechanics):
+  the live run's phase-level gate correctly flagged a plan-vs-delivered divergence
+  (`PLAN-ASSUMPTION-1`) because v2's plan narrated the trap — a second, bonus catch at the
+  recursive level, and a fixture-authoring lesson (fixed in this playbook).

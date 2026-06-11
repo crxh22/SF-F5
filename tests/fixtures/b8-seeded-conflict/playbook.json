@@ -12,7 +12,7 @@
     ],
     "dag_edges": [["catalog-a", "totals-b"]]
    },
-   "plan_md": "# Plan faza B8 v2 (driver)\nDoua etape structurale serializate contra contractului SUM-1: A extinde catalogul (invarianta vacuos satisfacuta), B adauga totals.json pe presupunerea veche — incalcare DOAR in comun (DoD SS5.3).\n"
+   "plan_md": "# Plan faza (driver)\nDoua etape structurale serializate contra contractului SUM-1: A extinde catalogul de preturi; B introduce raportul de totaluri conform contractului. Criterii de acceptanta per etapa in plan.json.\n"
   }
  },
  "spec": {
