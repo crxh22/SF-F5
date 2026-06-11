@@ -997,10 +997,40 @@ def _group_alive(pgid: int) -> bool:
 def _cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
     """Compare /proc/<pid>/cmdline against the registry cmdline (§5.5a 'pid alive
     with matching cmdline'). Unreadable/absent /proc ⇒ no match — never kill what
-    cannot be identified."""
+    cannot be identified.
+
+    Tolerant form (D-0014 item 2, empirically verified 2026-06-11 on server e9):
+    interpreter wrapping rewrites the live argv of script-shebang CLIs —
+    spawning ``codex …`` (``#!/usr/bin/env node`` script) yields a live cmdline
+    of ``node /…/bin/codex …``, while ``claude`` (native ELF) and the test stub
+    (spawned as an explicit ``<python> <script> …`` argv) match exactly. The
+    strict equality would therefore misread every live codex orphan as pid
+    reuse and leave its process group running unsupervised. Accepted matches:
+
+    - exact: ``shlex.join(live) == recorded`` (no wrapping); or
+    - wrapped: the recorded argv is a SUFFIX of the live argv, where the
+      recorded argv[0] matches its aligned live token by basename (PATH/shebang
+      resolution may absolutize it) and every following recorded token matches
+      exactly. Interpreter prefixes (``node``, ``python3``, …) before that
+      suffix are tolerated; any argument divergence still refuses the match —
+      never kill what cannot be identified.
+    """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    parts = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
-    return bool(parts) and shlex.join(parts) == recorded_cmdline
+    live = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
+    if not live:
+        return False
+    if shlex.join(live) == recorded_cmdline:
+        return True
+    try:
+        recorded = shlex.split(recorded_cmdline)
+    except ValueError:
+        return False
+    if not recorded or len(live) < len(recorded):
+        return False
+    anchor = len(live) - len(recorded)
+    if live[anchor + 1 :] != recorded[1:]:
+        return False
+    return Path(live[anchor]).name == Path(recorded[0]).name

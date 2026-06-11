@@ -76,6 +76,7 @@ from sf_factory.models import (
 )
 from sf_factory.notify import NtfyPublisher, dashboard_link
 from sf_factory.runner import AgentResult, AgentRunner
+from sf_factory.runner import _cmdline_matches as _runner_cmdline_matches
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
 from sf_factory.worktrees import StaleGateError, WorktreeManager, commit_paths, run_git
@@ -343,6 +344,30 @@ async def _dispose_worktree(
 def _resolve(home: Path, path: Path) -> Path:
     """Anchor a relative config path at factory.home (same rule as watchdog/runner)."""
     return path if path.is_absolute() else home / path
+
+
+async def _find_branch_checkout(repo_root: Path, branch: str) -> Path | None:
+    """The working tree (main checkout or linked worktree) where ``branch`` is
+    checked out, or None. ``worktrees.integrate`` merges INSIDE the target-branch
+    checkout (`_current_branch(root) == target_branch` is its precondition), and
+    a stage's target is the PHASE branch — checked out at the phase worktree,
+    never at the workspace root (which stays on the project integration branch).
+    Read-only `git worktree list --porcelain` scan; mechanics only."""
+    code, out, err = await run_git("worktree", "list", "--porcelain", cwd=repo_root)
+    if code != 0:
+        raise GitError(
+            f"git worktree list failed in {repo_root}: {(err or out).strip()}"
+        )
+    expected = f"refs/heads/{branch}"
+    current_path: str | None = None
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if line.startswith("worktree "):
+            current_path = line.removeprefix("worktree ")
+        elif line.startswith("branch ") and current_path is not None:
+            if line.removeprefix("branch ") == expected:
+                return Path(current_path)
+    return None
 
 
 def _bounded(text: str, max_bytes: int) -> str:
@@ -758,6 +783,16 @@ class StageExecutor:
             reason="threshold trigger(s) fired",
             payload={"triggers": [t for t, _ in escalating]},
             coupled=coupled,
+        )
+        # §8 B7: a mechanical escalation pages the founder channel without any
+        # human prompting ("escalation row + ntfy stub called") — title + deep
+        # link only (D-0004), strictly OUTSIDE the transaction (§7); delivery
+        # failure = 'alert_delivery_failed' event, rows already landed.
+        await self._publish_alert(
+            f"Escaladare: etapa {stage.name} — "
+            + ", ".join(t for t, _ in escalating),
+            f"unit/stage/{stage.id}",
+            context={"unit_id": stage.id, "triggers": [t for t, _ in escalating]},
         )
         return True
 
@@ -1528,6 +1563,28 @@ class StageExecutor:
                     payload={"decision_request_id": request_id, "error": str(exc)},
                 )
 
+    async def _publish_alert(
+        self, title: str, fragment: str, *, context: dict
+    ) -> None:
+        """Publish a max-priority alert (§8 B7 escalation page); delivery
+        failure = 'alert_delivery_failed' event, state unchanged (§6)."""
+        try:
+            await self._notify.publish(
+                title,
+                link=dashboard_link(self._cfg, fragment),
+                priority=self._notify.priority_alert,
+            )
+        except NotifyError as exc:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert_delivery_failed",
+                    actor=_ACTOR,
+                    payload=context | {"error": str(exc)},
+                )
+
     async def _step_awaiting_human(self, stage: Stage) -> bool:
         """AWAITING_HUMAN: consume the latest ANSWERED decision for this stage;
         an unknown answer is reported and leaves the stage blocked (Doctrine §7)."""
@@ -1815,9 +1872,21 @@ class StageExecutor:
             )
             return True
 
+        # Integration-revealed fix (wave 4): integrate() merges INSIDE a
+        # checkout of the TARGET branch — for a stage that is the phase
+        # worktree (worktrees_dir/<phase_id>), never the workspace root,
+        # which stays on the project integration branch. Resolve where the
+        # target branch is checked out; recreate the (derived, recomputable)
+        # phase checkout when a crash removed it — idempotent wt.create
+        # attaches the existing branch.
+        target_checkout = await _find_branch_checkout(repo_root, target_branch)
+        if target_checkout is None:
+            target_checkout = await self._wt.create(
+                repo_root, phase.id, target_branch, project.integration_branch
+            )
         try:
             merge_sha = await self._wt.integrate(
-                repo_root, stage.branch or f"stage/{stage.id}", target_branch
+                target_checkout, stage.branch or f"stage/{stage.id}", target_branch
             )
         except StaleGateError:
             with self._db.transaction() as conn:
@@ -3867,10 +3936,11 @@ def _group_alive(pgid: int) -> bool:
 def _proc_cmdline_matches(pid: int, recorded_cmdline: str) -> bool:
     """§5.5a 'pid alive with matching cmdline': compare /proc/<pid>/cmdline with
     the registry cmdline (recorded as shlex.join(argv) at spawn). Unreadable
-    /proc => no match — never kill what cannot be identified."""
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    parts = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
-    return bool(parts) and shlex.join(parts) == recorded_cmdline
+    /proc => no match — never kill what cannot be identified.
+
+    Delegates to ``runner._cmdline_matches`` — the single tolerant predicate
+    (D-0014 item 2): interpreter wrapping (codex = ``#!/usr/bin/env node``
+    script, observed live as ``node /…/bin/codex …``) breaks strict equality,
+    and a drifting second copy here would silently exempt the §5.5a orphan
+    sweep from that fix (Doctrine §9: index -> source)."""
+    return _runner_cmdline_matches(pid, recorded_cmdline)
