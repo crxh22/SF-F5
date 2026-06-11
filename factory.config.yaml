@@ -109,6 +109,9 @@ process:
   heartbeat_min_interval_s: 1
   tier2_max_diff_bytes_per_unit: 300000
   stub_agent_path: tests/stub_agent.py   # used only by routes with cli: stub (tests)
+  # Build/test droppings the §3.1 Validator-isolation assertion ignores (fnmatch
+  # against each porcelain path and its path segments; directories end with /).
+  isolation_ignore_globs: ["__pycache__/", "*.pyc", ".pytest_cache/", ".ruff_cache/"]
 
 canon:
   # Canon files injected into agent system prompts (decision D-0009).

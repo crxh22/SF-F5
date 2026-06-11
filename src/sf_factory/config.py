@@ -181,6 +181,14 @@ class ProcessCfg(_StrictModel):
     heartbeat_min_interval_s: float = Field(gt=0)
     tier2_max_diff_bytes_per_unit: int = Field(ge=1)
     stub_agent_path: Path
+    # Build/test droppings the §3.1 Validator-isolation assertion ignores:
+    # fnmatch globs against each porcelain path and its path segments.
+    isolation_ignore_globs: list[str] = [
+        "__pycache__/",
+        "*.pyc",
+        ".pytest_cache/",
+        ".ruff_cache/",
+    ]
 
 
 class CanonInjectCfg(_StrictModel):

@@ -28,6 +28,7 @@ from sf_factory import db as fdb
 from sf_factory import scheduler as sched_mod
 from sf_factory.config import FactoryConfig
 from sf_factory.models import (
+    ConfigError,
     DecisionRequest,
     Escalation,
     IntegrityError,
@@ -1523,12 +1524,61 @@ async def test_validator_runs_isolated_and_only_reports_cross(
 
 
 async def test_build_asserts_validator_isolation(db, config_dict, tmp_path) -> None:
+    """§3.1: a genuinely unregistered file trips the assertion even with
+    ignorable droppings alongside — the isolation_ignore_globs filter must
+    never mask a real leak (and the listing excludes the ignored entries)."""
     env = make_stage_env(db, config_dict, tmp_path)
     with db.transaction() as conn:
         fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    pycache = env.worktree / "__pycache__"
+    pycache.mkdir()
+    (pycache / "seed.cpython-312.pyc").write_bytes(b"\x00")
     (env.worktree / "leaked_validator_test.py").write_text("leak", encoding="utf-8")
-    with pytest.raises(IntegrityError, match="Validator-isolation"):
+    with pytest.raises(IntegrityError, match="Validator-isolation") as excinfo:
         await env.executor.execute("ph.s1")
+    assert "leaked_validator_test.py" in str(excinfo.value)
+    assert "__pycache__" not in str(excinfo.value)
+    assert not env.runner.calls  # the Builder never spawned over a dirty worktree
+
+
+async def test_build_isolation_ignores_build_test_droppings(
+    db, config_dict, tmp_path
+) -> None:
+    """Bytecode/test-cache droppings left by the factory's own Tier-1 suite run
+    (process.isolation_ignore_globs: __pycache__/, *.pyc, .pytest_cache/,
+    .ruff_cache/) never trip the §3.1 assertion — including nested
+    'tests/__pycache__/' porcelain entries, matched per path segment."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    # Track tests/ so the droppings surface as '?? tests/__pycache__/' (the
+    # live-incident porcelain shape), not as a collapsed '?? tests/'.
+    tests_dir = env.worktree / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_seed.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "-A"], cwd=env.worktree, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "tests"],
+        cwd=env.worktree,
+        check=True,
+        capture_output=True,
+    )
+    for dropping in ("__pycache__", "tests/__pycache__", ".pytest_cache", ".ruff_cache"):
+        d = env.worktree / dropping
+        d.mkdir()
+        (d / "cache.bin").write_bytes(b"\x00")
+    (env.worktree / "stray.pyc").write_bytes(b"\x00")
+
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+    env.runner.behaviors["validator"] = validator_writing(0)
+    # No IntegrityError: BUILD runs and the conveyor reaches MERGE_GATE, where
+    # the unset suite raises the explicit OPEN-2 ConfigError (never a skip).
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await env.executor.execute("ph.s1")
+    assert env.runner.calls[0].role == "builder_routine"
+    assert stage_state(db, "ph.s1") is StageState.MERGE_GATE
 
 
 async def test_spec_declared_failure_escalates_with_cursor(

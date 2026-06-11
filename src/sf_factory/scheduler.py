@@ -35,6 +35,7 @@ import sys
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -460,6 +461,20 @@ def _read_text(path: Path, *, what: str) -> str:
         return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ArtifactContractError(f"cannot read {what} at {path}: {exc}") from exc
+
+
+def _isolation_ignored(path: str, ignore_globs: Sequence[str]) -> bool:
+    """True when a ``git status --porcelain`` path is a build/test dropping per
+    process.isolation_ignore_globs (e.g. ``__pycache__/`` left by the factory's
+    own Tier-1 suite run). fnmatch-style: a glob matches the exact porcelain
+    path (directories keep their trailing ``/``) or any single path segment —
+    so ``tests/__pycache__/`` matches the ``__pycache__/`` glob."""
+    segments = [seg for seg in path.split("/") if seg]
+    for glob in ignore_globs:
+        stem = glob.rstrip("/")
+        if fnmatch(path, glob) or any(fnmatch(seg, stem) for seg in segments):
+            return True
+    return False
 
 
 def _builder_role(cfg: FactoryConfig, risk_class: str) -> str:
@@ -1046,14 +1061,24 @@ class StageExecutor:
     async def _assert_no_unregistered_files(self, stage: Stage, worktree: Path) -> None:
         """§3.1 Validator isolation: before each BUILD step the stage worktree
         must contain nothing uncommitted/unregistered — otherwise the Builder
-        could code to leaked Validator internals from iteration 2 onward."""
+        could code to leaked Validator internals from iteration 2 onward.
+        Build/test droppings (process.isolation_ignore_globs: ``__pycache__/``
+        etc.) are not Validator internals and never trip the assertion."""
         code, out, err = await run_git("status", "--porcelain", cwd=worktree)
         if code != 0:
             raise GitError(f"git status failed in {worktree}: {(err or out).strip()}")
-        if out.strip():
+        ignore_globs = self._cfg.process.isolation_ignore_globs
+        offending = [
+            line
+            for line in out.splitlines()
+            # Porcelain v1: 2-char status + space, path starts at column 4.
+            if line.strip() and not _isolation_ignored(line[3:], ignore_globs)
+        ]
+        if offending:
+            listing = "\n".join(offending)
             raise IntegrityError(
                 f"stage {stage.id} worktree has unregistered files before BUILD"
-                f" (Validator-isolation assertion, §3.1):\n{out.strip()}"
+                f" (Validator-isolation assertion, §3.1):\n{listing}"
             )
 
     async def _step_validate(self, stage: Stage) -> bool:
