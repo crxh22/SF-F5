@@ -62,6 +62,8 @@ from sf_factory.dashboard import GLOSS, DashboardServer, resolve_bind_host
 from sf_factory.db import Database
 from sf_factory.models import (
     GATE_ANSWERS,
+    PHASE_ESCALATION_RESOLUTIONS,
+    STAGE_ESCALATION_RESOLUTIONS,
     ArtifactContractError,
     ConfigError,
     DecisionRequest,
@@ -116,25 +118,10 @@ _SENTINEL_EVENTS: Mapping[str, tuple[str, str]] = {
     ),
 }
 
-#: ESCALATED-exit resolution vocabulary (§2 escalations.resolution examples):
-#: resolution string -> target state per level. Anything else = unknown ->
-#: explicit 'alert' event, unit stays put (never guessed, Doctrine §7).
-_STAGE_RESOLUTIONS: Mapping[str, StageState] = {
-    "rework:BUILD": StageState.BUILD,
-    "rework:SPEC": StageState.SPEC,
-    "respec": StageState.SPEC,
-    "rework:VALIDATE": StageState.VALIDATE,
-    "awaiting_human": StageState.AWAITING_HUMAN,
-    "failed": StageState.FAILED,
-    "cancelled": StageState.CANCELLED,
-}
-_PHASE_RESOLUTIONS: Mapping[str, PhaseState] = {
-    "replan": PhaseState.PLANNING,
-    "resume": PhaseState.RUNNING,
-    "awaiting_human": PhaseState.AWAITING_HUMAN,
-    "failed": PhaseState.FAILED,
-    "cancelled": PhaseState.CANCELLED,
-}
+#: ESCALATED-exit resolution vocabulary: models.STAGE_ESCALATION_RESOLUTIONS /
+#: models.PHASE_ESCALATION_RESOLUTIONS (CCR-7 / D-0027 — moved out of the
+#: former module privates; one source consumed by _step_escalated AND
+#: `cli resolve-escalation`).
 
 #: Target-state ROUTING for the models.GATE_ANSWERS vocabulary (CCR-3/D-0017:
 #: GATE_ANSWERS is the one answer-token source consumed by the executors AND
@@ -751,7 +738,7 @@ class _OutOfBoundsDetector:
                 try:
                     await self._notify.publish(
                         f"Scriere în afara limitelor detectată în {repo}",
-                        link=dashboard_link(self._cfg, "health"),
+                        link=dashboard_link(self._cfg, "acum"),
                         priority=self._notify.priority_alert,
                     )
                     self._published.add(repo)
@@ -860,7 +847,7 @@ class _UsageLimitDetector:
             try:
                 await self._notify.publish(
                     "Limită de utilizare suspectată — fabrica poate avea nevoie de pauză",
-                    link=dashboard_link(self._cfg, "health"),
+                    link=dashboard_link(self._cfg, "acum"),
                     priority=self._notify.priority_alert,
                 )
                 self._published = True
@@ -1135,7 +1122,9 @@ class StageExecutor:
         await self._publish_alert(
             f"Escaladare: etapa {stage.name} — "
             + ", ".join(t for t, _ in escalating),
-            f"unit/stage/{stage.id}",
+            # §10.4/D-0027 (A-4): deep links land on a REAL rendered anchor —
+            # the dashboard's open-escalations block — never a dead fragment.
+            "escaladari",
             context={"unit_id": stage.id, "triggers": [t for t, _ in escalating]},
         )
         return True
@@ -2027,7 +2016,7 @@ class StageExecutor:
         last = _latest_resolved_escalation(conn, Level.STAGE.value, stage.id)
         if last is None:
             return False  # escalated without a row = operator surgery; stay put
-        target = _STAGE_RESOLUTIONS.get(last.resolution or "")
+        target = STAGE_ESCALATION_RESOLUTIONS.get(last.resolution or "")
         if target is None:
             with self._db.transaction() as tx:
                 fdb.insert_event(
@@ -2040,7 +2029,7 @@ class StageExecutor:
                         "kind": "unknown_escalation_resolution",
                         "escalation_id": last.id,
                         "resolution": last.resolution,
-                        "known": sorted(_STAGE_RESOLUTIONS),
+                        "known": sorted(STAGE_ESCALATION_RESOLUTIONS),
                     },
                 )
             return False
@@ -3619,7 +3608,7 @@ class PhaseExecutor:
         last = _latest_resolved_escalation(conn, Level.PHASE.value, phase.id)
         if last is None:
             return False
-        target = _PHASE_RESOLUTIONS.get(last.resolution or "")
+        target = PHASE_ESCALATION_RESOLUTIONS.get(last.resolution or "")
         if target is None:
             with self._db.transaction() as tx:
                 fdb.insert_event(
@@ -3632,7 +3621,7 @@ class PhaseExecutor:
                         "kind": "unknown_escalation_resolution",
                         "escalation_id": last.id,
                         "resolution": last.resolution,
-                        "known": sorted(_PHASE_RESOLUTIONS),
+                        "known": sorted(PHASE_ESCALATION_RESOLUTIONS),
                     },
                 )
             return False
@@ -4179,7 +4168,7 @@ class Scheduler:
             try:
                 await self._notify.publish(
                     "Fabrica nu poate porni: integritatea artefactelor a eșuat",
-                    link=dashboard_link(self._cfg, "health"),
+                    link=dashboard_link(self._cfg, "acum"),
                     priority=self._notify.priority_alert,
                 )
             except NotifyError as exc:
@@ -4532,7 +4521,7 @@ class Scheduler:
             try:
                 await self._notify.publish(
                     "Fabrica este blocată: nicio unitate nu poate avansa",
-                    link=dashboard_link(self._cfg, "health"),
+                    link=dashboard_link(self._cfg, "acum"),
                     priority=self._notify.priority_alert,
                 )
                 self._stall_published = True
@@ -4673,7 +4662,7 @@ class Scheduler:
             await self._notify.publish(
                 "Dashboard căzut — decizia pe telefon nu funcționează;"
                 " fallback: cli decide",
-                link=dashboard_link(self._cfg, "health"),
+                link=dashboard_link(self._cfg, "acum"),
                 priority=self._notify.priority_alert,
             )
         except Exception as exc:  # noqa: BLE001 — any publisher defect: contained (§7 row 1)

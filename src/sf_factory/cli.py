@@ -1,5 +1,5 @@
 """Operator entry (design §4): ``init`` / ``run`` / ``resume`` / ``seed-phases`` /
-``status`` / ``decide``.
+``status`` / ``decide`` / ``resolve-escalation``.
 
 Command contracts (design §4 ``cli.main`` docstring, implemented exactly; the
 ``seed-phases`` subcommand and the ``_InstanceLock.acquire(claim=...)`` flock
@@ -35,6 +35,17 @@ narrative are the phase-seeding design CCR-5 amendments, D-0024):
   (``artifacts.register_artifact``) + ``db.answer_decision`` + event. The
   direct DB write from a second OS process is the D-0015-ratified emergency
   exception to the §2 sole-writer rule.
+- ``resolve-escalation <escalation_id> <resolution> [--reason <text>]`` —
+  operator escalation disposition (dashboard design §10.6, CCR-7/D-0027 —
+  the D-0026 gap c): vocabulary single-sourced from
+  ``models.STAGE_ESCALATION_RESOLUTIONS`` / ``PHASE_ESCALATION_RESOLUTIONS``
+  by the escalation's unit level; exactly ONE short transaction =
+  ``db.resolve_escalation`` (frozen ``WHERE status='open'`` guard) + one
+  ``escalation_resolved`` event (actor ``main_architect``, payload
+  resolution/reason/via='cli'). Works against a live orchestrator under the
+  same D-0015 second-OS-process bounds (extended by the D-0027 rider); busy
+  database = explicit error, zero partial state. No artifact requirement —
+  an architect disposition is operational control-flow, not founder canon.
 
 Pidfile content contract (shared with ``watchdog.py``, the reader): line 1 =
 orchestrator pid (decimal); line 2 (optional) = its command line —
@@ -94,9 +105,12 @@ from sf_factory.db import (
     list_units,
     pending_decisions,
     processes_in_state,
+    resolve_escalation,
     unit_token_total,
 )
 from sf_factory.models import (
+    PHASE_ESCALATION_RESOLUTIONS,
+    STAGE_ESCALATION_RESOLUTIONS,
     DecisionRequest,
     FactoryError,
     GitError,
@@ -1219,6 +1233,90 @@ def cmd_decide(cfg: FactoryConfig, request_id: int, option: str) -> int:
     return 0
 
 
+# -------------------------------------------------------------- resolve-escalation
+
+
+def cmd_resolve_escalation(
+    cfg: FactoryConfig, escalation_id: int, resolution: str, reason: str | None
+) -> int:
+    """Operator escalation disposition (§4 / dashboard design §10.6 — the
+    D-0026 gap c, CCR-7): validate the escalation is OPEN and the resolution
+    belongs to the ``models.*_ESCALATION_RESOLUTIONS`` vocabulary of its unit
+    level (unknown values rejected listing the valid set), then exactly ONE
+    short transaction = ``db.resolve_escalation`` (frozen ``WHERE
+    status='open'`` guard; rowcount≠1 → explicit error, the tx rolls back
+    whole) + one ``escalation_resolved`` event (actor='main_architect',
+    payload: resolution, reason, via='cli'). No flock and no artifact: the
+    single short DB write from a second OS process runs under the
+    D-0015-ratified emergency-exception bounds, extended to this command by
+    the D-0027 rider (WAL + busy_timeout serialize it; busy database =
+    explicit error, never partial state); an architect disposition is
+    operational control-flow, not founder canon — the rationale lives in the
+    event payload. The running orchestrator's ``_step_escalated`` consumes the
+    resolution on its next tick (existing mechanics, untouched)."""
+    token = resolution.strip()
+    if not token:
+        raise FactoryError(
+            "resolve-escalation: empty resolution — pass the disposition token"
+        )
+    db = _open_db(cfg)
+    try:
+        open_rows = _open_escalations(db.read())
+        matches = [row for row in open_rows if row["id"] == escalation_id]
+        if not matches:
+            open_ids = sorted(row["id"] for row in open_rows)
+            raise FactoryError(
+                f"no OPEN escalation with id {escalation_id}"
+                f" (open ids: {open_ids or 'none'})"
+            )
+        esc_row = matches[0]
+        try:
+            level = Level(esc_row["unit_level"])
+        except ValueError as exc:
+            raise FactoryError(
+                f"escalation {escalation_id} has non-unit level"
+                f" {esc_row['unit_level']!r} — no resolution vocabulary applies"
+            ) from exc
+        vocabulary = (
+            STAGE_ESCALATION_RESOLUTIONS
+            if level is Level.STAGE
+            else PHASE_ESCALATION_RESOLUTIONS
+        )
+        if token not in vocabulary:
+            raise FactoryError(
+                f"unknown resolution {token!r} for a {level.value} escalation —"
+                f" valid: {', '.join(sorted(vocabulary))}"
+            )
+        try:
+            with db.transaction() as conn:
+                resolve_escalation(conn, escalation_id, token)
+                insert_event(
+                    conn,
+                    unit_level=esc_row["unit_level"],
+                    unit_id=esc_row["unit_id"],
+                    event_type="escalation_resolved",
+                    actor="main_architect",
+                    payload={
+                        "escalation_id": escalation_id,
+                        "resolution": token,
+                        "reason": reason,
+                        "via": "cli",
+                    },
+                )
+        except sqlite3.OperationalError as exc:
+            raise FactoryError(
+                f"database busy (live orchestrator writing?) — escalation not"
+                f" resolved, retry: {exc}"
+            ) from exc
+    finally:
+        db.close()
+    print(
+        f"resolved escalation {escalation_id} for"
+        f" {esc_row['unit_level']}/{esc_row['unit_id']}: {token!r}"
+    )
+    return 0
+
+
 # -------------------------------------------------------------------------- main
 
 
@@ -1238,7 +1336,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (mode=ro — legitimately concurrent with a live orchestrator, §2) + git
     (non-canonical, Doctrine §9). decide <request_id> <option>: emergency-fallback
     answer path (DoD §9 plumbing; the expected founder path is the dashboard answer
-    endpoint, §1)."""
+    endpoint, §1). resolve-escalation <escalation_id> <resolution> [--reason]:
+    architect escalation disposition (dashboard design §10.6, CCR-7/D-0027) — one
+    short tx (resolve + escalation_resolved event) under the D-0015 bounds."""
     parser = argparse.ArgumentParser(
         prog="sf-factory",
         description="SF-F5 factory control plane — operator entry (design §4).",
@@ -1285,6 +1385,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p_decide.add_argument("request_id", type=int, help="decision_requests.id to answer")
     p_decide.add_argument("option", help="the chosen option text (recorded verbatim)")
+    p_resolve = sub.add_parser(
+        "resolve-escalation",
+        help="architect escalation disposition: one tx = resolve + event"
+        " (dashboard design §10.6, CCR-7/D-0027)",
+    )
+    p_resolve.add_argument(
+        "escalation_id", type=int, help="escalations.id to resolve (must be open)"
+    )
+    p_resolve.add_argument(
+        "resolution",
+        help="disposition token from models.STAGE_/PHASE_ESCALATION_RESOLUTIONS"
+        " for the escalation's unit level",
+    )
+    p_resolve.add_argument(
+        "--reason",
+        default=None,
+        help="short operator rationale, recorded in the event payload",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1301,6 +1419,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_status(cfg, as_json=args.as_json, write=args.write)
         if args.command == "decide":
             return cmd_decide(cfg, args.request_id, args.option)
+        if args.command == "resolve-escalation":
+            return cmd_resolve_escalation(
+                cfg, args.escalation_id, args.resolution, args.reason
+            )
         raise FactoryError(f"unknown command: {args.command!r}")  # unreachable
     except KeyboardInterrupt:
         print("sf-factory: interrupted — shutting down", file=sys.stderr)

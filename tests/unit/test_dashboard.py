@@ -1625,3 +1625,403 @@ def test_session_page_render_includes_confirm_buttons_and_textcontent_only(
     assert f"action='/decision/{request_id}/answer'" in html_page  # §3 confirm path
     assert "textContent" in html_page and "innerHTML" not in html_page
     assert dash.RO["session_confirm_label"] in html_page
+
+
+# ===================================================================== §10 (v1.2)
+# Founder-channel UX slice (D-0027): visual tokens, tables, the open-escalations
+# block, options-above-body cards, ANSWERED confirmation, session-page textarea.
+# Appended per the §10.8 lane; helpers stay local (frozen conftest).
+
+import re as _re  # noqa: E402 — §10 append; the wave-3 import block stays frozen
+
+from sf_factory.models import (  # noqa: E402 — §10 append (same convention)
+    PHASE_ESCALATION_RESOLUTIONS,
+    STAGE_ESCALATION_RESOLUTIONS,
+    Trigger,
+)
+
+
+def _seed_escalation_row(
+    env,
+    *,
+    unit_level: str = "stage",
+    unit_id: str = "ph.s1",
+    trigger: str = "max_fix_iterations",
+    target: str = "phase_architect",
+    payload_artifact_id: int | None = None,
+    status: str = "open",
+    resolution: str | None = None,
+    resolved_at: str | None = None,
+) -> int:
+    from sf_factory.models import Escalation
+
+    with env.db.transaction() as conn:
+        return fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level=unit_level,
+                unit_id=unit_id,
+                trigger=trigger,
+                target=target,
+                payload_artifact_id=payload_artifact_id,
+                event_seq=None,
+                status=status,
+                resolution=resolution,
+                created_at=utc_now(),
+                resolved_at=resolved_at,
+            ),
+        )
+
+
+# --------------------------------------------------- §10.2 token discipline
+# Contract (R-A13/R-B1), regex + exemption list STATED HERE next to the test:
+#   - the :root block is the single token source and is excluded from the scan;
+#   - @media condition literals are exempt (CSS forbids var() in conditions);
+#   - bare `0` values are exempt (the px regex needs a digit run before 'px',
+#     so unitless zeros never match);
+#   - rgba() shadow values are exempt (declarations carrying rgba(...) are
+#     skipped; rgba also carries no '#', so the hex regex never chases it).
+_CSS_HEX_RE = _re.compile(r"#[0-9a-fA-F]{3,8}")
+_CSS_PX_RE = _re.compile(r"\d+px")
+_CSS_DECL_VALUE_RE = _re.compile(r":([^;{}]*)[;}]")
+
+_REQUIRED_TOKENS = (
+    "--space-1", "--space-2", "--space-3", "--space-4",
+    "--c-bg", "--c-card", "--c-border", "--c-accent",
+    "--c-ok", "--c-warn", "--c-err", "--c-muted",
+    "--radius", "--fs-base", "--fs-small", "--fs-h1", "--fs-h2",
+    "--border-w", "--tap-min",
+)
+
+
+def test_css_token_discipline_outside_root() -> None:
+    css = dash._CSS
+    root = _re.search(r":root\{[^}]*\}", css)
+    assert root is not None, "the :root token block must exist (§10.2)"
+    for token in _REQUIRED_TOKENS:
+        assert f"{token}:" in root.group(0), f"token {token} missing from :root"
+    rest = css.replace(root.group(0), "")
+    rest = _re.sub(r"@media[^{]*\{", "@media{", rest)  # exemption: conditions
+    for match in _CSS_DECL_VALUE_RE.finditer(rest):
+        value = match.group(1)
+        if "rgba(" in value:
+            continue  # exemption: rgba() shadow values
+        assert not _CSS_HEX_RE.search(value), f"hex literal outside :root: {value!r}"
+        assert not _CSS_PX_RE.search(value), f"px literal outside :root: {value!r}"
+
+
+def test_css_tap_target_overflow_and_input_font_rules_exist() -> None:
+    assert "--tap-min:44px" in dash._CSS and "--fs-base:16px" in dash._CSS
+    button_rule = _re.search(r"\.opt button\{[^}]*\}", dash._CSS)
+    assert button_rule and "min-height:var(--tap-min)" in button_rule.group(0)
+    assert "width:100%" in button_rule.group(0)  # S1 full-width thumb targets
+    wrapper_rule = _re.search(r"\.tabel\{[^}]*\}", dash._CSS)
+    assert wrapper_rule and "overflow-x:auto" in wrapper_rule.group(0)  # A-7
+    assert _re.search(r"td\.num,th\.num\{[^}]*text-align:right", dash._CSS)
+    # Internal-token small-print renders on its OWN line (§10.2/A-7/A-12).
+    token_rule = _re.search(r"\.token\{[^}]*\}", dash._CSS)
+    assert token_rule and "display:block" in token_rule.group(0)
+    textarea_rule = _re.search(r"textarea\{[^}]*\}", dash._CSS)
+    assert textarea_rule and "font-size:var(--fs-base)" in textarea_rule.group(0)
+    pre_rule = _re.search(r"pre\{[^}]*\}", dash._CSS)
+    assert pre_rule and "overflow-x:auto" in pre_rule.group(0)
+    assert "white-space:pre-wrap" in pre_rule.group(0)
+
+
+# ------------------------------------------------------- §10.2 state chips
+
+
+def test_state_chip_closure_and_neutral_fallback() -> None:
+    valid = {"accent", "warn", "err", "ok", "neutral"}
+    for member in (*StageState, *PhaseState):
+        assert member.value in dash.STATE_CHIPS, member
+        assert dash.STATE_CHIPS[member.value] in valid, member
+    # The §10.2 named categories, spot-pinned.
+    assert dash.STATE_CHIPS["BUILD"] == "accent"
+    assert dash.STATE_CHIPS["AWAITING_HUMAN"] == "warn"
+    assert dash.STATE_CHIPS["ESCALATED"] == "err"
+    assert dash.STATE_CHIPS["DONE"] == "ok"
+    # Explicit neutral fallback (R-B6) — and the text gloss is always present.
+    chip = dash._chip("NO_SUCH_STATE")
+    assert "chip-neutral" in chip
+    assert "NO_SUCH_STATE (etichetă lipsă)" in chip
+
+
+# ------------------------------------- §10.4 R2 closure: triggers + targets
+
+
+def test_gloss_closure_full_trigger_vocabulary_targets_and_resolutions() -> None:
+    import inspect
+
+    for member in Trigger:
+        assert member.value in dash.GLOSS, member
+    # DDL-comment extras (migrations/0001 escalations.trigger) + the
+    # executor-owned usage_missing trigger (D-0014(1)).
+    for extra in (
+        "cp1_verdict",
+        "unresolved_contest",
+        "semantic_conflict",
+        "internal_error",
+        "usage_missing",
+    ):
+        assert extra in dash.GLOSS, extra
+    # The scheduler literal set, harvested mechanically from the source —
+    # self-updating: a new literal escalation insert without a gloss fails
+    # here, the A-6 incident class.
+    literals = set(
+        _re.findall(r'trigger="([a-z_0-9]+)"', inspect.getsource(sched_mod))
+    )
+    assert {"child_failed", "integration_conflict"} <= literals
+    for token in literals:
+        assert token in dash.GLOSS, token
+    assert dash.GLOSS["child_failed"] == "o etapă din fază a eșuat"
+    assert dash.GLOSS["integration_conflict"] == "conflict la integrare"
+    # The escalations target CHECK set (§2 DDL).
+    for target in ("phase_architect", "main_architect", "founder"):
+        assert target in dash.GLOSS, target
+    # The resolution vocabulary renders on the „ultima escaladare rezolvată”
+    # line — glossed end to end (R2).
+    for token in (*STAGE_ESCALATION_RESOLUTIONS, *PHASE_ESCALATION_RESOLUTIONS):
+        assert token in dash.GLOSS, token
+    # escalation_resolved joined the incident vocabulary (§10.4).
+    assert "escalation_resolved" in dash.INCIDENT_EVENT_TYPES
+    assert "escalation_resolved" in dash.GLOSS
+
+
+# ------------------------------------------------ §10.4 escalations block
+
+
+def test_escalations_block_rows_glossed_anchors_first_in_strip(denv) -> None:
+    from sf_factory.models import ArtifactRef
+
+    _seed_unit(denv)
+    decision_id = _seed_decision(denv)
+    with denv.db.transaction() as conn:
+        ref_id = fdb.insert_artifact_ref(
+            conn,
+            ArtifactRef(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                kind="escalation_payload",
+                repo="factory",
+                path="_factory/stages/ph.s1/escalation-payload.md",
+                sha256="3" * 64,
+                git_commit=None,
+                created_at=utc_now(),
+            ),
+        )
+    arch_id = _seed_escalation_row(denv, payload_artifact_id=ref_id)
+    founder_id = _seed_escalation_row(denv, trigger="weird_trigger", target="founder")
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+
+    # Anchor + per-row ids (the notify deep links land HERE).
+    assert "id='escaladari'" in page
+    assert f"id='escalation/{arch_id}'" in page
+    assert f"id='escalation/{founder_id}'" in page
+    # FIRST in the strip when non-empty: exceptional state outranks telemetry.
+    assert page.index("id='escaladari'") < page.index(dash.RO["pulse_label"])
+    # Unit + trigger glossed (R2).
+    assert "Schema de bază" in page
+    assert "prea multe încercări de reparare fără progres (max_fix_iterations)" in page
+    # Unknown trigger -> visible missing-gloss marker, the page never dies.
+    assert "weird_trigger (etichetă lipsă)" in page
+    # Architect target: glossed + the load-bearing reassurance line.
+    assert "arhitectul de fază (phase_architect)" in page
+    assert "nu cere acțiunea ta" in page
+    # Founder target: action line + the decision-card link, NEVER reassurance.
+    assert dash.RO["escalation_founder_action"] in page
+    assert (
+        f"<a href='#decision/{decision_id}'>{dash.RO['escalation_decision_link']}</a>"
+        in page
+    )
+    # „dosar de escaladare” link when the payload ref exists (A-9).
+    assert f"<a href='/artifact/{ref_id}'>{dash.RO['escalation_dossier']}</a>" in page
+
+
+def test_escalations_empty_state_last_resolved_line_and_last_position(denv) -> None:
+    _seed_unit(denv)
+    _seed_escalation_row(
+        denv,
+        status="resolved",
+        resolution="rework:BUILD",
+        resolved_at="2026-06-12T08:00:00Z",
+    )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "id='escaladari'" in page  # the anchor ALWAYS renders (A-4 landing)
+    assert dash.RO["escalations_none"] in page
+    # S2 resolution visibility: „nothing open” alone is indistinguishable from
+    # „nothing was ever wrong”.
+    assert dash.RO["escalation_last_resolved"] in page
+    assert "refă construcția (rework:BUILD)" in page
+    assert "12-06-2026" in page  # R4 founder format
+    # Empty set does NOT outrank telemetry: the block renders last.
+    assert page.index(dash.RO["pulse_label"]) < page.index("id='escaladari'")
+
+
+# ---------------------------------------------------- §10.3 tables, §10.2 blocks
+
+
+def test_tables_structure_chips_and_plan_groups(denv) -> None:
+    _seed_unit(denv)
+    now = utc_now()
+    with denv.db.transaction() as conn:
+        fdb.insert_stage(
+            conn,
+            Stage(
+                id="ph.b",
+                phase_id="ph",
+                name="Etapa activă",
+                risk_class="routine",
+                state=StageState.BUILD,
+                branch=None,
+                worktree_path=None,
+                spec_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "<div class='tabel'><table>" in page  # A-7 wrapper in the markup
+    # Health-strip tables: Faze / Etape în lucru / Buget headers + numeric cells.
+    assert dash.RO["col_phase"] in page and dash.RO["col_progress"] in page
+    assert dash.RO["running_label"] in page and dash.RO["col_step"] in page
+    assert dash.RO["col_burn"] in page and dash.RO["col_cap"] in page
+    assert "class='num'" in page
+    # Chips: color supplementary, gloss text always inside.
+    assert _re.search(r"<span class='chip chip-accent'>[^<]*\(BUILD\)</span>", page)
+    assert _re.search(r"<span class='chip chip-warn'>[^<]*\(AWAITING_HUMAN\)</span>", page)
+    # Plan groups as table sections, not nested bullets.
+    assert _re.search(r"<tr class='grup'><th colspan='3'>", page)
+    assert dash.RO["plan_running_group"] in page
+
+
+# ------------------------------------------- §10.1 S1: card order + confirmation
+
+
+def test_card_order_options_precede_collapsed_request(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    card = _re.search(
+        rf"<article class='card' id='decision/{request_id}'>.*?</article>",
+        page,
+        _re.DOTALL,
+    )
+    assert card is not None
+    chunk = card.group(0)
+    options_at = chunk.index(f"action='/decision/{request_id}/answer'")
+    details_at = chunk.index("<details>")
+    pre_at = chunk.index("<pre>")
+    assert options_at < details_at < pre_at  # options markup precedes the <pre>
+    assert f"<details><summary>{dash.RO['request_summary']}</summary>" in chunk
+    # The session entry is a full-width LINK-BUTTON (S3/A-1) — no free-text
+    # field anywhere on the auto-refreshing main page.
+    assert f"<a class='btn' href='/decision/{request_id}/session'>" in chunk
+    assert "<input type='text'" not in page
+    assert "<textarea" not in page
+    # Mechanical links render as the 2-col table (§10.3).
+    assert f"<tr><th>{dash.RO['col_kind']}</th><th>{dash.RO['col_file']}</th></tr>" in chunk
+
+
+def test_recommended_badge_inside_button_label_with_accent_style(denv) -> None:
+    _seed_unit(denv)
+    _seed_decision(denv)  # default body carries 'Recomandare: approved'
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    button = _re.search(r"<button class='recomandat'>.*?</button>", page, _re.DOTALL)
+    assert button is not None
+    chunk = button.group(0)
+    # Badge INSIDE the button's label, token small-print on its own line (A-12).
+    assert f"<span class='badge'>{dash.RO['recommended_badge']}</span>" in chunk
+    assert "<span class='token'>(approved)</span>" in chunk
+    assert page.count("class='badge'") == 1  # never a wrapping sibling elsewhere
+    accent_rule = _re.search(r"\.opt button\.recomandat\{[^}]*\}", dash._CSS)
+    assert accent_rule and "var(--c-accent)" in accent_rule.group(0)
+
+
+async def test_answered_renders_confirmation_page_with_back_link(denv) -> None:
+    """S1/A-3: ANSWERED -> an explicit RO confirmation page (the old 303 landed
+    on an anchor that no longer exists, with zero acknowledgment)."""
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        status, _, body = await asyncio.to_thread(
+            _http,
+            "POST",
+            f"http://{host}:{port}/decision/{request_id}/answer",
+            b"option=approved",
+        )
+        assert status == 200
+        assert dash.RO["answered_ok"] in body
+        assert "<a href='/'>" in body  # the link back to the dashboard
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+def test_every_ro_entry_is_referenced_dead_string_audit() -> None:
+    """A-3's blind side closed: an RO literal nobody renders is dead UX copy —
+    every key must be referenced (quoted) in the module source."""
+    source = Path(dash.__file__).read_text(encoding="utf-8")
+    for key in dash.RO:
+        assert f'"{key}"' in source or f"'{key}'" in source, f"dead RO string: {key}"
+
+
+# --------------------------------------------------- §10.1 S6: top banner
+
+
+def test_banner_links_decizii_only_when_cards_exist(denv) -> None:
+    _seed_unit(denv)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "class='banner'" not in page  # no decisions -> no banner
+    _seed_decision(denv)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert (
+        f"<a class='banner' href='#decizii'>{dash.RO['banner_decisions_one']}</a>"
+        in page
+    )
+    _seed_decision(denv)  # a second pending card -> plural, count prefixed
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert (
+        f"<a class='banner' href='#decizii'>2 {dash.RO['banner_decisions_many']}</a>"
+        in page
+    )
+    assert "id='decizii'" in page  # the anchor the banner lands on
+
+
+# ------------------------------------------- §10.5 session textarea (S3/A-1)
+
+
+def test_textarea_only_on_session_page_and_never_with_meta_refresh(denv) -> None:
+    _seed_unit(denv)
+    request_id = _seed_decision(denv)
+    view = dash.build_view(denv.cfg)
+    main_page = dash.render_page(view, denv.cfg)
+    assert "http-equiv='refresh'" in main_page  # the main page auto-refreshes
+    assert "<textarea" not in main_page  # so it may NEVER carry a textarea
+
+    card = next(c for c in view.cards if c.request_id == request_id)
+    snap = dash.SessionSnapshot(
+        request_id=request_id, turns=(), busy=False, locked=None, turns_left=3
+    )
+    session_page = dash.render_session_page(snap, card, denv.cfg, "N0NCE")
+    # BOTH ids pinned (R-B5): the poll script locates form + field by id; a
+    # lost id leaves submit intercepted-then-dead, invisible to headless tests.
+    assert "<form id='mesaj-form'" in session_page
+    assert "<textarea id='mesaj-text' name='text' rows='4'" in session_page
+    assert "http-equiv" not in session_page  # no meta-refresh with a textarea
+    # JS-free path intact: plain form POST to the message endpoint.
+    assert f"action='/decision/{request_id}/session/message'" in session_page
+
+    # Locked session: the form disappears — still no meta-refresh anywhere.
+    locked_snap = dash.SessionSnapshot(
+        request_id=request_id, turns=(), busy=False, locked="blocat", turns_left=0
+    )
+    locked_page = dash.render_session_page(locked_snap, card, denv.cfg, "N0NCE")
+    assert "<textarea" not in locked_page
+    assert "http-equiv" not in locked_page

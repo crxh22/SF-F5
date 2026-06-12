@@ -361,8 +361,14 @@ async def test_health_strip_liveness_and_budget(make_env) -> None:
         status, _, page = await asyncio.to_thread(_http, "GET", f"http://{host}:{port}/")
         assert status == 200
         assert dash.RO["pulse_stale"] not in page  # fresh liveness
-        # 5.000 / 10.000 tokeni · 50% — seeded ledger vs conftest routine budget.
-        assert "5.000 / 10.000 tokeni · 50%" in page
+        # Seeded ledger vs conftest routine budget — §10.3 (v1.2) renders the
+        # budget as a TABLE (etapă · consum · plafon · %), so the old
+        # "5.000 / 10.000 tokeni · 50%" single-line shape is gone; the same
+        # three figures must land in numeric cells. [AMENDED: old-HTML-shape
+        # assertion, §10.8 carve-out — enumerated in the build report.]
+        assert "<td class='num'>5.000</td>" in page
+        assert "<td class='num'>10.000</td>" in page
+        assert "<td class='num'>50%</td>" in page
 
         import os
 
@@ -616,3 +622,135 @@ def test_scan_vocabulary_pin() -> None:
     scheduler uses (one source) — pinned cheaply here."""
     assert sched_category(Level.STAGE, "AWAITING_HUMAN", True) is SchedCategory.BLOCKED
     assert sched_category(Level.STAGE, "BUILD", True) is SchedCategory.RUNNING
+
+
+# ===================================================================== §10 (v1.2)
+# Founder-channel UX slice (D-0027) integration: a LIVE escalation in the strip,
+# `cli resolve-escalation` -> next-tick routing (the full D-0026 flow), and the
+# A-4 fragment↔anchor closure over every notify-emitted deep link.
+
+
+async def test_live_escalation_strip_cli_resolution_and_fragment_closure(
+    make_env,
+) -> None:
+    """§10.7 integration: (1) a real threshold escalation (real StageExecutor +
+    ThresholdEvaluator + stub agents) renders FIRST in the strip with the real
+    anchors; (2) `cli resolve-escalation` — the D-0026 gap-c operator surface,
+    exercised through the real argparse entry as a second-writer — resolves it
+    with the escalation_resolved event; (3) the next executor pass routes the
+    stage per the resolution (awaiting_human -> AWAITING_HUMAN + the Romanian
+    trade-off decision request); (4) EVERY fragment any notify call emitted
+    across the whole flow matches an id rendered on the page (A-4)."""
+    import re
+    import urllib.parse
+
+    env = make_env(use_config_db=True, config_overrides=_DASHBOARD_OVERRIDES)
+    _git_init_home(env.home)
+    env.seed_phase()
+    env.seed_freeze_event()
+    stage_id = "ph1.esc"
+    worktree = env.create_stage_worktree(stage_id)
+    env.seed_stage(stage_id, StageState.BUILD, risk="routine", worktree=worktree)
+    builds = 3  # conftest escalation.max_fix_iterations
+    env.write_playbook(
+        {
+            "builder": {
+                "calls": [
+                    {"write_files": {f"b{i}.txt": f"attempt {i}\n"}, "notes": False}
+                    for i in range(1, builds + 1)
+                ],
+                "default": None,
+            },
+            "validator": {
+                "calls": [{"failing": 3} for _ in range(builds)],
+                "default": None,
+            },
+            "cp1": {
+                "calls": [{"verdict": "rebuild"} for _ in range(builds - 1)],
+                "default": None,
+            },
+        }
+    )
+    executor = env.stage_executor()
+    await executor.execute(stage_id)
+    assert env.stage_state(stage_id) is StageState.ESCALATED
+    (esc_row,) = env.escalations(stage_id, status="open")
+
+    server = _dashboard_for(env)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        base = f"http://{host}:{port}"
+
+        # (1) The strip: open escalation FIRST, real anchors, glossed content.
+        status, _, page = await asyncio.to_thread(_http, "GET", f"{base}/")
+        assert status == 200
+        assert "id='escaladari'" in page
+        assert f"id='escalation/{esc_row['id']}'" in page
+        assert page.index("id='escaladari'") < page.index(dash.RO["pulse_label"])
+        assert (
+            "prea multe încercări de reparare fără progres (max_fix_iterations)"
+            in page
+        )
+        assert "nu cere acțiunea ta" in page  # architect-target reassurance
+        # The drive registered the evidence payload -> the „dosar” link exists.
+        assert dash.RO["escalation_dossier"] in page
+        # The escalation page's deep link lands on the rendered anchor (A-4 —
+        # pre-fix this fragment was the dead '#unit/stage/<id>').
+        esc_alerts = [p for p in env.notify.published if "Escaladare" in p[0]]
+        assert esc_alerts and esc_alerts[0][1].endswith("#escaladari")
+
+        # (2) cli resolve-escalation: the second-OS-process write pattern
+        # (D-0015 bounds, D-0027 rider) against the same live database.
+        from sf_factory.cli import main as cli_main
+
+        cfg_path = env.write_config_yaml()
+        assert (
+            cli_main(
+                [
+                    "-c",
+                    str(cfg_path),
+                    "resolve-escalation",
+                    str(esc_row["id"]),
+                    "awaiting_human",
+                    "--reason",
+                    "compromis de produs — decizia fondatorului",
+                ]
+            )
+            == 0
+        )
+        (resolved,) = env.escalations(stage_id, status="resolved")
+        assert resolved["resolution"] == "awaiting_human"
+        (event,) = env.events(stage_id, "escalation_resolved")
+        assert event["actor"] == "main_architect"
+        payload = json.loads(event["payload_json"])
+        assert payload["via"] == "cli" and payload["resolution"] == "awaiting_human"
+
+        # (3) Next tick: _step_escalated consumes the resolution — the stage
+        # routes to AWAITING_HUMAN with the trade-off decision request created
+        # atomically (the full D-0026 flow, mechanized end to end).
+        await executor.execute(stage_id)
+        assert env.stage_state(stage_id) is StageState.AWAITING_HUMAN
+        (pending,) = fdb.pending_decisions(env.db.read())
+        assert pending.gate_kind == "escalation_tradeoff"
+
+        # Cold-return page (S2): nothing open + the resolved line + the card.
+        status, _, page = await asyncio.to_thread(_http, "GET", f"{base}/")
+        assert status == 200
+        assert dash.RO["escalations_none"] in page
+        assert dash.RO["escalation_last_resolved"] in page
+        assert "trimisă la decizia fondatorului (awaiting_human)" in page
+        assert f"id='decision/{pending.id}'" in page
+
+        # (4) A-4 closure: every notify-emitted fragment across the WHOLE flow
+        # (escalation alert, decision publish, any health alert) matches an id
+        # rendered on the page — no deep link lands blind at page top again.
+        ids = set(re.findall(r"id='([^']+)'", page))
+        links = [link for _title, link, _prio in env.notify.published]
+        assert links  # the flow really paged
+        for link in links:
+            assert link and "#" in link, link
+            fragment = urllib.parse.unquote(link.split("#", 1)[1])
+            assert fragment in ids, f"notify fragment {fragment!r} has no anchor"
+    finally:
+        await _stop(task)

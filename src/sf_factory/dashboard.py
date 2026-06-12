@@ -1,4 +1,7 @@
-"""Founder dashboard — the orchestrator's founder surface (dashboard design v1.1, D-0017).
+"""Founder dashboard — the orchestrator's founder surface (dashboard design
+v1.1 D-0017; §10 founder-channel UX slice v1.2 D-0027: :root token visual
+system, tables over bullets, the open-escalations block, options-above-body
+cards, the ANSWERED confirmation page, session-page-only textarea).
 
 In-process module owned by the ``Scheduler`` (design §1): stdlib
 ``ThreadingHTTPServer`` worker threads supervised by an asyncio task. GET
@@ -69,7 +72,9 @@ from sf_factory.worktrees import commit_paths, run_git
 #: (the scheduler CP1_ID pattern); routed tools-off (§4, D-0017).
 _SESSION_ROLE = "decision_session"
 
-#: event_type values surfaced as „Ultimul incident” (§2b — frozen constant).
+#: event_type values surfaced as „Ultimul incident” (§2b — frozen constant;
+#: ``escalation_resolved`` joined with §10.4/D-0027: a resolved escalation is
+#: cold-return-visible news, not silence).
 INCIDENT_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "alert",
@@ -79,6 +84,7 @@ INCIDENT_EVENT_TYPES: frozenset[str] = frozenset(
         "cp_breach_attempt",
         "timeout",
         "usage_missing",
+        "escalation_resolved",
     }
 )
 
@@ -121,7 +127,33 @@ RO: Mapping[str, str] = {
     "recommended_badge": "★ Recomandat",
     "options_label": "Opțiuni",
     "artifacts_label": "Artefacte mecanice",
-    "request_label": "Cererea de decizie (conținut integral)",
+    "request_summary": "Cererea completă",
+    "banner_decisions_one": "O decizie așteaptă răspunsul tău",
+    "banner_decisions_many": "decizii așteaptă răspunsul tău",
+    "escalations_label": "Escaladări deschise",
+    "escalations_none": "nicio escaladare deschisă",
+    "escalation_last_resolved": "ultima escaladare rezolvată",
+    "escalation_dossier": "dosar de escaladare",
+    "escalation_reassurance": "în lucru la {target}; nu cere acțiunea ta",
+    "escalation_founder_action": "necesită decizia fondatorului",
+    "escalation_decision_link": "vezi cardul deciziei",
+    "running_label": "Etape în lucru",
+    "col_unit": "Unitate",
+    "col_trigger": "Declanșator",
+    "col_since": "De când",
+    "col_phase": "Fază",
+    "col_state": "Stare",
+    "col_progress": "Progres",
+    "col_stage": "Etapă",
+    "col_step": "Pas atins",
+    "col_risk": "Clasă de risc",
+    "col_tokens": "Tokeni",
+    "col_burn": "Consum",
+    "col_cap": "Plafon",
+    "col_pct": "%",
+    "col_kind": "Tip",
+    "col_file": "Fișier",
+    "col_when": "Când",
     "no_buttons_notice": (
         "Acest tip de decizie nu are încă butoane de răspuns în panou — "
         "răspunde din terminal cu comanda de urgență „cli decide” "
@@ -251,12 +283,15 @@ GLOSS: Mapping[str, str] = {
     "cp_breach_attempt": "încălcare de guvernanță (apel LLM neînregistrat)",
     "timeout": "timp depășit",
     "usage_missing": "consum de tokeni neraportat",
+    "escalation_resolved": "escaladare rezolvată",
     # risk classes (golden config keys)
     "routine": "risc de rutină",
     "structural": "risc structural",
     "critical": "risc critic",
-    # escalation triggers (§2 escalations.trigger vocabulary — rendered by the
-    # re-authored escalation-tradeoff request wrapper)
+    # escalation triggers (§2 escalations.trigger vocabulary — FULL closure per
+    # §10.4/D-0027: Trigger enum + the DDL-comment extras + the scheduler's
+    # literal inserts; rendered by the escalations block and the re-authored
+    # escalation-tradeoff request wrapper)
     "max_fix_iterations": "prea multe încercări de reparare fără progres",
     "churn_threshold": "prea multe modificări repetate în aceeași zonă de cod",
     "agent_declared_failure": "agentul a declarat eșec",
@@ -266,6 +301,19 @@ GLOSS: Mapping[str, str] = {
     "semantic_conflict": "conflict semantic la integrare",
     "internal_error": "eroare internă a fabricii",
     "artifact_contract": "artefact neconform cu contractul",
+    "child_failed": "o etapă din fază a eșuat",
+    "integration_conflict": "conflict la integrare",
+    # escalation targets (DDL CHECK set, §10.4 — who handles it)
+    "phase_architect": "arhitectul de fază",
+    "main_architect": "arhitectul principal",
+    "founder": "fondatorul — necesită decizia ta",
+    # escalation resolutions (models.*_ESCALATION_RESOLUTIONS vocabulary, CCR-7 —
+    # rendered by the „ultima escaladare rezolvată” line)
+    "rework:VALIDATE": "reia validarea",
+    "respec": "refă specificația",
+    "awaiting_human": "trimisă la decizia fondatorului",
+    "failed": "eșuată definitiv",
+    "cancelled": "anulată",
     # artifact kinds (mechanical links, §2a)
     "spec": "specificație",
     "build_notes": "note de construcție",
@@ -281,6 +329,30 @@ GLOSS: Mapping[str, str] = {
     "contest_rationale": "motivație de contestare",
     "transcript": "transcript de sesiune",
     "tier1_conflict": "conflict la integrare (nivel 1)",
+}
+
+#: §10.2 state -> chip category (running=accent, blocked/awaiting=warn,
+#: escalated/failed=err, done=ok). Color is SUPPLEMENTARY — the text gloss
+#: always renders inside the chip. Closure over ALL StageState/PhaseState
+#: members pinned by test; an unknown state at runtime falls back to
+#: 'neutral' explicitly (R-B6), never a KeyError.
+STATE_CHIPS: Mapping[str, str] = {
+    "PENDING": "neutral",
+    "SPEC": "accent",
+    "BUILD": "accent",
+    "VALIDATE": "accent",
+    "AUDIT": "accent",
+    "MERGE_GATE": "accent",
+    "PLANNING": "accent",
+    "CONTRACTS_FROZEN": "accent",
+    "RUNNING": "accent",
+    "INTEGRATING": "accent",
+    "AWAITING_HUMAN": "warn",
+    "AWAITING_SIGNOFF": "warn",
+    "ESCALATED": "err",
+    "FAILED": "err",
+    "CANCELLED": "err",
+    "DONE": "ok",
 }
 
 
@@ -342,6 +414,14 @@ def _label(token: str) -> str:
     """Romanian label for a token; unknown -> visible '<token> (etichetă lipsă)'."""
     gloss = GLOSS.get(token)
     return gloss if gloss is not None else f"{token} ({RO['missing_gloss']})"
+
+
+def _chip(state: str) -> str:
+    """State gloss inside a colored chip (§10.2): category via STATE_CHIPS with
+    an explicit 'neutral' fallback (R-B6); the text gloss is always present —
+    color is supplementary, never the information."""
+    category = STATE_CHIPS.get(state, "neutral")
+    return f"<span class='chip chip-{category}'>{esc(_glossed(state))}</span>"
 
 
 def resolve_bind_host(cfg: FactoryConfig) -> str:
@@ -554,6 +634,44 @@ class PhaseHealth:
 
 
 @dataclass(frozen=True)
+class RunningStage:
+    """§2b/§10.3 'Etape în lucru' row: one RUNNING-category stage."""
+
+    stage_id: str
+    name: str
+    state: str
+    risk_class: str
+    tokens: int
+
+
+@dataclass(frozen=True)
+class EscalationRow:
+    """§10.4 'Escaladări deschise' row (escalations WHERE status='open')."""
+
+    escalation_id: int
+    unit_level: str
+    unit_id: str
+    unit_name: str
+    trigger: str
+    target: str
+    created_at: str
+    payload_artifact_id: int | None
+    #: founder-target rows only: the unit's newest PENDING decision (the card
+    #: the founder must answer), None when no card exists (§10.4).
+    decision_request_id: int | None
+
+
+@dataclass(frozen=True)
+class ResolvedEscalation:
+    """§10.4 'ultima escaladare rezolvată' line (S2 cold-return visibility)."""
+
+    unit_name: str
+    unit_id: str
+    resolution: str
+    resolved_at: str
+
+
+@dataclass(frozen=True)
 class BudgetRow:
     """§2b 'Buget' row for one active stage."""
 
@@ -577,13 +695,13 @@ class Incident:
 
 @dataclass(frozen=True)
 class HealthStrip:
-    """§2b assembled health data."""
+    """§2b assembled health data (+ the §10.4 escalations view)."""
 
     liveness_age_s: int | None  # None = liveness file missing
     liveness_display: str  # pre-rendered RO line
     liveness_stale: bool
     phases: tuple[PhaseHealth, ...]
-    running_stages: tuple[tuple[str, str, str], ...]  # (id, name, state token)
+    running_stages: tuple[RunningStage, ...]
     waiting_count: int
     runnable_count: int
     budgets: tuple[BudgetRow, ...]
@@ -591,6 +709,8 @@ class HealthStrip:
     total_estimated_tokens: int
     total_cost_usd: float
     incident: Incident | None
+    escalations: tuple[EscalationRow, ...]
+    last_resolved: ResolvedEscalation | None
 
 
 @dataclass(frozen=True)
@@ -797,7 +917,7 @@ def _build_health(
         if prow["state"] not in terminal_phase
     )
 
-    running: list[tuple[str, str, str]] = []
+    running: list[RunningStage] = []
     waiting = runnable = 0
     budgets: list[BudgetRow] = []
     active_states = {"SPEC", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE", "AWAITING_HUMAN",
@@ -806,8 +926,21 @@ def _build_health(
         state = srow["state"]
         deps = fdb.deps_done(conn, Level.STAGE, srow["id"]) if state == "PENDING" else True
         category = sched_category(Level.STAGE, state, deps)
+        tokens = (
+            fdb.unit_token_total(conn, Level.STAGE.value, srow["id"])
+            if state in active_states
+            else 0
+        )
         if category is SchedCategory.RUNNING:
-            running.append((srow["id"], srow["name"], state))
+            running.append(
+                RunningStage(
+                    stage_id=srow["id"],
+                    name=srow["name"],
+                    state=state,
+                    risk_class=srow["risk_class"],
+                    tokens=tokens,
+                )
+            )
         elif category is SchedCategory.WAITING:
             waiting += 1
         elif category is SchedCategory.RUNNABLE:
@@ -818,7 +951,7 @@ def _build_health(
                     stage_id=srow["id"],
                     name=srow["name"],
                     risk_class=srow["risk_class"],
-                    tokens=fdb.unit_token_total(conn, Level.STAGE.value, srow["id"]),
+                    tokens=tokens,
                     budget=cfg.budgets.per_stage.get(srow["risk_class"]),
                 )
             )
@@ -853,6 +986,48 @@ def _build_health(
             created_at=incident_row["created_at"],
         )
 
+    # §10.4 (D-0026 gap b): open escalations, oldest first; founder-target rows
+    # carry the unit's newest pending decision so the row can link the card.
+    escalations: list[EscalationRow] = []
+    for erow in conn.execute(
+        "SELECT * FROM escalations WHERE status = 'open' ORDER BY id"
+    ).fetchall():
+        decision_request_id = None
+        if erow["target"] == "founder":
+            drow = conn.execute(
+                "SELECT id FROM decision_requests WHERE unit_level = ?"
+                " AND unit_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                (erow["unit_level"], erow["unit_id"]),
+            ).fetchone()
+            decision_request_id = int(drow["id"]) if drow is not None else None
+        escalations.append(
+            EscalationRow(
+                escalation_id=int(erow["id"]),
+                unit_level=erow["unit_level"],
+                unit_id=erow["unit_id"],
+                unit_name=_unit_name(conn, erow["unit_level"], erow["unit_id"]),
+                trigger=erow["trigger"],
+                target=erow["target"],
+                created_at=erow["created_at"],
+                payload_artifact_id=erow["payload_artifact_id"],
+                decision_request_id=decision_request_id,
+            )
+        )
+    resolved_row = conn.execute(
+        "SELECT * FROM escalations WHERE status = 'resolved'"
+        " ORDER BY resolved_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    last_resolved = None
+    if resolved_row is not None:
+        last_resolved = ResolvedEscalation(
+            unit_name=_unit_name(
+                conn, resolved_row["unit_level"], resolved_row["unit_id"]
+            ),
+            unit_id=resolved_row["unit_id"],
+            resolution=resolved_row["resolution"] or "",
+            resolved_at=resolved_row["resolved_at"] or resolved_row["created_at"],
+        )
+
     return HealthStrip(
         liveness_age_s=age,
         liveness_display=display,
@@ -866,6 +1041,8 @@ def _build_health(
         total_estimated_tokens=int(estimated["tokens"]),
         total_cost_usd=float(totals["cost"]),
         incident=incident,
+        escalations=tuple(escalations),
+        last_resolved=last_resolved,
     )
 
 
@@ -931,36 +1108,107 @@ def build_view(cfg: FactoryConfig, *, now: str | None = None) -> DashboardView:
 
 # -------------------------------------------------------------------- render
 
+# §10.2 visual system: CSS custom properties in :root are the SINGLE token
+# source (change once, propagates); every rule below consumes tokens. The
+# token-discipline test pins: no hex colors and no px spacing/size literals in
+# declaration values outside :root (exempt: @media condition literals, bare 0,
+# rgba() shadow values). --fs-base is 16px (mobile zoom-avoidance, §10.5);
+# --tap-min is the 44px thumb target (S1).
 _CSS = """
-body{font-family:system-ui,sans-serif;margin:0;padding:0 .8rem 2rem;background:#f5f4f0;
-  color:#1c1c1c;max-width:60rem}
-h1{font-size:1.25rem;margin:.8rem 0}
-h2{font-size:1.05rem;border-bottom:2px solid #c8c2b6;padding-bottom:.2rem;margin-top:1.4rem}
-section{margin-bottom:1rem}
-article.card{background:#fff;border:1px solid #d8d2c6;border-radius:8px;padding:.8rem;
-  margin:.8rem 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}
-article.card.eroare{border-color:#b3261e;background:#fdf3f2}
-pre{white-space:pre-wrap;word-break:break-word;background:#faf9f6;border:1px solid #e6e1d6;
-  border-radius:6px;padding:.6rem;font-size:.9rem;max-height:30rem;overflow:auto}
-.opt{display:inline-block;margin:.25rem .35rem .25rem 0}
-.opt button{font-size:1rem;padding:.5rem .9rem;border-radius:8px;border:1px solid #6b675e;
-  background:#fff;cursor:pointer}
-.opt button:hover{background:#efece4}
-.opt .token{color:#6b675e;font-size:.75rem}
-.badge{background:#1c6b35;color:#fff;border-radius:6px;padding:.1rem .4rem;font-size:.75rem;
-  margin-left:.3rem}
-.rosu{color:#b3261e;font-weight:700}
-.meta{color:#5a564d;font-size:.85rem}
-ul{margin:.3rem 0;padding-left:1.2rem}
-.tura{margin:.5rem 0}
-.tura.fondator pre{background:#eef3fb}
-footer{color:#5a564d;font-size:.8rem;margin-top:1.5rem;border-top:1px solid #c8c2b6;
-  padding-top:.5rem}
-input[type=text]{width:70%;padding:.45rem;border:1px solid #6b675e;border-radius:6px;
-  font-size:1rem}
+:root{--space-1:.25rem;--space-2:.5rem;--space-3:.8rem;--space-4:1.4rem;
+  --c-bg:#f5f4f0;--c-card:#fff;--c-border:#d8d2c6;--c-accent:#155c8d;
+  --c-ok:#1c6b35;--c-warn:#8a5a00;--c-err:#b3261e;--c-muted:#5a564d;
+  --c-text:#1c1c1c;--c-tint:#edeae0;--radius:8px;--border-w:1px;--tap-min:44px;
+  --fs-base:16px;--fs-small:.85rem;--fs-h1:1.25rem;--fs-h2:1.05rem;
+  --shadow:0 1px 2px rgba(0,0,0,.06)}
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;margin:0 auto;max-width:60rem;
+  padding:0 var(--space-2) var(--space-4);background:var(--c-bg);
+  color:var(--c-text);font-size:var(--fs-base)}
+h1{font-size:var(--fs-h1);margin:var(--space-3) 0}
+section,article.card{background:var(--c-card);
+  border:var(--border-w) solid var(--c-border);border-radius:var(--radius);
+  padding:var(--space-3);margin:var(--space-3) 0;box-shadow:var(--shadow)}
+section>h2{font-size:var(--fs-h2);background:var(--c-tint);
+  border-bottom:var(--border-w) solid var(--c-border);
+  margin:calc(-1*var(--space-3)) calc(-1*var(--space-3)) var(--space-3);
+  padding:var(--space-2) var(--space-3);
+  border-radius:var(--radius) var(--radius) 0 0}
+.bloc{border:var(--border-w) solid var(--c-border);border-radius:var(--radius);
+  padding:var(--space-2);margin:0 0 var(--space-3);background:var(--c-card)}
+.bloc h3{font-size:var(--fs-base);background:var(--c-tint);
+  margin:calc(-1*var(--space-2)) calc(-1*var(--space-2)) var(--space-2);
+  padding:var(--space-1) var(--space-2);
+  border-bottom:var(--border-w) solid var(--c-border);
+  border-radius:var(--radius) var(--radius) 0 0}
+article.card.eroare{border-color:var(--c-err)}
+article.card h3{margin:0 0 var(--space-2)}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--c-bg);
+  border:var(--border-w) solid var(--c-border);border-radius:var(--radius);
+  padding:var(--space-2);font-size:var(--fs-small);max-height:30rem;
+  overflow-x:auto;overflow-y:auto}
+.tabel{overflow-x:auto;margin:var(--space-2) 0}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-small)}
+th,td{border-bottom:var(--border-w) solid var(--c-border);
+  padding:var(--space-1) var(--space-2);text-align:left;vertical-align:top;
+  word-break:break-word}
+th{color:var(--c-muted);font-weight:600}
+td.num,th.num{text-align:right}
+tr.grup th{background:var(--c-tint);color:var(--c-text)}
+.token{display:block;color:var(--c-muted);font-size:var(--fs-small)}
+.chip{display:inline-block;border:var(--border-w) solid var(--c-border);
+  border-radius:var(--radius);padding:0 var(--space-1);background:var(--c-card)}
+.chip-accent{border-color:var(--c-accent);color:var(--c-accent)}
+.chip-warn{border-color:var(--c-warn);color:var(--c-warn)}
+.chip-err{border-color:var(--c-err);color:var(--c-err)}
+.chip-ok{border-color:var(--c-ok);color:var(--c-ok)}
+.chip-neutral{color:var(--c-muted)}
+.opt{display:block;margin:var(--space-2) 0}
+.opt button{display:block;width:100%;min-height:var(--tap-min);
+  font-size:var(--fs-base);padding:var(--space-2) var(--space-3);
+  border-radius:var(--radius);border:var(--border-w) solid var(--c-muted);
+  background:var(--c-card);cursor:pointer;text-align:left}
+.opt button:hover{background:var(--c-tint)}
+.opt button.recomandat{border:calc(2*var(--border-w)) solid var(--c-accent)}
+.badge{background:var(--c-ok);color:var(--c-card);border-radius:var(--radius);
+  padding:0 var(--space-1);font-size:var(--fs-small);margin-left:var(--space-1)}
+a.btn{display:block;width:100%;min-height:var(--tap-min);text-align:center;
+  border:var(--border-w) solid var(--c-accent);border-radius:var(--radius);
+  color:var(--c-accent);text-decoration:none;font-size:var(--fs-base);
+  padding:var(--space-2) var(--space-3);margin:var(--space-2) 0}
+a.banner{display:block;min-height:var(--tap-min);background:var(--c-warn);
+  color:var(--c-card);border-radius:var(--radius);font-weight:700;
+  padding:var(--space-2) var(--space-3);margin:var(--space-3) 0;
+  text-decoration:none}
+.rosu{color:var(--c-err);font-weight:700}
+.meta{color:var(--c-muted);font-size:var(--fs-small)}
+details{margin:var(--space-2) 0}
+summary{cursor:pointer;font-weight:600;min-height:var(--tap-min);
+  padding:var(--space-2) 0}
+ul{margin:var(--space-1) 0;padding-left:var(--space-4)}
+.tura{margin:var(--space-2) 0}
+.tura.fondator pre{background:var(--c-tint)}
+footer{color:var(--c-muted);font-size:var(--fs-small);
+  margin-top:var(--space-3);border-top:var(--border-w) solid var(--c-border);
+  padding-top:var(--space-2)}
+textarea{width:100%;font-size:var(--fs-base);padding:var(--space-2);
+  border:var(--border-w) solid var(--c-muted);border-radius:var(--radius);
+  margin:0 0 var(--space-2)}
+#mesaj-form button{display:block;min-height:var(--tap-min);
+  font-size:var(--fs-base);padding:var(--space-2) var(--space-3);
+  border-radius:var(--radius);border:var(--border-w) solid var(--c-muted);
+  background:var(--c-card);cursor:pointer}
+@media (max-width:720px){
+  body{padding:0 var(--space-1) var(--space-3)}
+  #mesaj-form button{width:100%}
+}
 """
 
 def _render_option_forms(card: DecisionCard, *, confirm: bool = False) -> str:
+    """§2a option buttons, §10.2 shape: ≥ --tap-min full-width buttons; the
+    „★ Recomandat” badge INSIDE the recommended button's label (accent border
+    on that button), never a wrapping sibling; the internal token small-print
+    on its own line inside the button (A-12)."""
     parts: list[str] = []
     if not card.options:
         parts.append(f"<p class='meta'>{esc(RO['no_buttons_notice'])}</p>")
@@ -968,23 +1216,31 @@ def _render_option_forms(card: DecisionCard, *, confirm: bool = False) -> str:
     label = RO["session_confirm_label"] if confirm else RO["options_label"]
     parts.append(f"<p><strong>{esc(label)}</strong></p>")
     for token in card.options:
+        recommended = card.recommended == token
         badge = (
-            f"<span class='badge'>{esc(RO['recommended_badge'])}</span>"
-            if card.recommended == token
+            f" <span class='badge'>{esc(RO['recommended_badge'])}</span>"
+            if recommended
             else ""
         )
+        button_class = " class='recomandat'" if recommended else ""
         label_text = _label(token)
         parts.append(
             "<form class='opt' method='post'"
             f" action='/decision/{card.request_id}/answer'>"
             f"<input type='hidden' name='option' value='{esc(token)}'>"
-            f"<button>{esc(label_text)} <span class='token'>({esc(token)})</span></button>"
-            f"{badge}</form>"
+            f"<button{button_class}>{esc(label_text)}{badge}"
+            f"<span class='token'>({esc(token)})</span></button>"
+            "</form>"
         )
     return "".join(parts)
 
 
 def _render_card(card: DecisionCard) -> str:
+    """§2a card, §10.1-S1 order: title + gate gloss + OPTION BUTTONS first
+    (the options markup precedes the request <pre> — pinned), the full request
+    collapsed in a zero-JS <details> below, mechanical links as a 2-col table
+    (§10.3), and the session entry as a full-width LINK-BUTTON to the session
+    page (S3/A-1: no free-text input on the auto-refreshing main page)."""
     unit_word = RO["stage_word"] if card.unit_level == "stage" else RO["phase_word"]
     title = (
         f"{RO['decision_word']} #{card.request_id} — {unit_word}:"
@@ -996,78 +1252,181 @@ def _render_card(card: DecisionCard) -> str:
             f"<h3>{esc(title)}</h3><p>{esc(card.error)}</p></article>"
         )
     links = "".join(
-        f"<li><a href='/artifact/{link.ref_id}'>{esc(_label(link.kind))}"
-        f" — {esc(link.filename)}</a></li>"
+        f"<tr><td>{esc(_label(link.kind))}</td>"
+        f"<td><a href='/artifact/{link.ref_id}'>{esc(link.filename)}</a></td></tr>"
         for link in card.artifact_links
     )
     links_block = (
-        f"<p><strong>{esc(RO['artifacts_label'])}</strong></p><ul>{links}</ul>" if links else ""
+        f"<p><strong>{esc(RO['artifacts_label'])}</strong></p>"
+        "<div class='tabel'><table>"
+        f"<tr><th>{esc(RO['col_kind'])}</th><th>{esc(RO['col_file'])}</th></tr>"
+        f"{links}</table></div>"
+        if links
+        else ""
     )
     return (
         f"<article class='card' id='decision/{card.request_id}'>"
         f"<h3>{esc(title)}</h3>"
         f"<p class='meta'>{esc(_glossed(card.gate_kind))} · {esc(card.created_display)}</p>"
-        f"<p><strong>{esc(RO['request_label'])}</strong></p>"
-        f"<pre>{esc(card.request_text)}</pre>"
         f"{_render_option_forms(card)}"
+        f"<a class='btn' href='/decision/{card.request_id}/session'>"
+        f"{esc(RO['session_open'])}</a>"
+        f"<details><summary>{esc(RO['request_summary'])}</summary>"
+        f"<pre>{esc(card.request_text)}</pre></details>"
         f"{links_block}"
-        f"<form method='post' action='/decision/{card.request_id}/session/message'>"
-        f"<input type='text' name='text'"
-        f" placeholder='{esc(RO['session_message_placeholder'])}'>"
-        f" <button>{esc(RO['session_open'])}</button></form>"
         "</article>"
     )
 
 
-def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
+def _table(header_cells: str, body_rows: str) -> str:
+    """One §10.3 table inside its overflow-x:auto wrapper (A-7)."""
+    head = f"<tr>{header_cells}</tr>" if header_cells else ""
+    return f"<div class='tabel'><table>{head}{body_rows}</table></div>"
+
+
+def _bloc(heading: str, body: str, *, anchor: str | None = None) -> str:
+    """One delimited health-strip sub-block: h3 header row + content (§10.2,
+    finding 3 at both levels)."""
+    anchor_attr = f" id='{anchor}'" if anchor else ""
+    return f"<div class='bloc'{anchor_attr}><h3>{esc(heading)}</h3>{body}</div>"
+
+
+def _render_escalations(view: DashboardView, cfg: FactoryConfig) -> str:
+    """§10.4 'Escaladări deschise' (D-0026 gap b): anchor id='escaladari' is
+    ALWAYS rendered — the scheduler's notify fragments must land on a real
+    anchor even after every escalation is resolved. Per-row id='escalation/<id>';
+    each row splits in two physical rows (A-7): unit+trigger+age, then the
+    per-target line (architect reassurance / founder action + card link) and
+    the optional „dosar” link. Empty set -> explicit notice; the newest
+    resolved line gives cold-return closure (S2)."""
     health = view.health
-    parts = [f"<h2>{esc(RO['section_now'])}</h2>"]
+    if health.escalations:
+        rows: list[str] = []
+        for row in health.escalations:
+            age = _age_text(_age_seconds(row.created_at, view.generated_at))
+            if row.target == "founder":
+                detail = esc(RO["escalation_founder_action"])
+                if row.decision_request_id is not None:
+                    detail += (
+                        f" — <a href='#decision/{row.decision_request_id}'>"
+                        f"{esc(RO['escalation_decision_link'])}</a>"
+                    )
+            else:
+                detail = esc(
+                    RO["escalation_reassurance"].format(target=_glossed(row.target))
+                )
+            if row.payload_artifact_id is not None:
+                detail += (
+                    f" · <a href='/artifact/{row.payload_artifact_id}'>"
+                    f"{esc(RO['escalation_dossier'])}</a>"
+                )
+            rows.append(
+                f"<tr id='escalation/{row.escalation_id}'>"
+                f"<td>{esc(row.unit_name)}"
+                f"<span class='token'>({esc(row.unit_id)})</span></td>"
+                f"<td>{esc(_glossed(row.trigger))}</td>"
+                f"<td class='num'>{esc(age)}</td></tr>"
+                f"<tr><td colspan='3' class='meta'>{detail}</td></tr>"
+            )
+        body = _table(
+            f"<th>{esc(RO['col_unit'])}</th><th>{esc(RO['col_trigger'])}</th>"
+            f"<th class='num'>{esc(RO['col_since'])}</th>",
+            "".join(rows),
+        )
+    else:
+        body = f"<p class='meta'>{esc(RO['escalations_none'])}</p>"
+    if health.last_resolved is not None:
+        res = health.last_resolved
+        when = fmt_founder_ts(res.resolved_at, cfg.factory.timezone_founder)
+        body += (
+            f"<p class='meta'>{esc(RO['escalation_last_resolved'])}:"
+            f" {esc(res.unit_name)} ({esc(res.unit_id)}) —"
+            f" {esc(_glossed(res.resolution))}, {esc(when)}</p>"
+        )
+    return _bloc(RO["escalations_label"], body, anchor="escaladari")
+
+
+def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
+    """§2b health strip, §10.3 shape: each data group its own sub-block (h3 +
+    table); 'Escaladări deschise' FIRST when non-empty (exceptional state
+    outranks routine telemetry), LAST otherwise — the anchor always exists."""
+    health = view.health
+    blocks: list[str] = []
+
+    escalations_block = _render_escalations(view, cfg)
+    if health.escalations:
+        blocks.append(escalations_block)
+
     stale_mark = (
         f" <span class='rosu'>{esc(RO['pulse_stale'])}</span>" if health.liveness_stale else ""
     )
-    parts.append(
-        f"<p><strong>{esc(RO['pulse_label'])}:</strong>"
-        f" {esc(health.liveness_display)}{stale_mark}</p>"
+    blocks.append(
+        _bloc(RO["pulse_label"], f"<p>{esc(health.liveness_display)}{stale_mark}</p>")
     )
+
     if health.phases:
-        rows = "".join(
-            f"<li>{esc(ph.name)} ({esc(ph.phase_id)}) — {esc(_glossed(ph.state))} —"
-            f" {ph.stages_done} {esc(RO['progress_of'])} {ph.stages_total}"
-            f" {esc(RO['progress_done'])}</li>"
+        phase_rows = "".join(
+            f"<tr><td>{esc(ph.name)}<span class='token'>({esc(ph.phase_id)})</span></td>"
+            f"<td>{_chip(ph.state)}</td>"
+            f"<td class='num'>{ph.stages_done} {esc(RO['progress_of'])}"
+            f" {ph.stages_total} {esc(RO['progress_done'])}</td></tr>"
             for ph in health.phases
         )
-        parts.append(f"<p><strong>{esc(RO['phases_label'])}:</strong></p><ul>{rows}</ul>")
-    queue_bits: list[str] = []
-    if health.running_stages:
-        queue_bits.append(
-            "".join(
-                f"<li>{esc(name)} ({esc(sid)}) — {esc(_glossed(state))}</li>"
-                for sid, name, state in health.running_stages
+        blocks.append(
+            _bloc(
+                RO["phases_label"],
+                _table(
+                    f"<th>{esc(RO['col_phase'])}</th><th>{esc(RO['col_state'])}</th>"
+                    f"<th class='num'>{esc(RO['col_progress'])}</th>",
+                    phase_rows,
+                ),
             )
         )
-    running_list = (
-        f"<ul>{queue_bits[0]}</ul>"
-        if queue_bits
-        else f"<p class='meta'>{esc(RO['queue_none_running'])}</p>"
+
+    if health.running_stages:
+        running_rows = "".join(
+            f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
+            f"<td>{_chip(st.state)}</td>"
+            f"<td>{esc(_glossed(st.risk_class))}</td>"
+            f"<td class='num'>{esc(_fmt_int(st.tokens))}</td></tr>"
+            for st in health.running_stages
+        )
+        running_body = _table(
+            f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_step'])}</th>"
+            f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_tokens'])}</th>",
+            running_rows,
+        )
+    else:
+        running_body = f"<p class='meta'>{esc(RO['queue_none_running'])}</p>"
+    blocks.append(_bloc(RO["running_label"], running_body))
+
+    blocks.append(
+        _bloc(
+            RO["queue_label"],
+            _table(
+                "",
+                f"<tr><td>{esc(RO['queue_waiting'])}</td>"
+                f"<td class='num'>{health.waiting_count}</td></tr>"
+                f"<tr><td>{esc(RO['queue_runnable'])}</td>"
+                f"<td class='num'>{health.runnable_count}</td></tr>",
+            ),
+        )
     )
-    parts.append(
-        f"<p><strong>{esc(RO['queue_label'])}:</strong></p>{running_list}"
-        f"<p class='meta'>{esc(RO['queue_waiting'])}: {health.waiting_count} ·"
-        f" {esc(RO['queue_runnable'])}: {health.runnable_count}</p>"
-    )
+
     budget_rows = []
     for row in health.budgets:
         if row.budget:
-            pct = int(round(100 * row.tokens / row.budget))
-            figure = (
-                f"{_fmt_int(row.tokens)} / {_fmt_int(row.budget)}"
-                f" {RO['budget_tokens']} · {pct}%"
-            )
+            pct_cell = f"{int(round(100 * row.tokens / row.budget))}%"
+            cap_cell = _fmt_int(row.budget)
         else:
-            figure = f"{_fmt_int(row.tokens)} {RO['budget_tokens']}"
+            pct_cell = "—"
+            cap_cell = "—"
         budget_rows.append(
-            f"<li>{esc(row.name)} ({esc(row.stage_id)}, {esc(_glossed(row.risk_class))})"
-            f" — {esc(figure)}</li>"
+            f"<tr><td>{esc(row.name)}<span class='token'>({esc(row.stage_id)} ·"
+            f" {esc(_glossed(row.risk_class))})</span></td>"
+            f"<td class='num'>{esc(_fmt_int(row.tokens))}</td>"
+            f"<td class='num'>{esc(cap_cell)}</td>"
+            f"<td class='num'>{esc(pct_cell)}</td></tr>"
         )
     estimated_part = (
         f" · {esc(RO['budget_estimated_part'])}:"
@@ -1080,36 +1439,60 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if health.total_cost_usd
         else ""
     )
-    parts.append(
-        f"<p><strong>{esc(RO['budget_label'])}:</strong></p><ul>{''.join(budget_rows)}</ul>"
-        f"<p class='meta'>{esc(RO['budget_total'])}:"
-        f" {esc(_fmt_int(health.total_tokens))} {esc(RO['budget_tokens'])}"
-        f"{estimated_part}{cost_part}</p>"
+    budget_table = (
+        _table(
+            f"<th>{esc(RO['col_stage'])}</th><th class='num'>{esc(RO['col_burn'])}</th>"
+            f"<th class='num'>{esc(RO['col_cap'])}</th>"
+            f"<th class='num'>{esc(RO['col_pct'])}</th>",
+            "".join(budget_rows),
+        )
+        if budget_rows
+        else ""
     )
+    blocks.append(
+        _bloc(
+            RO["budget_label"],
+            f"{budget_table}"
+            f"<p class='meta'>{esc(RO['budget_total'])}:"
+            f" {esc(_fmt_int(health.total_tokens))} {esc(RO['budget_tokens'])}"
+            f"{estimated_part}{cost_part}</p>",
+        )
+    )
+
     if health.incident is not None:
         inc = health.incident
         when = fmt_founder_ts(inc.created_at, cfg.factory.timezone_founder)
-        parts.append(
-            f"<p><strong>{esc(RO['incident_label'])}:</strong>"
-            f" {esc(_glossed(inc.event_type))} — {esc(inc.unit_name)}"
-            f" ({esc(inc.unit_id or 'factory')}) · {esc(when)}</p>"
+        incident_body = _table(
+            f"<th>{esc(RO['col_kind'])}</th><th>{esc(RO['col_unit'])}</th>"
+            f"<th class='num'>{esc(RO['col_when'])}</th>",
+            f"<tr><td>{esc(_glossed(inc.event_type))}</td>"
+            f"<td>{esc(inc.unit_name)}"
+            f"<span class='token'>({esc(inc.unit_id or 'factory')})</span></td>"
+            f"<td class='num'>{esc(when)}</td></tr>",
         )
     else:
-        parts.append(
-            f"<p><strong>{esc(RO['incident_label'])}:</strong>"
-            f" {esc(RO['incident_none'])}</p>"
-        )
-    return f"<section id='acum'>{''.join(parts)}</section>"
+        incident_body = f"<p class='meta'>{esc(RO['incident_none'])}</p>"
+    blocks.append(_bloc(RO["incident_label"], incident_body))
+
+    if not health.escalations:
+        blocks.append(escalations_block)
+
+    return (
+        f"<section id='acum'><h2>{esc(RO['section_now'])}</h2>{''.join(blocks)}</section>"
+    )
 
 
 def _render_plan(view: DashboardView) -> str:
+    """§2c plan & history, §10.3 shape: per phase ONE table (etapă · stare/pas
+    · clasă risc) with the Finalizate/În lucru/Planificate groups as table
+    sections (header rows), not nested bullets."""
     parts = [f"<h2>{esc(RO['section_plan'])}</h2>"]
     for phase in view.plan:
         done_n = len(phase.done)
         total_n = done_n + len(phase.running) + len(phase.pending)
         parts.append(
-            f"<h3>{esc(phase.name)} ({esc(phase.phase_id)}) —"
-            f" {esc(_glossed(phase.state))} — {done_n} {esc(RO['progress_of'])}"
+            f"<h3>{esc(phase.name)} ({esc(phase.phase_id)}) — {_chip(phase.state)} —"
+            f" {done_n} {esc(RO['progress_of'])}"
             f" {total_n} {esc(RO['progress_done'])}</h3>"
         )
         if total_n == 0:
@@ -1121,6 +1504,7 @@ def _render_plan(view: DashboardView) -> str:
             )
             parts.append(f"<p class='meta'>{esc(RO['plan_no_stages'])}{link}</p>")
             continue
+        rows: list[str] = []
         for label_key, group in (
             ("plan_done_group", phase.done),
             ("plan_running_group", phase.running),
@@ -1128,18 +1512,30 @@ def _render_plan(view: DashboardView) -> str:
         ):
             if not group:
                 continue
-            rows = "".join(
-                f"<li>{esc(st.name)} ({esc(st.stage_id)}) — {esc(_glossed(st.state))}</li>"
+            rows.append(f"<tr class='grup'><th colspan='3'>{esc(RO[label_key])}</th></tr>")
+            rows.extend(
+                f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
+                f"<td>{_chip(st.state)}</td>"
+                f"<td>{esc(_glossed(st.risk_class))}</td></tr>"
                 for st in group
             )
-            parts.append(f"<p><strong>{esc(RO[label_key])}</strong></p><ul>{rows}</ul>")
+        parts.append(
+            _table(
+                f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_state'])}</th>"
+                f"<th>{esc(RO['col_risk'])}</th>",
+                "".join(rows),
+            )
+        )
     parts.append(f"<footer>{esc(RO['plan_footer'])}</footer>")
     return f"<section id='plan'>{''.join(parts)}</section>"
 
 
 def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
     """The single server-rendered HTML page: three sections, meta-refresh, zero
-    JS; all dynamic text via esc()."""
+    JS; all dynamic text via esc(). §10.1-S6: when decision cards exist, a
+    one-line top banner anchor-links #decizii (the founder's to-do outranks the
+    taller strip). The meta-refresh lives ONLY here — never on a page that
+    renders a textarea (S3/A-1, pinned by test)."""
     refresh = cfg.founder_channel.dashboard.refresh_s
     cards: list[str] = []
     for card in view.cards:
@@ -1148,6 +1544,14 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
         except Exception as exc:  # noqa: BLE001 — §2a per-card containment
             cards.append(_render_card(_error_card(_card_as_request(card), exc)))
     cards_html = "".join(cards) if cards else f"<p class='meta'>{esc(RO['decisions_none'])}</p>"
+    count = len(view.cards)
+    if count == 1:
+        banner_text = RO["banner_decisions_one"]
+    else:
+        banner_text = f"{count} {RO['banner_decisions_many']}"
+    banner = (
+        f"<a class='banner' href='#decizii'>{esc(banner_text)}</a>" if count else ""
+    )
     return (
         "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -1155,6 +1559,7 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
         f"<title>{esc(RO['page_title'])}</title>"
         f"<style>{_CSS}</style></head><body>"
         f"<h1>{esc(RO['page_heading'])}</h1>"
+        f"{banner}"
         f"{_render_health(view, cfg)}"
         f"<section id='decizii'><h2>{esc(RO['section_decisions'])}</h2>{cards_html}</section>"
         f"{_render_plan(view)}"
@@ -1206,15 +1611,18 @@ def render_session_page(
     locked_note = (
         f"<p class='rosu'>{esc(snap.locked)}</p>" if snap.locked is not None else ""
     )
+    # §10.5 (finding 1): a multi-line textarea, SESSION PAGE ONLY — the main
+    # page's meta-refresh would destroy form state mid-composition (A-1). Both
+    # ids stay pinned: the poll script locates #mesaj-form/#mesaj-text by id.
     input_form = (
         ""
         if snap.locked is not None
         else (
             f"<form id='mesaj-form' method='post'"
             f" action='/decision/{snap.request_id}/session/message'>"
-            f"<input id='mesaj-text' type='text' name='text'"
-            f" placeholder='{esc(RO['session_message_placeholder'])}'>"
-            f" <button>{esc(RO['session_send'])}</button></form>"
+            f"<textarea id='mesaj-text' name='text' rows='4'"
+            f" placeholder='{esc(RO['session_message_placeholder'])}'></textarea>"
+            f"<button>{esc(RO['session_send'])}</button></form>"
             f"<p class='meta'>{esc(RO['session_turns_left'])}: {snap.turns_left}</p>"
         )
     )
@@ -1914,7 +2322,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _answer_response(self, cfg: FactoryConfig, result: AnswerResult) -> None:
         if result.outcome is AnswerOutcome.ANSWERED:
-            self._send(303, "", location=f"/#decision/{result.request_id}")
+            # §10.1-S1 (A-3): an explicit confirmation page — the old 303 landed
+            # on an anchor that no longer exists (the card left pending) with
+            # zero acknowledgment; _page() carries the link back to '/'.
+            self._page(200, RO["answered_ok"])
             return
         if result.outcome is AnswerOutcome.ALREADY_ANSWERED:
             self._page(200, RO["answered_already"])

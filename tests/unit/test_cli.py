@@ -1352,3 +1352,189 @@ def test_seed_phases_tx_failure_rolls_back_everything(
     state = _seed_db_state(seed_env)
     assert state.phases == {} and state.edges == []
     assert state.refs == [] and state.seed_events == []
+
+
+# ------------------------- resolve-escalation (dashboard design §10.6, CCR-7)
+# Appended with the founder-channel UX slice (D-0027 — the D-0026 gap c).
+# Helpers use the existing frozen imports (insert_escalation/Escalation are
+# already in the import block for the status fixture).
+
+
+def _seed_escalation(env: SimpleNamespace, *, unit_level: str = "stage") -> int:
+    """Phase + stage + ONE open escalation; returns escalations.id."""
+    db = _open_factory_db(env)
+    try:
+        with db.transaction() as conn:
+            phase_id, stage_id = _seed_units(conn, stage_state=StageState.ESCALATED)
+            return insert_escalation(
+                conn,
+                Escalation(
+                    id=None,
+                    unit_level=unit_level,
+                    unit_id=stage_id if unit_level == "stage" else phase_id,
+                    trigger="max_fix_iterations",
+                    target="phase_architect",
+                    payload_artifact_id=None,
+                    event_seq=None,
+                    status="open",
+                    resolution=None,
+                    created_at=utc_now(),
+                    resolved_at=None,
+                ),
+            )
+    finally:
+        db.close()
+
+
+def _escalation_state(env: SimpleNamespace, esc_id: int) -> tuple[dict, int]:
+    """(escalation row as dict, count of escalation_resolved events)."""
+    db = _open_factory_db(env)
+    try:
+        conn = db.read()
+        row = conn.execute(
+            "SELECT * FROM escalations WHERE id = ?", (esc_id,)
+        ).fetchone()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'escalation_resolved'"
+        ).fetchone()[0]
+        return dict(row), int(count)
+    finally:
+        db.close()
+
+
+def test_resolve_escalation_happy_path_one_tx_row_plus_event(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _cli(cli_env, "init") == 0
+    esc_id = _seed_escalation(cli_env)
+    assert (
+        _cli(
+            cli_env,
+            "resolve-escalation",
+            str(esc_id),
+            "rework:BUILD",
+            "--reason",
+            "arhitect: refacem construcția",
+        )
+        == 0
+    )
+    assert "resolved escalation" in capsys.readouterr().out
+
+    row, resolved_events = _escalation_state(cli_env, esc_id)
+    assert row["status"] == "resolved"
+    assert row["resolution"] == "rework:BUILD"
+    assert row["resolved_at"] is not None
+    assert resolved_events == 1
+    db = _open_factory_db(cli_env)
+    try:
+        event = db.read().execute(
+            "SELECT * FROM events WHERE event_type = 'escalation_resolved'"
+        ).fetchone()
+    finally:
+        db.close()
+    assert event["actor"] == "main_architect"
+    assert event["unit_level"] == "stage" and event["unit_id"] == "st-demo"
+    payload = json.loads(event["payload_json"])
+    assert payload["resolution"] == "rework:BUILD"
+    assert payload["reason"] == "arhitect: refacem construcția"
+    assert payload["via"] == "cli"
+    assert payload["escalation_id"] == esc_id
+
+
+def test_resolve_escalation_rejects_unknown_and_already_resolved_zero_writes(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _cli(cli_env, "init") == 0
+    esc_id = _seed_escalation(cli_env)
+
+    assert _cli(cli_env, "resolve-escalation", str(esc_id + 999), "failed") == 1
+    err = capsys.readouterr().err
+    assert "no OPEN escalation" in err
+    assert str(esc_id) in err  # helpful: lists the actually-open ids
+    row, resolved_events = _escalation_state(cli_env, esc_id)
+    assert row["status"] == "open" and resolved_events == 0  # zero writes
+
+    assert _cli(cli_env, "resolve-escalation", str(esc_id), "failed") == 0
+    capsys.readouterr()
+    # Already resolved = no longer open -> explicit error, zero NEW writes.
+    assert _cli(cli_env, "resolve-escalation", str(esc_id), "failed") == 1
+    assert "no OPEN escalation" in capsys.readouterr().err
+    row, resolved_events = _escalation_state(cli_env, esc_id)
+    assert row["status"] == "resolved" and resolved_events == 1
+
+
+def test_resolve_escalation_rejects_invalid_resolution_listing_vocabulary(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from sf_factory.models import (
+        PHASE_ESCALATION_RESOLUTIONS,
+        STAGE_ESCALATION_RESOLUTIONS,
+    )
+
+    assert _cli(cli_env, "init") == 0
+    stage_esc = _seed_escalation(cli_env)
+
+    assert _cli(cli_env, "resolve-escalation", str(stage_esc), "fix-it") == 1
+    err = capsys.readouterr().err
+    assert "unknown resolution 'fix-it'" in err
+    for token in STAGE_ESCALATION_RESOLUTIONS:
+        assert token in err  # the full valid vocabulary is listed
+    row, resolved_events = _escalation_state(cli_env, stage_esc)
+    assert row["status"] == "open" and resolved_events == 0  # zero writes
+
+    # Level-matched vocabulary: a stage-only token is invalid for a PHASE
+    # escalation, and the listed set is the PHASE one.
+    db = _open_factory_db(cli_env)
+    try:
+        with db.transaction() as conn:
+            phase_esc = insert_escalation(
+                conn,
+                Escalation(
+                    id=None,
+                    unit_level="phase",
+                    unit_id="ph-demo",
+                    trigger="child_failed",
+                    target="main_architect",
+                    payload_artifact_id=None,
+                    event_seq=None,
+                    status="open",
+                    resolution=None,
+                    created_at=utc_now(),
+                    resolved_at=None,
+                ),
+            )
+    finally:
+        db.close()
+    assert _cli(cli_env, "resolve-escalation", str(phase_esc), "rework:VALIDATE") == 1
+    err = capsys.readouterr().err
+    assert "phase escalation" in err
+    for token in PHASE_ESCALATION_RESOLUTIONS:
+        assert token in err
+
+    # Empty resolution -> explicit error before any DB read.
+    assert _cli(cli_env, "resolve-escalation", str(stage_esc), "   ") == 1
+    assert "empty resolution" in capsys.readouterr().err
+
+
+def test_resolve_escalation_busy_database_fails_explicitly(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A live-orchestrator write lock -> explicit „database busy” error, zero
+    partial state (the D-0015 second-OS-process bounds, D-0027 rider 2)."""
+    import sqlite3 as sqlite3_mod
+
+    cli_env.config["process"]["db_busy_timeout_ms"] = 200  # fast-fail the wait
+    cli_env.config_path.write_text(yaml.safe_dump(cli_env.config), encoding="utf-8")
+    assert _cli(cli_env, "init") == 0
+    esc_id = _seed_escalation(cli_env)
+
+    blocker = sqlite3_mod.connect(cli_env.db_path)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")  # the rival writer holds the lock
+        assert _cli(cli_env, "resolve-escalation", str(esc_id), "failed") == 1
+        assert "database busy" in capsys.readouterr().err
+    finally:
+        blocker.rollback()
+        blocker.close()
+    row, resolved_events = _escalation_state(cli_env, esc_id)
+    assert row["status"] == "open" and resolved_events == 0  # nothing partial

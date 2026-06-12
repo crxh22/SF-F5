@@ -349,3 +349,40 @@ class TestErrorTaxonomy:
     def test_factory_error_is_catchable_base(self):
         with pytest.raises(FactoryError):
             raise ConfigError("bad config")
+
+
+# ------------------------------------- escalation-resolution vocabulary (CCR-7)
+# Appended with the founder-channel UX slice (dashboard design §10.6, D-0027):
+# the maps moved from scheduler.py privates, so the old scheduler↔models
+# equality has no second operand — the tight invariant is R-B3: every value is
+# a LEGAL ESCALATED exit of its level's §3 transition table. Function-level
+# imports keep the frozen import block untouched (test_cli.py precedent).
+
+
+class TestEscalationResolutionVocabulary:
+    def test_stage_values_are_legal_escalated_exits(self):
+        from sf_factory.models import STAGE_ESCALATION_RESOLUTIONS
+
+        assert STAGE_ESCALATION_RESOLUTIONS  # never silently empty
+        for token, target in STAGE_ESCALATION_RESOLUTIONS.items():
+            assert isinstance(target, StageState), token
+            assert target in VALID_STAGE_TRANSITIONS[StageState.ESCALATED], token
+
+    def test_phase_values_are_legal_escalated_exits(self):
+        from sf_factory.models import PHASE_ESCALATION_RESOLUTIONS
+
+        assert PHASE_ESCALATION_RESOLUTIONS
+        for token, target in PHASE_ESCALATION_RESOLUTIONS.items():
+            assert isinstance(target, PhaseState), token
+            assert target in VALID_PHASE_TRANSITIONS[PhaseState.ESCALATED], token
+
+    def test_maps_are_read_only(self):
+        from sf_factory.models import (
+            PHASE_ESCALATION_RESOLUTIONS,
+            STAGE_ESCALATION_RESOLUTIONS,
+        )
+
+        with pytest.raises(TypeError):
+            STAGE_ESCALATION_RESOLUTIONS["new"] = StageState.BUILD  # type: ignore[index]
+        with pytest.raises(TypeError):
+            PHASE_ESCALATION_RESOLUTIONS["new"] = PhaseState.RUNNING  # type: ignore[index]

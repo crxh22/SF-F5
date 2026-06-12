@@ -274,6 +274,34 @@ GATE_ANSWERS: Mapping[tuple[str, str], tuple[str, ...]] = MappingProxyType(
     }
 )
 
+#: ESCALATED-exit resolution vocabulary (§2 ``escalations.resolution``) — the
+#: ONE source (Doctrine §9) consumed by BOTH the scheduler's ``_step_escalated``
+#: routing and ``cli resolve-escalation`` validation (CCR-7 / D-0027, moved out
+#: of scheduler.py privates — the GATE_ANSWERS precedent). Resolution string ->
+#: target state per level; anything else = unknown -> explicit 'alert' event,
+#: the unit stays put (never guessed, Doctrine §7). Every value is a legal
+#: ESCALATED exit of its level's transition table (pinned by test).
+STAGE_ESCALATION_RESOLUTIONS: Mapping[str, StageState] = MappingProxyType(
+    {
+        "rework:BUILD": StageState.BUILD,
+        "rework:SPEC": StageState.SPEC,
+        "respec": StageState.SPEC,
+        "rework:VALIDATE": StageState.VALIDATE,
+        "awaiting_human": StageState.AWAITING_HUMAN,
+        "failed": StageState.FAILED,
+        "cancelled": StageState.CANCELLED,
+    }
+)
+PHASE_ESCALATION_RESOLUTIONS: Mapping[str, PhaseState] = MappingProxyType(
+    {
+        "replan": PhaseState.PLANNING,
+        "resume": PhaseState.RUNNING,
+        "awaiting_human": PhaseState.AWAITING_HUMAN,
+        "failed": PhaseState.FAILED,
+        "cancelled": PhaseState.CANCELLED,
+    }
+)
+
 
 # ------------------------------------------------------------------------ helpers
 
