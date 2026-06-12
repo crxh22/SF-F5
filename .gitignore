@@ -9,3 +9,4 @@ __pycache__/
 
 # factory operational state (SQLite + logs are canonical in DB, not git — DoD §6)
 .factory/
+.claude/
