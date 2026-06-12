@@ -29,6 +29,16 @@ flags only (claude ``-p`` with no positional reads stdin; codex takes the
 stdin=PIPE and feeds the prompt from a concurrent task — a child that exits
 before reading all input is a NORMAL path, contained, recorded as
 ``stdin_fed`` on the exit/timeout event.
+
+D-0029 (AGENTS.md litter incident, 2026-06-12): the codex adapter's D-0009
+artifact — the canon materialized as ``AGENTS.md`` in the agent's cwd — must
+never outlive its run. The cross-model auditor runs in the STAGE WORKTREE at
+AUDIT; a durable unregistered ``AGENTS.md`` left there trips the §3.1
+validator-isolation assertion when findings route the stage back to BUILD
+(IntegrityError → spurious escalation; first hit foundation.config-registry).
+``run_agent`` snapshots ``cwd/AGENTS.md`` before ``materialize_workspace`` and
+deletes/restores it in the supervision ``finally`` — see ``_AGENTS_MD`` for
+why the filename is hardcoded at this boundary.
 """
 
 from __future__ import annotations
@@ -65,6 +75,17 @@ StreamKind = Literal["init", "text", "result", "usage", "other"]
 #: Truncation marker appended to the NDJSON log when an oversized line is
 #: swallowed (§5.2) — itself a valid JSON line so log replays stay parseable.
 TRUNCATION_MARKER = b'{"_sf_truncated_oversized_line": true}\n'
+
+#: The codex adapter's documented D-0009 artifact: the canon bundle is
+#: materialized under this name in the agent's cwd (codex has no system-prompt
+#: flag). The filename is hardcoded HERE — at the run_agent boundary, not
+#: reported by the adapter — because the frozen §4 CliAdapter protocol gives
+#: ``materialize_workspace`` no return channel (an optional cleanup callable
+#: would amend the frozen signature), so ``run_agent`` snapshots/restores this
+#: exact name around EVERY run (D-0029). Claude/stub materialization is a
+#: no-op, so for those routes pre-state == post-state and the restore does
+#: nothing.
+_AGENTS_MD = "AGENTS.md"
 
 _PR_SET_PDEATHSIG = 1  # linux/prctl.h
 
@@ -308,10 +329,12 @@ class CodexAdapter:
         """Write the canon bundle as AGENTS.md into cwd (D-0009: codex has no
         system-prompt flag). Idempotent on identical content; an existing
         DIFFERENT AGENTS.md is never clobbered silently (Doctrine §7) — that
-        would both destroy workspace content and pollute the stage diff."""
+        would both destroy workspace content and pollute the stage diff.
+        The artifact is scrubbed/restored by run_agent once the run is over
+        (D-0029, see ``_AGENTS_MD``) — it must never outlive its agent."""
         if system_append is None:
             return
-        target = Path(cwd) / "AGENTS.md"
+        target = Path(cwd) / _AGENTS_MD
         try:
             if target.exists():
                 if target.read_text(encoding="utf-8") == system_append:
@@ -507,7 +530,9 @@ class AgentRunner:
         (terminate->kill grace from config, signals to the process GROUP); finalize
         registry+token_ledger in one tx; detect declared-failure sentinel. Raises
         ProcessError only on spawn impossibility. CCR-8: the prompt is fed on
-        stdin by a concurrent task (argv carries flags only — E2BIG)."""
+        stdin by a concurrent task (argv carries flags only — E2BIG). D-0029:
+        cwd/AGENTS.md is snapshot before materialization and deleted/restored
+        after the run — the codex D-0009 artifact never outlives its agent."""
         self._enforce_tagging(role=role, kind=kind, cp_id=cp_id)
         route = self._cfg.models[role]
         if route.mode != "print":
@@ -517,6 +542,10 @@ class AgentRunner:
             )
         adapter = self._adapters[route.cli]
         canon = self._canon_text(role=role, kind=kind)
+        # D-0029: snapshot cwd/AGENTS.md BEFORE the adapter may materialize it —
+        # the artifact is deleted/restored in the supervision `finally` below so
+        # it never outlives the run (see _AGENTS_MD).
+        agents_md_before = _snapshot_agents_md(Path(cwd))
         adapter.materialize_workspace(Path(cwd), canon)
         argv = adapter.build_cmd(
             route, prompt, system_append=canon, resume_session=resume_session
@@ -644,6 +673,12 @@ class AgentRunner:
             # pipe nobody will drain — cancel-then-await never hangs, and a
             # broken/cancelled feed is the contained normal path.
             stdin_fed = await _reap_feeder(feeder)
+            # D-0029: the run is over — scrub/restore the codex D-0009 artifact
+            # so it never reaches the §3.1 validator-isolation assertion as
+            # unregistered litter. Never raises (cleanup failure must not mask
+            # the agent result); spawn-failure paths above never get here and
+            # leave any residue to the §5.5b recovery, like every crash window.
+            _restore_agents_md(Path(cwd), agents_md_before)
 
         ended_at = utc_now()
         duration_ms = int((loop.time() - started) * 1000)
@@ -1088,6 +1123,60 @@ async def _reap_feeder(feeder: asyncio.Task) -> bool:
         return bool(await feeder)
     except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError, OSError):
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentsMdSnapshot:
+    """Pre-materialization state of cwd/AGENTS.md (D-0029, see ``_AGENTS_MD``):
+    ``pre_existed=False`` → delete at cleanup; ``pre_existed=True`` with
+    ``data`` → rewrite the original bytes iff the current content differs;
+    ``pre_existed=True`` with ``data=None`` → the file was unreadable at
+    snapshot — leave it alone (bytes we never had cannot be restored)."""
+
+    pre_existed: bool
+    data: bytes | None
+
+
+def _snapshot_agents_md(cwd: Path) -> _AgentsMdSnapshot:
+    """Snapshot cwd/AGENTS.md before the adapter may materialize it (D-0029).
+    Never raises: an unreadable pre-existing file (perms, AGENTS.md-as-a-
+    directory, …) degrades to the leave-it-alone snapshot — the codex adapter
+    will fail such a workspace explicitly at materialization anyway, and a
+    claude/stub run must not start failing over a file it never consumes."""
+    path = cwd / _AGENTS_MD
+    try:
+        return _AgentsMdSnapshot(pre_existed=True, data=path.read_bytes())
+    except FileNotFoundError:
+        return _AgentsMdSnapshot(pre_existed=False, data=None)
+    except OSError:
+        # os.path.exists never raises (verifier F1: pathlib .exists() can raise
+        # PermissionError on an unstatable parent); unknown -> treated pre-existing.
+        return _AgentsMdSnapshot(pre_existed=os.path.exists(path), data=None)
+
+
+def _restore_agents_md(cwd: Path, snapshot: _AgentsMdSnapshot) -> None:
+    """Post-run scrub of the codex D-0009 artifact (D-0029, see ``_AGENTS_MD``):
+    a file that did not pre-exist is deleted (already missing = goal achieved);
+    a pre-existing file gets its original bytes back ONLY if the current
+    content differs (no gratuitous rewrite, no mtime/diff churn on untouched
+    workspaces). ALL OSErrors are contained — cleanup failure must never mask
+    the agent result; at worst the §5.5b recovery `clean -fd` handles the
+    residue of a crash window."""
+    path = cwd / _AGENTS_MD
+    try:
+        if not snapshot.pre_existed:
+            path.unlink(missing_ok=True)
+            return
+        if snapshot.data is None:
+            return  # pre-existed but unreadable at snapshot: leave it alone
+        try:
+            current: bytes | None = path.read_bytes()
+        except OSError:
+            current = None  # unreadable/missing now — differs from the snapshot
+        if current != snapshot.data:
+            path.write_bytes(snapshot.data)
+    except OSError:
+        pass
 
 
 def _signal_group(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:

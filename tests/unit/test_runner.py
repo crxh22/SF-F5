@@ -1017,3 +1017,181 @@ async def test_early_exit_child_with_pending_prompt_is_contained(
     (exit_event,) = _events(renv.db, "exit")
     assert json.loads(exit_event["payload_json"])["stdin_fed"] is False
     assert _proc_rows(renv.db)[0]["state"] == "exited"
+
+
+# ---------------- AGENTS.md lifecycle (D-0029: the codex D-0009 artifact scrub)
+#
+# These runs spawn hermetic fake `codex`/`claude` executables steered via PATH
+# (precedent: test_missing_cli_binary_finalizes_killed) so the REAL adapters —
+# argv, materialization, NDJSON shapes — are exercised end-to-end without the
+# installed binaries or any network.
+
+
+def _install_fake_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, body: str
+) -> None:
+    """Install an executable fake CLI named `name` ahead of everything on PATH.
+    The script runs under the current interpreter; every body drains stdin
+    first (the CCR-8 prompt contract) and emits CLI-shaped NDJSON."""
+    bin_dir = tmp_path / "fake-cli-bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / name
+    script.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+_FAKE_CODEX_OBSERVER = """
+import json, os, sys
+sys.stdin.read()  # CCR-8: the prompt arrives on stdin — drain it
+exists = os.path.exists("AGENTS.md")
+canon = exists and "SF-F5 CANON" in open("AGENTS.md", encoding="utf-8").read()
+lines = [
+    {"type": "thread.started", "thread_id": "thr-fake-audit"},
+    {"type": "item.completed",
+     "item": {"type": "agent_message", "text": "agents_md=%s canon=%s" % (exists, canon)}},
+    {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 3}},
+]
+for line in lines:
+    print(json.dumps(line), flush=True)
+"""
+
+_FAKE_CODEX_CLOBBERER = """
+import json, sys
+sys.stdin.read()
+with open("AGENTS.md", "w", encoding="utf-8") as fh:
+    fh.write("CLOBBERED BY THE AGENT MID-RUN\\n")
+lines = [
+    {"type": "thread.started", "thread_id": "thr-fake-clobber"},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": "clobbered"}},
+    {"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 2}},
+]
+for line in lines:
+    print(json.dumps(line), flush=True)
+"""
+
+_FAKE_CLAUDE = """
+import json, sys
+sys.stdin.read()
+init = {"type": "system", "subtype": "init", "session_id": "sess-fake-claude"}
+result = {"type": "result", "result": "claude done", "session_id": "sess-fake-claude",
+          "usage": {"input_tokens": 3, "output_tokens": 2}, "total_cost_usd": 0.001}
+print(json.dumps(init), flush=True)
+print(json.dumps(result), flush=True)
+"""
+
+_FAKE_CODEX_CWD_NUKER = """
+import json, os, sys
+sys.stdin.read()
+lines = [
+    {"type": "thread.started", "thread_id": "thr-fake-nuke"},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": "nuked"}},
+    {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+]
+for line in lines:
+    print(json.dumps(line), flush=True)
+cwd = os.getcwd()
+for name in os.listdir(cwd):
+    os.remove(os.path.join(cwd, name))
+os.rmdir(cwd)
+"""
+
+
+async def test_codex_route_leaves_no_agents_md_after_run(
+    config_dict, db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-0029 regression (first hit: foundation.config-registry): the canon the
+    codex adapter materializes as cwd/AGENTS.md (D-0009) is gone once the run
+    is over — left behind in the stage worktree it trips the §3.1
+    validator-isolation assertion (`?? AGENTS.md` → IntegrityError → spurious
+    escalation) when audit findings route the stage back to BUILD."""
+    _install_fake_cli(tmp_path, monkeypatch, "codex", _FAKE_CODEX_OBSERVER)
+    config_dict["models"]["auditor_cross_model"] = {
+        "cli": "codex", "model": "default", "mode": "print",
+    }
+    env = _build_env(config_dict, db, tmp_path)
+    assert not (env.cwd / "AGENTS.md").exists()
+    result = await env.runner.run_agent(
+        "auditor_cross_model", "audit the stage", unit_level="stage", unit_id="stg-1",
+        cwd=env.cwd,
+    )
+    assert result.exit_code == 0
+    assert not result.timed_out and not result.killed
+    assert result.session_id == "thr-fake-audit"
+    # The child really saw the materialized canon in its cwd during the run...
+    assert result.result_text == "agents_md=True canon=True"
+    # ...and the artifact did not outlive it.
+    assert not (env.cwd / "AGENTS.md").exists()
+    assert _proc_rows(db)[0]["state"] == "exited"
+
+
+async def test_codex_route_restores_overwritten_preexisting_agents_md(
+    config_dict, db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-existing cwd/AGENTS.md comes back byte-identical after a codex run
+    that overwrote it. The adapter itself never overwrites divergent content
+    (ProcessError, D-0009) — the overwriter is the AGENT (codex runs under
+    `--sandbox workspace-write`), so the run is a consultation spawn: CPs get
+    no canon (D-0009 exception) and are the codex route that admits a
+    divergent pre-existing file."""
+    _install_fake_cli(tmp_path, monkeypatch, "codex", _FAKE_CODEX_CLOBBERER)
+    config_dict["models"]["cp1_triage"] = {"cli": "codex", "model": "default", "mode": "print"}
+    env = _build_env(config_dict, db, tmp_path)
+    original = "# workspace-owned AGENTS.md\nbyte-exact content — ñ\n".encode()
+    (env.cwd / "AGENTS.md").write_bytes(original)
+    result = await env.runner.run_agent(
+        "cp1_triage", "triage", unit_level="stage", unit_id="stg-1", cwd=env.cwd,
+        kind="consultation", cp_id="CP-1",
+    )
+    assert result.exit_code == 0
+    assert result.result_text == "clobbered"  # the agent really overwrote it mid-run
+    assert (env.cwd / "AGENTS.md").read_bytes() == original
+
+
+async def test_claude_route_preexisting_agents_md_untouched(
+    config_dict, db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude materialization is a no-op (canon rides --append-system-prompt,
+    D-0009) — the D-0029 snapshot/restore must not delete or rewrite a
+    workspace's own AGENTS.md on claude routes: content AND mtime unchanged
+    (an untouched file is never rewritten in place)."""
+    _install_fake_cli(tmp_path, monkeypatch, "claude", _FAKE_CLAUDE)
+    config_dict["models"]["builder_routine"] = {
+        "cli": "claude", "model": "fable", "mode": "print",
+    }
+    env = _build_env(config_dict, db, tmp_path)
+    original = b"# workspace-owned AGENTS.md\nnot the factory's artifact\n"
+    target = env.cwd / "AGENTS.md"
+    target.write_bytes(original)
+    mtime_before = target.stat().st_mtime_ns
+    result = await env.runner.run_agent(
+        "builder_routine", "build", unit_level="stage", unit_id="stg-1", cwd=env.cwd
+    )
+    assert result.exit_code == 0
+    assert result.result_text == "claude done"
+    assert target.read_bytes() == original
+    assert target.stat().st_mtime_ns == mtime_before
+
+
+async def test_agents_md_cleanup_oserror_contained(
+    config_dict, db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup failure must never mask the agent result (D-0029; §5.5b recovery
+    owns crash-window residue): the agent deletes its entire cwd, so the
+    post-run restore of the pre-existing AGENTS.md hits ENOENT — run_agent
+    neither raises nor degrades the AgentResult, and the registry row still
+    finalizes 'exited'."""
+    _install_fake_cli(tmp_path, monkeypatch, "codex", _FAKE_CODEX_CWD_NUKER)
+    config_dict["models"]["cp1_triage"] = {"cli": "codex", "model": "default", "mode": "print"}
+    env = _build_env(config_dict, db, tmp_path)
+    (env.cwd / "AGENTS.md").write_bytes(b"original bytes\n")
+    result = await env.runner.run_agent(
+        "cp1_triage", "triage", unit_level="stage", unit_id="stg-1", cwd=env.cwd,
+        kind="consultation", cp_id="CP-1",
+    )
+    assert not env.cwd.exists()  # the agent really removed the directory
+    assert result.exit_code == 0
+    assert not result.timed_out and not result.killed and not result.declared_failure
+    assert result.result_text == "nuked"
+    assert result.session_id == "thr-fake-nuke"
+    assert _proc_rows(db)[0]["state"] == "exited"
