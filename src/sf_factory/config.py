@@ -41,6 +41,24 @@ class ModelRoute(_StrictModel):
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
+class ModelPrice(_StrictModel):
+    """USD per 1M tokens for one ledger model string (design §11.1, CCR-10):
+    input/output list prices, founder-tunable. Used ONLY where the CLI reports
+    no exact cost (token_ledger.cost_usd NULL) — estimates render with `~`."""
+
+    input: float = Field(gt=0)
+    output: float = Field(gt=0)
+
+
+class PricingCfg(_StrictModel):
+    """pricing.usd_per_mtok.<ledger-model> -> ModelPrice (design §11.1). Keys are
+    LEDGER model strings (`fable`, `sonnet`, `haiku`, `default`, …). A NULL-cost
+    row whose model has no key renders the explicit missing-price marker —
+    fail-visible, never a silent zero (Doctrine §7)."""
+
+    usd_per_mtok: dict[str, ModelPrice] = {}
+
+
 class ConsultationPointCfg(_StrictModel):
     """id, purpose, inputs: list[str], verdicts: list[str], fallback: str, role: str,
     max_input_bytes: int."""
@@ -251,8 +269,8 @@ class CanonCfg(_StrictModel):
 
 class FactoryConfig(_StrictModel):
     """Typed mirror of factory.config.yaml: factory, projects, models, budgets, escalation,
-    risk_classes, economics, consultation_points, founder_channel, process, canon (D-0009).
-    extra='forbid' everywhere."""
+    risk_classes, economics, consultation_points, founder_channel, process, canon (D-0009),
+    pricing (CCR-10, optional). extra='forbid' everywhere."""
 
     factory: FactorySection
     projects: dict[str, ProjectCfg]
@@ -265,6 +283,9 @@ class FactoryConfig(_StrictModel):
     founder_channel: FounderChannelCfg
     process: ProcessCfg
     canon: CanonCfg
+    #: CCR-10 (design §11.3.1): OPTIONAL top-level section, default empty — the
+    #: golden config carries the real table; minimal test fixtures need none.
+    pricing: PricingCfg = PricingCfg()
 
     @model_validator(mode="after")
     def _cross_checks(self) -> FactoryConfig:

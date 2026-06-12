@@ -673,6 +673,47 @@ def unit_token_total(conn: sqlite3.Connection, unit_level: str, unit_id: str) ->
     return int(row[0])
 
 
+def list_token_ledger(
+    conn: sqlite3.Connection, unit_level: str, unit_id: str
+) -> list[sqlite3.Row]:
+    """All ledger rows for one unit — the §11 per-agent cost table source
+    (dashboard design §11.3.2, CCR-10). Ordered by ledger ``id`` (insertion
+    order): ``recorded_at`` is second-precision and ties are real (review F7) —
+    ``recorded_at`` is displayed, ``id`` orders. Pure SQL, no business rules."""
+    return conn.execute(
+        "SELECT id, process_id, role, model, tokens_in, tokens_out, cost_usd,"
+        " estimated, recorded_at FROM token_ledger"
+        " WHERE unit_level = ? AND unit_id = ? ORDER BY id",
+        (unit_level, unit_id),
+    ).fetchall()
+
+
+def sum_token_cost(
+    conn: sqlite3.Connection, *, since: str | None = None
+) -> list[sqlite3.Row]:
+    """Cost aggregate per (unit_level, unit_id, model) — the §11 summary source
+    (dashboard design §11.3.2, CCR-10). ``exact_usd`` sums the CLI-reported
+    costs (NULL when the group has none — exact-where-reported precedence);
+    ``est_tokens_in``/``est_tokens_out`` sum ONLY NULL-cost rows (the inputs of
+    the config-price estimation); ``null_cost_rows`` counts them, so a model
+    missing from ``pricing`` renders the explicit missing-price marker, never a
+    silent zero (Doctrine §7). Optional ``since`` bounds ``recorded_at``
+    (ISO-UTC, inclusive) — the „Astăzi” founder-TZ-midnight cut (review F5)."""
+    where = " WHERE recorded_at >= ?" if since is not None else ""
+    params: tuple = (since,) if since is not None else ()
+    return conn.execute(
+        "SELECT unit_level, unit_id, model,"
+        " SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd END) AS exact_usd,"
+        " COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN COALESCE(tokens_in, 0) END), 0)"
+        " AS est_tokens_in,"
+        " COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN COALESCE(tokens_out, 0) END), 0)"
+        " AS est_tokens_out,"
+        " SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS null_cost_rows"
+        f" FROM token_ledger{where} GROUP BY unit_level, unit_id, model",
+        params,
+    ).fetchall()
+
+
 # ------------------------------------------------- repository: fix loops and churn
 
 

@@ -201,6 +201,15 @@ def denv(config_dict: dict[str, Any], tmp_path: Path):
         "mode": "print",
         "tools": "none",
     }
+    # §11 (CCR-10): pricing for the cost-surface tests; models WITHOUT a key
+    # (e.g. 'model-fara-pret') exercise the explicit missing-price marker.
+    config_dict["pricing"] = {
+        "usd_per_mtok": {
+            "stub-model": {"input": 2.0, "output": 10.0},
+            "fable": {"input": 10, "output": 50},
+            "sonnet": {"input": 3, "output": 15},
+        }
+    }
     cfg = FactoryConfig.model_validate(config_dict)
     database = Database(Path(config_dict["process"]["db_path"]), busy_timeout_ms=5000)
     database.open()
@@ -1892,8 +1901,10 @@ def test_tables_structure_chips_and_plan_groups(denv) -> None:
     # Chips: color supplementary, gloss text always inside.
     assert _re.search(r"<span class='chip chip-accent'>[^<]*\(BUILD\)</span>", page)
     assert _re.search(r"<span class='chip chip-warn'>[^<]*\(AWAITING_HUMAN\)</span>", page)
-    # Plan groups as table sections, not nested bullets.
-    assert _re.search(r"<tr class='grup'><th colspan='3'>", page)
+    # Plan groups as table sections, not nested bullets. [AMENDED with §11
+    # (CCR-10): the plan table gained the cost column -> colspan 3 became 4;
+    # old-HTML-shape assertion, §10.8 carve-out — enumerated in the build report.]
+    assert _re.search(r"<tr class='grup'><th colspan='4'>", page)
     assert dash.RO["plan_running_group"] in page
 
 
@@ -2025,3 +2036,383 @@ def test_textarea_only_on_session_page_and_never_with_meta_refresh(denv) -> None
     locked_page = dash.render_session_page(locked_snap, card, denv.cfg, "N0NCE")
     assert "<textarea" not in locked_page
     assert "http-equiv" not in locked_page
+
+
+# ===================================================================== §11 (v1.3)
+# Per-stage agent cost breakdown (CCR-10): _fmt_usd, the §11.1 precedence/marker
+# honesty rule, exact/estimated pairs never merged, the «Astăzi» founder-TZ cut,
+# the refresh-free read-only GET /costuri, and the role/model gloss closure.
+# Appended per the §11.3 lane; helpers stay local (frozen conftest).
+
+_TS = " "  # the _fmt_usd thin space (§11.2)
+
+
+def _seed_ledger_row(
+    env,
+    *,
+    unit_level: str = "stage",
+    unit_id: str = "ph.s1",
+    role: str = "builder_routine",
+    model: str = "sonnet",
+    tokens_in: int | None = 1000,
+    tokens_out: int | None = 500,
+    cost_usd: float | None = None,
+    estimated: bool = False,
+    recorded_at: str | None = None,
+) -> None:
+    """One token_ledger row (with its FK process row); recorded_at overridable —
+    insert_token_usage stamps utc_now and the «Astăzi» cut needs fixed clocks."""
+    from sf_factory.models import ProcessRecord
+
+    with env.db.transaction() as conn:
+        pid = fdb.insert_process(
+            conn,
+            ProcessRecord(
+                id=None,
+                unit_level=unit_level,
+                unit_id=unit_id,
+                kind="agent",
+                role=role,
+                cp_id=None,
+                session_id=None,
+                pid=None,
+                cmdline="stub",
+                cwd=None,
+                state="exited",
+                exit_code=0,
+                ndjson_log_path=None,
+                spawned_at=utc_now(),
+                heartbeat_at=None,
+                ended_at=utc_now(),
+            ),
+        )
+        fdb.insert_token_usage(
+            conn,
+            process_id=pid,
+            unit_level=unit_level,
+            unit_id=unit_id,
+            role=role,
+            model=model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            estimated=estimated,
+        )
+        if recorded_at is not None:
+            conn.execute(
+                "UPDATE token_ledger SET recorded_at = ?"
+                " WHERE id = (SELECT MAX(id) FROM token_ledger)",
+                (recorded_at,),
+            )
+
+
+def _seed_build_stage(env, stage_id: str = "ph.b", *, state=None) -> None:
+    """One extra stage in phase 'ph' (default BUILD = RUNNING category)."""
+    now = utc_now()
+    with env.db.transaction() as conn:
+        fdb.insert_stage(
+            conn,
+            Stage(
+                id=stage_id,
+                phase_id="ph",
+                name="Etapa activă",
+                risk_class="routine",
+                state=state or StageState.BUILD,
+                branch=None,
+                worktree_path=None,
+                spec_artifact_id=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+
+def test_fmt_usd_romanian_comma_subcent_thin_space() -> None:
+    assert dash._fmt_usd(12.4) == f"12,40{_TS}$"
+    assert dash._fmt_usd(0.0) == f"0,00{_TS}$"
+    assert dash._fmt_usd(0.01) == f"0,01{_TS}$"
+    # Sub-cent non-zero is never rounded into '0,00 $' or '0,01 $' (§11.2).
+    assert dash._fmt_usd(0.004) == f"<0,01{_TS}$"
+    assert dash._fmt_usd(0.0099) == f"<0,01{_TS}$"
+    # Thousands grouped Romanian-style (R4), decimal COMMA.
+    assert dash._fmt_usd(1234.5) == f"1.234,50{_TS}$"
+
+
+def test_founder_day_start_utc_golden_chisinau() -> None:
+    # Summer (EEST, UTC+3) and winter (EET, UTC+2): the «Astăzi» cut is the
+    # FOUNDER'S midnight converted to UTC, never the UTC day boundary (F5).
+    assert (
+        dash._founder_day_start_utc("2026-06-12T10:00:00Z", "Europe/Chisinau")
+        == "2026-06-11T21:00:00Z"
+    )
+    assert (
+        dash._founder_day_start_utc("2026-01-15T10:00:00Z", "Europe/Chisinau")
+        == "2026-01-14T22:00:00Z"
+    )
+
+
+def test_row_cost_precedence_exact_estimate_marker_and_estimated_flag(denv) -> None:
+    """§11.1: non-NULL cost_usd renders EXACT as-is (config prices NEVER applied
+    over a reported cost); NULL estimates from pricing with `~`; NULL + missing
+    pricing key -> the explicit marker, never a silent zero; estimated=1 token
+    counts keep `~` regardless of cost source."""
+
+    def row(**kw):
+        base = dict(
+            ledger_id=1,
+            role="builder_routine",
+            model="sonnet",
+            tokens_in=1_000_000,
+            tokens_out=100_000,
+            cost_usd=None,
+            estimated=False,
+            recorded_at="2026-06-12T08:00:00Z",
+        )
+        base.update(kw)
+        return dash.AgentCostRow(**base)
+
+    # Exact passthrough: config arithmetic would say 3 + 1.5 = 4.50 — the
+    # CLI-reported 1.20 wins (Doctrine §21, F4).
+    assert dash._fmt_row_cost(denv.cfg, row(cost_usd=1.2)) == f"1,20{_TS}$"
+    # NULL -> config-price estimate with `~`: 1M×3/1M + 100k×15/1M = 4.50.
+    assert dash._fmt_row_cost(denv.cfg, row()) == f"~4,50{_TS}$"
+    # NULL + missing pricing key -> explicit marker, never zero.
+    assert dash._fmt_row_cost(denv.cfg, row(model="model-fara-pret")) == dash.RO[
+        "missing_price"
+    ]
+    # estimated=1 keeps the `~` even over an exact cost.
+    assert dash._fmt_row_cost(denv.cfg, row(cost_usd=1.2, estimated=True)) == f"~1,20{_TS}$"
+    # NULL token counts estimate as zero flow, not a crash.
+    assert (
+        dash._fmt_row_cost(denv.cfg, row(tokens_in=None, tokens_out=None))
+        == f"~0,00{_TS}$"
+    )
+
+
+def test_pair_never_merged_totals_summaries_factory_line_and_phase_rows(denv) -> None:
+    """§11.2 (F8/F11/F3): every total renders «exact + ~estimat» as SEPARATE
+    addends — running cell, plan stage cell (+ «detalii →» link), phase header
+    (INCLUDING the phase's own unit_level='phase' rows) and the §2b factory
+    line + «Astăzi» in the Buget block."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)  # ph.b, BUILD
+    # Stage ph.b: one exact row + one NULL-cost row estimated from config.
+    _seed_ledger_row(denv, unit_id="ph.b", model="sonnet", cost_usd=1.2)
+    _seed_ledger_row(
+        denv,
+        unit_id="ph.b",
+        role="validator",
+        model="fable",
+        tokens_in=1_000_000,
+        tokens_out=100_000,
+        cost_usd=None,
+    )  # 10 + 5 = ~15,00 $
+    # The phase's OWN ledger row (the PLANNING agent, F3).
+    _seed_ledger_row(
+        denv, unit_level="phase", unit_id="ph", role="phase_architect",
+        model="fable", cost_usd=0.5,
+    )
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+
+    stage_pair = f"1,20{_TS}$ + ~15,00{_TS}$"
+    phase_pair = f"1,70{_TS}$ + ~15,00{_TS}$"  # 1,20 + 0,50 exact; phase rows IN
+    # Running table: the right-aligned cost column carries the stage pair.
+    assert f"<td class='num'>{stage_pair}</td>" in page
+    # Plan stage row: pair + the «detalii →» link to the /costuri anchor.
+    assert f"{stage_pair} <a href='/costuri#ph.b'>{dash.RO['cost_details']}</a>" in page
+    # Phase header: the phase total INCLUDES the phase-level row (1,70 not 1,20).
+    assert phase_pair in page
+    # §2b factory line + «Astăzi» (rows recorded now -> today == lifetime).
+    assert f"{dash.RO['budget_cost']}: {phase_pair}" in page
+    assert f"{dash.RO['budget_today']}: {phase_pair}" in page
+    # NEVER merged: no cell anywhere shows the blended sums.
+    for merged in (f"16,70{_TS}$", f"16,20{_TS}$", f"4,70{_TS}$"):
+        assert merged not in page
+
+    # /costuri renders the same pairs: stage total row + phase header (F3).
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    assert stage_pair in costs_page
+    assert phase_pair in costs_page
+    assert f"16,70{_TS}$" not in costs_page and f"16,20{_TS}$" not in costs_page
+    # The phase-agents table exists and carries the glossed planning role.
+    assert dash.RO["costs_phase_agents"] in costs_page
+    assert "arhitectul de fază (phase_architect)" in costs_page
+
+
+def test_missing_price_marker_never_silent_zero_on_pages(denv) -> None:
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    _seed_ledger_row(denv, unit_id="ph.b", model="model-fara-pret", cost_usd=None)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["missing_price"] in page
+    assert f"0,00{_TS}$" not in page  # the gap is named, never zeroed
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    assert dash.RO["missing_price"] in costs_page
+    assert f"0,00{_TS}$" not in costs_page
+
+
+def test_costuri_per_agent_rows_id_order_glossed_and_recorded_at(denv) -> None:
+    """§11.2 (F7): one row per ledger entry, ordered by ledger id (a re-run role
+    appears twice — the truth of what was spent); role/model glossed (R2),
+    recorded_at displayed (R4), numeric columns right-aligned, total row last."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    _seed_ledger_row(
+        denv, unit_id="ph.b", role="builder_routine", model="sonnet",
+        cost_usd=1.0, recorded_at="2026-06-12T08:00:00Z",
+    )
+    _seed_ledger_row(
+        denv, unit_id="ph.b", role="validator", model="sonnet",
+        cost_usd=2.0, recorded_at="2026-06-12T08:00:00Z",  # same second: id orders
+    )
+    _seed_ledger_row(
+        denv, unit_id="ph.b", role="builder_routine", model="sonnet",
+        cost_usd=3.0, recorded_at="2026-06-12T08:00:00Z",
+    )
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    # Anchor = the «detalii →» landing.
+    assert "id='ph.b'" in costs_page
+    # Header row: glossed columns, numerics right-aligned.
+    assert (
+        f"<th>{dash.RO['col_agent']}</th><th>{dash.RO['col_model']}</th>"
+        f"<th class='num'>{dash.RO['col_tokens_in']}</th>"
+        f"<th class='num'>{dash.RO['col_tokens_out']}</th>"
+        f"<th class='num'>{dash.RO['col_cost']}</th>" in costs_page
+    )
+    # One row per ledger entry in id order: 1,00 / 2,00 / 3,00.
+    first = costs_page.index(f"1,00{_TS}$")
+    second = costs_page.index(f"2,00{_TS}$")
+    third = costs_page.index(f"3,00{_TS}$")
+    assert first < second < third
+    # The re-run role renders twice; both roles and the model are glossed.
+    assert costs_page.count("constructor (etape ușoare) (builder_routine)") == 2
+    assert "validator (validator)" in costs_page
+    assert "Claude Sonnet (sonnet)" in costs_page
+    # recorded_at displayed in founder format (R4: 08:00Z -> 11:00 Chisinau EEST).
+    assert "12-06-2026 11:00" in costs_page
+    # Total row last, as the pair (all-exact here -> single exact addend).
+    total_at = costs_page.index(dash.RO["cost_total_row"])
+    assert total_at > third
+    assert f"6,00{_TS}$" in costs_page
+
+
+def test_astazi_line_uses_founder_tz_midnight_cut(denv) -> None:
+    """§11.2 (F5): «Astăzi» sums rows with recorded_at >= founder-TZ midnight
+    converted to UTC — a 23:59-local-yesterday row is OUT, 00:30-local is IN."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    now = "2026-06-12T10:00:00Z"  # 13:00 Chisinau (EEST) -> cut 2026-06-11T21:00:00Z
+    _seed_ledger_row(
+        denv, unit_id="ph.b", cost_usd=5.0, recorded_at="2026-06-11T20:59:00Z"
+    )  # yesterday, founder time
+    _seed_ledger_row(
+        denv, unit_id="ph.b", cost_usd=0.25, recorded_at="2026-06-11T21:30:00Z"
+    )  # 00:30 founder time — today
+    _seed_ledger_row(
+        denv, unit_id="ph.b", cost_usd=0.5, recorded_at="2026-06-12T09:00:00Z"
+    )
+    view = dash.build_view(denv.cfg, now=now)
+    assert view.health.today_cost == dash.CostSummary(exact_usd=0.75)
+    assert view.health.factory_cost.exact_usd == pytest.approx(5.75)
+    page = dash.render_page(view, denv.cfg)
+    assert f"{dash.RO['budget_today']}: 0,75{_TS}$" in page
+    assert f"{dash.RO['budget_cost']}: 5,75{_TS}$" in page
+
+    # Nothing recorded today -> an explicit exact zero, not a missing line
+    # (zero rows since the cut IS exactly zero recorded spend).
+    with denv.db.transaction() as conn:
+        conn.execute(
+            "DELETE FROM token_ledger WHERE recorded_at >= ?", ("2026-06-11T21:00:00Z",)
+        )
+    view = dash.build_view(denv.cfg, now=now)
+    assert view.health.today_cost.empty
+    page = dash.render_page(view, denv.cfg)
+    assert f"{dash.RO['budget_today']}: 0,00{_TS}$" in page
+
+
+async def test_costuri_route_refresh_free_read_only_no_inputs(denv) -> None:
+    """§11.2 (F2): /costuri is the stateful reading surface — NO meta-refresh
+    (pinned like the session page), NO inputs of any kind, read-only over HTTP
+    with the base CSP (zero JS)."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    _seed_ledger_row(denv, unit_id="ph.b", cost_usd=1.2)
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        status, headers, body = await asyncio.to_thread(
+            _http, "GET", f"http://{host}:{port}/costuri"
+        )
+        assert status == 200
+        csp = headers["Content-Security-Policy"]
+        for directive in (
+            "default-src 'none'",
+            "style-src 'unsafe-inline'",
+            "form-action 'self'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+        ):
+            assert directive in csp
+        assert "script-src" not in csp  # zero JS, like the main page
+        assert "http-equiv" not in body  # NO meta-refresh — the F2 pin
+        for forbidden in ("<form", "<input", "<textarea", "<button", "<script"):
+            assert forbidden not in body
+        assert "id='ph.b'" in body  # the «detalii →» anchor target
+        assert f"<a href='/'>{dash.RO['back_to_dashboard']}</a>" in body
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+def test_pending_stage_no_cost_row_no_link_no_anchor(denv) -> None:
+    _seed_unit(denv)
+    _seed_build_stage(denv)  # has ledger rows
+    _seed_build_stage(denv, "ph.todo", state=StageState.PENDING)  # no rows
+    _seed_ledger_row(denv, unit_id="ph.b", cost_usd=1.2)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "/costuri#ph.b" in page
+    assert "/costuri#ph.todo" not in page  # §11.4: PENDING -> no cost row/link
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    assert "id='ph.b'" in costs_page
+    assert "id='ph.todo'" not in costs_page
+
+
+def test_cost_legend_renders_iff_any_cost_cell_does(denv) -> None:
+    _seed_unit(denv)
+    # No ledger rows anywhere: no cost cells -> no legend, no «Astăzi», no
+    # factory cost part; /costuri shows the explicit empty notice instead.
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["cost_legend"] not in page
+    assert dash.RO["budget_today"] not in page
+    assert f"{dash.RO['budget_cost']}:" not in page
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    assert dash.RO["cost_legend"] not in costs_page
+    assert dash.RO["costs_none"] in costs_page
+    # One ledger row -> cost cells exist -> the legend renders on BOTH pages.
+    _seed_ledger_row(denv, unit_id="ph.s1", cost_usd=0.1)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["cost_legend"] in page
+    costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
+    assert dash.RO["cost_legend"] in costs_page
+    assert dash.RO["costs_none"] not in costs_page
+
+
+def test_gloss_closure_role_keys_and_model_tokens(real_config_path) -> None:
+    """§11.4 (F6) closure extension: role keys = the golden config's models.*
+    keys; model tokens = the routes' model strings + the pricing table keys."""
+    golden = load_config(real_config_path)
+    for role in golden.models:
+        assert role in dash.GLOSS, role
+    model_tokens = {route.model for route in golden.models.values()} | set(
+        golden.pricing.usd_per_mtok
+    )
+    for token in model_tokens:
+        assert token in dash.GLOSS, token
+    assert dash.GLOSS["default"] == "codex — model implicit"
+    # The §11 forward gloss for the follow-up slice's escalation trigger — added
+    # now so the trigger never renders bare when that slice lands.
+    assert dash.GLOSS["agent_run_failed"] == (
+        "agentul a eșuat la rulare (oprire fără rezultat)"
+    )

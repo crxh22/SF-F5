@@ -122,6 +122,24 @@ class TestGoldenRealConfig:
         assert all(s and s == s.lower() for s in signatures)
         assert "usage limit" in signatures
 
+    def test_pricing_table_structure(self, cfg: FactoryConfig):
+        # CCR-10 (dashboard design §11.1): pricing.usd_per_mtok keyed by LEDGER
+        # model strings — VALUES are founder-tunable, the structure is not. The
+        # claude route models + 'default' (codex ledger rows) must be priced so
+        # NULL-cost rows estimate instead of hitting the missing-price marker;
+        # 'opus-4-8' is the D-0025 downshift reservation (F10: dead-config
+        # comment, not a route).
+        table = cfg.pricing.usd_per_mtok
+        route_models = {
+            route.model for route in cfg.models.values() if route.cli == "claude"
+        }
+        assert route_models <= set(table)
+        assert "default" in table  # codex ledger rows record model 'default'
+        assert "opus-4-8" in table
+        for model, price in table.items():
+            assert price.input > 0, model
+            assert price.output > 0, model
+
 
 # --------------------------------------------------------- minimal fixture config
 
@@ -236,6 +254,30 @@ class TestSchemaRejection:
         # uppercase signature would silently never match (fail-explicit at load).
         config_dict["founder_channel"]["usage_limit_signatures"] = ["Rate Limit"]
         _expect_config_error(tmp_path, config_dict, match="lowercase")
+
+    # ------------------------------------------------------- CCR-10: pricing
+
+    def test_pricing_optional_default_empty(self, config_dict):
+        # §11.3.1: pricing is an OPTIONAL top-level section, default empty —
+        # the minimal fixture carries none and must keep validating.
+        assert "pricing" not in config_dict
+        cfg = FactoryConfig.model_validate(config_dict)
+        assert cfg.pricing.usd_per_mtok == {}
+
+    def test_pricing_nonpositive_price_rejected(self, tmp_path, config_dict):
+        config_dict["pricing"] = {"usd_per_mtok": {"fable": {"input": 0, "output": 50}}}
+        _expect_config_error(tmp_path, config_dict)
+        config_dict["pricing"] = {"usd_per_mtok": {"fable": {"input": 10, "output": -1}}}
+        _expect_config_error(tmp_path, config_dict)
+
+    def test_pricing_unknown_key_rejected(self, tmp_path, config_dict):
+        # extra='forbid' on both PricingCfg and ModelPrice.
+        config_dict["pricing"] = {"usd_per_mtok": {}, "currency": "EUR"}
+        _expect_config_error(tmp_path, config_dict)
+        config_dict["pricing"] = {
+            "usd_per_mtok": {"fable": {"input": 10, "output": 50, "cached": 1}}
+        }
+        _expect_config_error(tmp_path, config_dict)
 
 
 # ----------------------------------------------------------- §4 cross-checks

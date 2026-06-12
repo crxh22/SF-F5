@@ -1,7 +1,10 @@
 """Founder dashboard — the orchestrator's founder surface (dashboard design
 v1.1 D-0017; §10 founder-channel UX slice v1.2 D-0027: :root token visual
 system, tables over bullets, the open-escalations block, options-above-body
-cards, the ANSWERED confirmation page, session-page-only textarea).
+cards, the ANSWERED confirmation page, session-page-only textarea; §11
+per-stage agent cost breakdown v1.3 CCR-10: cost pairs on the main page, the
+«Astăzi» line, and the refresh-free read-only ``GET /costuri`` per-agent
+tables — exact-where-reported, ``~``-estimate-where-not, never merged).
 
 In-process module owned by the ``Scheduler`` (design §1): stdlib
 ``ThreadingHTTPServer`` worker threads supervised by an asyncio task. GET
@@ -40,7 +43,7 @@ import threading
 import time
 import traceback
 import urllib.parse
-from collections.abc import Coroutine, Mapping
+from collections.abc import Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -114,7 +117,20 @@ RO: Mapping[str, str] = {
     "budget_total": "Total fabrică",
     "budget_tokens": "tokeni",
     "budget_estimated_part": "din care estimat",
-    "budget_cost": "cost raportat",
+    "budget_cost": "cost",
+    "budget_today": "Astăzi",
+    "missing_price": "— (preț lipsă în config)",
+    "cost_details": "detalii →",
+    "cost_total_row": "Total",
+    "cost_legend": (
+        "costurile = raportate exact de CLI (includ reducerile de cache); "
+        "~ = estimare din prețurile din config; sumele sunt echivalent-API "
+        "(abonamentul se facturează separat); agentul în lucru apare la "
+        "finalul rulării sale"
+    ),
+    "costs_title": "Costuri pe agenți",
+    "costs_phase_agents": "agenți de fază",
+    "costs_none": "nicio cheltuială înregistrată încă",
     "incident_label": "Ultimul incident",
     "incident_none": "niciun incident înregistrat",
     "decisions_none": "Nicio decizie în așteptare — fabrica merge singură.",
@@ -154,6 +170,11 @@ RO: Mapping[str, str] = {
     "col_kind": "Tip",
     "col_file": "Fișier",
     "col_when": "Când",
+    "col_cost": "Cost",
+    "col_agent": "Agent",
+    "col_model": "Model",
+    "col_tokens_in": "Tokeni intrare",
+    "col_tokens_out": "Tokeni ieșire",
     "no_buttons_notice": (
         "Acest tip de decizie nu are încă butoane de răspuns în panou — "
         "răspunde din terminal cu comanda de urgență „cli decide” "
@@ -303,6 +324,9 @@ GLOSS: Mapping[str, str] = {
     "artifact_contract": "artefact neconform cu contractul",
     "child_failed": "o etapă din fază a eșuat",
     "integration_conflict": "conflict la integrare",
+    # introduced by a follow-up slice (glossed now with §11 so the trigger never
+    # renders bare — the closure tests are one-directional, token -> gloss)
+    "agent_run_failed": "agentul a eșuat la rulare (oprire fără rezultat)",
     # escalation targets (DDL CHECK set, §10.4 — who handles it)
     "phase_architect": "arhitectul de fază",
     "main_architect": "arhitectul principal",
@@ -329,6 +353,27 @@ GLOSS: Mapping[str, str] = {
     "contest_rationale": "motivație de contestare",
     "transcript": "transcript de sesiune",
     "tier1_conflict": "conflict la integrare (nivel 1)",
+    # agent roles (§11/F6: the golden config's models.* keys are the closure
+    # source — roles are config-defined, not enum-defined; rendered by the
+    # /costuri per-agent tables. phase_architect/main_architect/founder are
+    # glossed above as escalation targets, one gloss per token.)
+    "spec_agent": "agent de specificații",
+    "builder_routine": "constructor (etape ușoare)",
+    "builder_heavy": "constructor (etape grele)",
+    "validator": "validator",
+    "validator_structural": "validator structural",
+    "integration_validator": "validator de integrare",
+    "auditor_same_model": "auditor (același model)",
+    "auditor_cross_model": "auditor încrucișat (codex)",
+    "cp1_triage": "triaj CP-1",
+    "decision_session": "sesiune de decizie",
+    # ledger model tokens (§11/F6: models.*.model values + pricing.usd_per_mtok
+    # keys; codex rows record 'default' — the §11.5.4 attribution watch item)
+    "fable": "Claude Fable",
+    "sonnet": "Claude Sonnet",
+    "haiku": "Claude Haiku",
+    "opus-4-8": "Claude Opus 4.8",
+    "default": "codex — model implicit",
 }
 
 #: §10.2 state -> chip category (running=accent, blocked/awaiting=warn,
@@ -384,6 +429,18 @@ def _fmt_int(value: int) -> str:
     return f"{int(value):,}".replace(",", ".")
 
 
+_THIN_SPACE = " "  # §11.2 _fmt_usd: thin space before the '$'
+
+
+def _fmt_usd(value: float) -> str:
+    """§11.2 money format: two decimals, Romanian decimal COMMA (thousands
+    grouped with dots, R4), thin space + '$'; sub-cent non-zero -> '<0,01 $'."""
+    if 0 < value < 0.01:
+        return f"<0,01{_THIN_SPACE}$"
+    grouped = f"{value:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+    return f"{grouped}{_THIN_SPACE}$"
+
+
 def _age_seconds(utc_iso: str, now_iso: str) -> int:
     then = datetime.strptime(utc_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     now = datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
@@ -399,6 +456,15 @@ def _age_text(seconds: int) -> str:
     if seconds < 86400:
         return f"{RO['ago_word']} {seconds // 3600}{RO['hours_short']}"
     return f"{RO['ago_word']} {seconds // 86400} {RO['days_short']}"
+
+
+def _founder_day_start_utc(now_iso: str, tz: str) -> str:
+    """Founder-TZ midnight of `now`'s local day, converted to ISO-UTC — the
+    «Astăzi» ledger cut (§11.2, F5): the founder's day, never the UTC day."""
+    moment = datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    local = moment.astimezone(ZoneInfo(tz))
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _glossed(token: str) -> str:
@@ -590,6 +656,169 @@ def _artifact_text(cfg: FactoryConfig, conn: sqlite3.Connection, ref: sqlite3.Ro
     raise DashboardError(f"artifact {ref['id']} unresolved at {ref['repo']}:{ref['path']}")
 
 
+# ------------------------------------------------------------ §11 cost shapes
+# CCR-10 (design §11): per-stage agent cost breakdown over token_ledger. The
+# honesty rule (Doctrine §21, §11.1): cost_usd non-NULL renders EXACT as-is
+# (the CLI's own cache-aware figure); NULL estimates from pricing.usd_per_mtok
+# with a `~` prefix; NULL cost + missing pricing key renders the explicit
+# missing-price marker, never a silent zero; exact and estimated sums always
+# form a PAIR — never merged, including every summary line (F8).
+
+
+@dataclass(frozen=True)
+class CostSummary:
+    """Exact/estimated cost pair for one scope (unit, phase, day, factory)."""
+
+    exact_usd: float | None = None  # None = no CLI-reported-cost rows in scope
+    est_usd: float | None = None  # None = no estimable NULL-cost rows in scope
+    missing_price: bool = False  # NULL-cost rows whose model has no pricing key
+
+    @property
+    def empty(self) -> bool:
+        """True = NO cost cell renders for this scope (e.g. a PENDING stage)."""
+        return self.exact_usd is None and self.est_usd is None and not self.missing_price
+
+
+_NO_COST = CostSummary()
+
+
+@dataclass(frozen=True)
+class AgentCostRow:
+    """One token_ledger row — a /costuri per-agent table row (§11.2; F7:
+    ordered by ledger id, recorded_at displayed)."""
+
+    ledger_id: int
+    role: str
+    model: str
+    tokens_in: int | None
+    tokens_out: int | None
+    cost_usd: float | None
+    estimated: bool  # token counts estimated (bytes/4 fallback) -> keeps `~`
+    recorded_at: str
+
+
+@dataclass(frozen=True)
+class StageCosts:
+    """/costuri: one stage's per-agent table (anchor id=<stage_id>)."""
+
+    stage_id: str
+    name: str
+    rows: tuple[AgentCostRow, ...]
+    total: CostSummary
+
+
+@dataclass(frozen=True)
+class PhaseCosts:
+    """/costuri: one phase bloc — the total INCLUDES the phase's own
+    unit_level='phase' ledger rows (F3: the PLANNING agent is an involved
+    agent; stage-only derivation silently drops its spend)."""
+
+    phase_id: str
+    name: str
+    phase_rows: tuple[AgentCostRow, ...]
+    stages: tuple[StageCosts, ...]
+    total: CostSummary
+
+
+@dataclass(frozen=True)
+class CostsView:
+    """Pure render input of GET /costuri (read-only, refresh-free)."""
+
+    generated_at: str
+    phases: tuple[PhaseCosts, ...]
+
+
+def _estimate_usd(
+    cfg: FactoryConfig, model: str, tokens_in: int, tokens_out: int
+) -> float | None:
+    """§11.1 estimation: tokens/1e6 × pricing.usd_per_mtok.<model>; None when
+    the model has no pricing key (the caller renders the explicit marker)."""
+    price = cfg.pricing.usd_per_mtok.get(model)
+    if price is None:
+        return None
+    return tokens_in / 1e6 * price.input + tokens_out / 1e6 * price.output
+
+
+def _summary_from_groups(cfg: FactoryConfig, groups: Iterable[sqlite3.Row]) -> CostSummary:
+    """db.sum_token_cost group rows -> CostSummary (§11.1 precedence)."""
+    exact: float | None = None
+    est: float | None = None
+    missing = False
+    for group in groups:
+        if group["exact_usd"] is not None:
+            exact = (exact or 0.0) + float(group["exact_usd"])
+        if group["null_cost_rows"]:
+            estimate = _estimate_usd(
+                cfg,
+                group["model"],
+                int(group["est_tokens_in"]),
+                int(group["est_tokens_out"]),
+            )
+            if estimate is None:
+                missing = True
+            else:
+                est = (est or 0.0) + estimate
+    return CostSummary(exact, est, missing)
+
+
+def _summary_from_rows(cfg: FactoryConfig, rows: Iterable[AgentCostRow]) -> CostSummary:
+    """AgentCostRow sequence -> CostSummary (same §11.1 precedence per row)."""
+    exact: float | None = None
+    est: float | None = None
+    missing = False
+    for row in rows:
+        if row.cost_usd is not None:
+            exact = (exact or 0.0) + float(row.cost_usd)
+            continue
+        estimate = _estimate_usd(cfg, row.model, row.tokens_in or 0, row.tokens_out or 0)
+        if estimate is None:
+            missing = True
+        else:
+            est = (est or 0.0) + estimate
+    return CostSummary(exact, est, missing)
+
+
+def _combine_summaries(parts: Iterable[CostSummary]) -> CostSummary:
+    """Sum pairs componentwise — exact and estimated NEVER cross (F8)."""
+    exact: float | None = None
+    est: float | None = None
+    missing = False
+    for part in parts:
+        if part.exact_usd is not None:
+            exact = (exact or 0.0) + part.exact_usd
+        if part.est_usd is not None:
+            est = (est or 0.0) + part.est_usd
+        missing = missing or part.missing_price
+    return CostSummary(exact, est, missing)
+
+
+def _fmt_cost_pair(summary: CostSummary) -> str:
+    """«12,40 $ + ~0,85 $» — the exact part, the `~` estimated part and the
+    missing-price marker as SEPARATE addends (F8); '' when nothing is in scope
+    (no cost cell renders — §11.4 PENDING case)."""
+    parts: list[str] = []
+    if summary.exact_usd is not None:
+        parts.append(_fmt_usd(summary.exact_usd))
+    if summary.est_usd is not None:
+        parts.append(f"~{_fmt_usd(summary.est_usd)}")
+    if summary.missing_price:
+        parts.append(RO["missing_price"])
+    return " + ".join(parts)
+
+
+def _fmt_row_cost(cfg: FactoryConfig, row: AgentCostRow) -> str:
+    """One ledger row's cost cell (§11.1): non-NULL cost_usd -> exact as-is;
+    NULL -> `~` config-price estimate; NULL + missing key -> explicit marker;
+    estimated=1 token counts keep the `~` regardless of cost source."""
+    if row.cost_usd is not None:
+        text = _fmt_usd(row.cost_usd)
+        return f"~{text}" if row.estimated else text
+    estimate = _estimate_usd(cfg, row.model, row.tokens_in or 0, row.tokens_out or 0)
+    if estimate is None:
+        return RO["missing_price"]
+    return f"~{_fmt_usd(estimate)}"
+
+
 # --------------------------------------------------------------- view shapes
 # Constituents of DashboardView per its frozen §6 docstring ("decision cards,
 # health strip, plan rows — assembled, pre-glossed").
@@ -642,6 +871,7 @@ class RunningStage:
     state: str
     risk_class: str
     tokens: int
+    cost: CostSummary = _NO_COST  # §11.2: the right-aligned cost pair
 
 
 @dataclass(frozen=True)
@@ -707,7 +937,11 @@ class HealthStrip:
     budgets: tuple[BudgetRow, ...]
     total_tokens: int
     total_estimated_tokens: int
-    total_cost_usd: float
+    #: §11.2 (F11): the factory lifetime cost as the exact/estimated PAIR —
+    #: a merged SUM made codex spend invisible.
+    factory_cost: CostSummary
+    #: §11.2 (F5): «Astăzi» — ledger rows since founder-TZ midnight (UTC cut).
+    today_cost: CostSummary
     incident: Incident | None
     escalations: tuple[EscalationRow, ...]
     last_resolved: ResolvedEscalation | None
@@ -721,6 +955,9 @@ class PlanStage:
     name: str
     state: str
     risk_class: str
+    #: §11.2: cost pair + «detalii →» link to /costuri#<stage_id> when the
+    #: stage has ledger rows; empty for PENDING stages (no cost row/link).
+    cost: CostSummary = _NO_COST
 
 
 @dataclass(frozen=True)
@@ -734,6 +971,9 @@ class PlanPhase:
     running: tuple[PlanStage, ...]
     pending: tuple[PlanStage, ...]
     plan_artifact_id: int | None
+    #: §11.2 phase total pair = stage rows + the phase's OWN unit_level='phase'
+    #: ledger rows (F3 — matches the figure `status` shows the founder).
+    cost: CostSummary = _NO_COST
 
 
 @dataclass(frozen=True)
@@ -876,8 +1116,21 @@ def _phase_dag_order(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return [by_id[pid] for pid in ordered]
 
 
+def _cost_buckets(
+    cfg: FactoryConfig, conn: sqlite3.Connection
+) -> dict[tuple[str, str], CostSummary]:
+    """One §11 ledger aggregate pass -> per-(unit_level, unit_id) cost pair."""
+    grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for group in fdb.sum_token_cost(conn):
+        grouped.setdefault((group["unit_level"], group["unit_id"]), []).append(group)
+    return {key: _summary_from_groups(cfg, groups) for key, groups in grouped.items()}
+
+
 def _build_health(
-    cfg: FactoryConfig, conn: sqlite3.Connection, now: str
+    cfg: FactoryConfig,
+    conn: sqlite3.Connection,
+    now: str,
+    costs: Mapping[tuple[str, str], CostSummary],
 ) -> HealthStrip:
     liveness = _resolve(cfg.factory.home, cfg.process.liveness_file)
     threshold = float(cfg.founder_channel.watchdog.staleness_threshold_s)
@@ -939,6 +1192,7 @@ def _build_health(
                     state=state,
                     risk_class=srow["risk_class"],
                     tokens=tokens,
+                    cost=costs.get((Level.STAGE.value, srow["id"]), _NO_COST),
                 )
             )
         elif category is SchedCategory.WAITING:
@@ -957,13 +1211,22 @@ def _build_health(
             )
 
     totals = conn.execute(
-        "SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0) AS tokens,"
-        " COALESCE(SUM(cost_usd), 0) AS cost FROM token_ledger"
+        "SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0) AS tokens"
+        " FROM token_ledger"
     ).fetchone()
     estimated = conn.execute(
         "SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0) AS tokens"
         " FROM token_ledger WHERE estimated = 1"
     ).fetchone()
+    # §11.2: the factory lifetime PAIR (F11) and the founder's-day pair (F5 —
+    # founder-TZ midnight converted to a UTC ledger cut).
+    factory_cost = _combine_summaries(costs.values())
+    today_cost = _summary_from_groups(
+        cfg,
+        fdb.sum_token_cost(
+            conn, since=_founder_day_start_utc(now, cfg.factory.timezone_founder)
+        ),
+    )
 
     placeholders = ",".join("?" for _ in INCIDENT_EVENT_TYPES)
     incident_row = conn.execute(
@@ -1039,14 +1302,17 @@ def _build_health(
         budgets=tuple(budgets),
         total_tokens=int(totals["tokens"]),
         total_estimated_tokens=int(estimated["tokens"]),
-        total_cost_usd=float(totals["cost"]),
+        factory_cost=factory_cost,
+        today_cost=today_cost,
         incident=incident,
         escalations=tuple(escalations),
         last_resolved=last_resolved,
     )
 
 
-def _build_plan(conn: sqlite3.Connection) -> tuple[PlanPhase, ...]:
+def _build_plan(
+    conn: sqlite3.Connection, costs: Mapping[tuple[str, str], CostSummary]
+) -> tuple[PlanPhase, ...]:
     plan: list[PlanPhase] = []
     stage_rows = conn.execute("SELECT * FROM stages ORDER BY created_at, id").fetchall()
     by_phase: dict[str, list[sqlite3.Row]] = {}
@@ -1056,12 +1322,16 @@ def _build_plan(conn: sqlite3.Connection) -> tuple[PlanPhase, ...]:
         done: list[PlanStage] = []
         running: list[PlanStage] = []
         pending: list[PlanStage] = []
+        stage_costs: list[CostSummary] = []
         for srow in by_phase.get(prow["id"], ()):
+            stage_cost = costs.get((Level.STAGE.value, srow["id"]), _NO_COST)
+            stage_costs.append(stage_cost)
             stage = PlanStage(
                 stage_id=srow["id"],
                 name=srow["name"],
                 state=srow["state"],
                 risk_class=srow["risk_class"],
+                cost=stage_cost,
             )
             if srow["state"] == "DONE":
                 done.append(stage)
@@ -1080,6 +1350,10 @@ def _build_plan(conn: sqlite3.Connection) -> tuple[PlanPhase, ...]:
                 running=tuple(running),
                 pending=tuple(pending),
                 plan_artifact_id=prow["plan_artifact_id"],
+                # F3: phase total = stage rows + the phase's OWN ledger rows.
+                cost=_combine_summaries(
+                    [costs.get((Level.PHASE.value, prow["id"]), _NO_COST), *stage_costs]
+                ),
             )
         )
     return tuple(plan)
@@ -1099,11 +1373,85 @@ def build_view(cfg: FactoryConfig, *, now: str | None = None) -> DashboardView:
                 cards.append(_build_card(cfg, conn, dr, moment))
             except Exception as exc:  # noqa: BLE001 — §2a per-card containment
                 cards.append(_error_card(dr, exc))
-        health = _build_health(cfg, conn, moment)
-        plan = _build_plan(conn)
+        costs = _cost_buckets(cfg, conn)
+        health = _build_health(cfg, conn, moment, costs)
+        plan = _build_plan(conn, costs)
     finally:
         db.close()
     return DashboardView(generated_at=moment, cards=tuple(cards), health=health, plan=plan)
+
+
+def _ledger_rows(
+    conn: sqlite3.Connection, unit_level: str, unit_id: str
+) -> tuple[AgentCostRow, ...]:
+    """db.list_token_ledger rows -> AgentCostRow tuple (id order, F7)."""
+    return tuple(
+        AgentCostRow(
+            ledger_id=int(row["id"]),
+            role=row["role"],
+            model=row["model"],
+            tokens_in=row["tokens_in"],
+            tokens_out=row["tokens_out"],
+            cost_usd=row["cost_usd"],
+            estimated=bool(row["estimated"]),
+            recorded_at=row["recorded_at"],
+        )
+        for row in fdb.list_token_ledger(conn, unit_level, unit_id)
+    )
+
+
+def build_costs_view(cfg: FactoryConfig, *, now: str | None = None) -> CostsView:
+    """Assemble GET /costuri (§11.2, CCR-10) from a fresh mode=ro connection —
+    same read path as build_view, never the orchestrator's rw connection, never
+    writes. One PhaseCosts per phase with ledger rows (phase-level or stage-
+    level); units without rows render nothing (§11.4 PENDING case)."""
+    moment = now or utc_now()
+    db = _open_ro(cfg)
+    try:
+        conn = db.read()
+        units_with_rows = {
+            (group["unit_level"], group["unit_id"]) for group in fdb.sum_token_cost(conn)
+        }
+        by_phase: dict[str, list[sqlite3.Row]] = {}
+        for srow in conn.execute("SELECT * FROM stages ORDER BY created_at, id").fetchall():
+            by_phase.setdefault(srow["phase_id"], []).append(srow)
+        phases: list[PhaseCosts] = []
+        for prow in _phase_dag_order(conn):
+            phase_rows: tuple[AgentCostRow, ...] = (
+                _ledger_rows(conn, Level.PHASE.value, prow["id"])
+                if (Level.PHASE.value, prow["id"]) in units_with_rows
+                else ()
+            )
+            stages: list[StageCosts] = []
+            for srow in by_phase.get(prow["id"], ()):
+                if (Level.STAGE.value, srow["id"]) not in units_with_rows:
+                    continue  # no ledger rows -> no table, no anchor (§11.4)
+                rows = _ledger_rows(conn, Level.STAGE.value, srow["id"])
+                stages.append(
+                    StageCosts(
+                        stage_id=srow["id"],
+                        name=srow["name"],
+                        rows=rows,
+                        total=_summary_from_rows(cfg, rows),
+                    )
+                )
+            if not phase_rows and not stages:
+                continue
+            phases.append(
+                PhaseCosts(
+                    phase_id=prow["id"],
+                    name=prow["name"],
+                    phase_rows=phase_rows,
+                    stages=tuple(stages),
+                    # F3: the pair includes the phase's own PLANNING-agent rows.
+                    total=_combine_summaries(
+                        [_summary_from_rows(cfg, phase_rows), *(s.total for s in stages)]
+                    ),
+                )
+            )
+    finally:
+        db.close()
+    return CostsView(generated_at=moment, phases=tuple(phases))
 
 
 # -------------------------------------------------------------------- render
@@ -1384,16 +1732,20 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         )
 
     if health.running_stages:
+        # §11.2: the cost column (right-aligned, after tokens) carries the
+        # exact/estimated pair; empty when the stage has no ledger rows.
         running_rows = "".join(
             f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
             f"<td>{_chip(st.state)}</td>"
             f"<td>{esc(_glossed(st.risk_class))}</td>"
-            f"<td class='num'>{esc(_fmt_int(st.tokens))}</td></tr>"
+            f"<td class='num'>{esc(_fmt_int(st.tokens))}</td>"
+            f"<td class='num'>{esc(_fmt_cost_pair(st.cost))}</td></tr>"
             for st in health.running_stages
         )
         running_body = _table(
             f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_step'])}</th>"
-            f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_tokens'])}</th>",
+            f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_tokens'])}</th>"
+            f"<th class='num'>{esc(RO['col_cost'])}</th>",
             running_rows,
         )
     else:
@@ -1434,11 +1786,22 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if health.total_estimated_tokens
         else ""
     )
+    # §11.2: factory lifetime cost as the PAIR (F11) + the «Astăzi» day line
+    # (F5); both render only when any ledger row exists — the same condition
+    # under which the §11 legend renders (no cost cells, no legend).
+    costs_present = not health.factory_cost.empty
     cost_part = (
-        f" · {esc(RO['budget_cost'])}: {health.total_cost_usd:.2f} USD"
-        if health.total_cost_usd
+        f" · {esc(RO['budget_cost'])}: {esc(_fmt_cost_pair(health.factory_cost))}"
+        if costs_present
         else ""
     )
+    today_line = (
+        f"<p class='meta'>{esc(RO['budget_today'])}:"
+        f" {esc(_fmt_cost_pair(health.today_cost) or _fmt_usd(0.0))}</p>"
+        if costs_present
+        else ""
+    )
+    legend = f"<p class='meta'>{esc(RO['cost_legend'])}</p>" if costs_present else ""
     budget_table = (
         _table(
             f"<th>{esc(RO['col_stage'])}</th><th class='num'>{esc(RO['col_burn'])}</th>"
@@ -1455,7 +1818,8 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
             f"{budget_table}"
             f"<p class='meta'>{esc(RO['budget_total'])}:"
             f" {esc(_fmt_int(health.total_tokens))} {esc(RO['budget_tokens'])}"
-            f"{estimated_part}{cost_part}</p>",
+            f"{estimated_part}{cost_part}</p>"
+            f"{today_line}{legend}",
         )
     )
 
@@ -1482,6 +1846,18 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     )
 
 
+def _stage_cost_cell(stage: PlanStage) -> str:
+    """§11.2 plan-row cost cell: the pair + the «detalii →» link to the stage's
+    /costuri anchor when ledger rows exist; EMPTY for a PENDING (no-ledger)
+    stage — no cost row, no link (§11.4)."""
+    if stage.cost.empty:
+        return ""
+    return (
+        f"{esc(_fmt_cost_pair(stage.cost))} "
+        f"<a href='/costuri#{stage.stage_id}'>{esc(RO['cost_details'])}</a>"
+    )
+
+
 def _render_plan(view: DashboardView) -> str:
     """§2c plan & history, §10.3 shape: per phase ONE table (etapă · stare/pas
     · clasă risc) with the Finalizate/În lucru/Planificate groups as table
@@ -1490,10 +1866,15 @@ def _render_plan(view: DashboardView) -> str:
     for phase in view.plan:
         done_n = len(phase.done)
         total_n = done_n + len(phase.running) + len(phase.pending)
+        # §11.2: the phase header carries the phase total PAIR (incl. the
+        # phase's own unit_level='phase' ledger rows, F3).
+        phase_cost = (
+            f" — {esc(_fmt_cost_pair(phase.cost))}" if not phase.cost.empty else ""
+        )
         parts.append(
             f"<h3>{esc(phase.name)} ({esc(phase.phase_id)}) — {_chip(phase.state)} —"
             f" {done_n} {esc(RO['progress_of'])}"
-            f" {total_n} {esc(RO['progress_done'])}</h3>"
+            f" {total_n} {esc(RO['progress_done'])}{phase_cost}</h3>"
         )
         if total_n == 0:
             link = (
@@ -1512,17 +1893,18 @@ def _render_plan(view: DashboardView) -> str:
         ):
             if not group:
                 continue
-            rows.append(f"<tr class='grup'><th colspan='3'>{esc(RO[label_key])}</th></tr>")
+            rows.append(f"<tr class='grup'><th colspan='4'>{esc(RO[label_key])}</th></tr>")
             rows.extend(
                 f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
                 f"<td>{_chip(st.state)}</td>"
-                f"<td>{esc(_glossed(st.risk_class))}</td></tr>"
+                f"<td>{esc(_glossed(st.risk_class))}</td>"
+                f"<td class='num'>{_stage_cost_cell(st)}</td></tr>"
                 for st in group
             )
         parts.append(
             _table(
                 f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_state'])}</th>"
-                f"<th>{esc(RO['col_risk'])}</th>",
+                f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_cost'])}</th>",
                 "".join(rows),
             )
         )
@@ -1563,6 +1945,86 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
         f"{_render_health(view, cfg)}"
         f"<section id='decizii'><h2>{esc(RO['section_decisions'])}</h2>{cards_html}</section>"
         f"{_render_plan(view)}"
+        "</body></html>"
+    )
+
+
+def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> str:
+    """One §11.2 per-agent table: rol (glossed) · model (glossed) · tokeni
+    intrare · tokeni ieșire · cost — one row per ledger entry in ledger-id
+    order (F7; recorded_at displayed as small print), a re-run role appearing
+    twice is the truth of what was spent; the total row last renders the PAIR."""
+    body: list[str] = []
+    sum_in = 0
+    sum_out = 0
+    for row in rows:
+        when = fmt_founder_ts(row.recorded_at, cfg.factory.timezone_founder)
+        sum_in += row.tokens_in or 0
+        sum_out += row.tokens_out or 0
+        in_cell = _fmt_int(row.tokens_in) if row.tokens_in is not None else "—"
+        out_cell = _fmt_int(row.tokens_out) if row.tokens_out is not None else "—"
+        body.append(
+            f"<tr><td>{esc(_glossed(row.role))}"
+            f"<span class='token'>{esc(when)}</span></td>"
+            f"<td>{esc(_glossed(row.model))}</td>"
+            f"<td class='num'>{esc(in_cell)}</td>"
+            f"<td class='num'>{esc(out_cell)}</td>"
+            f"<td class='num'>{esc(_fmt_row_cost(cfg, row))}</td></tr>"
+        )
+    total = _summary_from_rows(cfg, rows)
+    body.append(
+        f"<tr class='grup'><th>{esc(RO['cost_total_row'])}</th><th></th>"
+        f"<th class='num'>{esc(_fmt_int(sum_in))}</th>"
+        f"<th class='num'>{esc(_fmt_int(sum_out))}</th>"
+        f"<th class='num'>{esc(_fmt_cost_pair(total))}</th></tr>"
+    )
+    return _table(
+        f"<th>{esc(RO['col_agent'])}</th><th>{esc(RO['col_model'])}</th>"
+        f"<th class='num'>{esc(RO['col_tokens_in'])}</th>"
+        f"<th class='num'>{esc(RO['col_tokens_out'])}</th>"
+        f"<th class='num'>{esc(RO['col_cost'])}</th>",
+        "".join(body),
+    )
+
+
+def render_costs_page(view: CostsView, cfg: FactoryConfig) -> str:
+    """GET /costuri (§11.2, CCR-10): read-only, refresh-free, zero JS, NO
+    inputs — the stateful reading surface the meta-refreshing main page must
+    not carry (F2; the §10.5 session-page precedent — NO meta-refresh here,
+    pinned by test). One bloc per phase: header with the total pair (incl. the
+    phase's own rows, F3), the „agenți de fază” table for unit_level='phase'
+    rows, then per stage (anchor id=<stage_id>, the «detalii →» landing) the
+    per-agent table; the §11 legend renders iff any cost cell does."""
+    parts: list[str] = [f"<h1>{esc(RO['costs_title'])}</h1>"]
+    for phase in view.phases:
+        blocs: list[str] = []
+        if phase.phase_rows:
+            blocs.append(
+                _bloc(RO["costs_phase_agents"], _render_cost_table(phase.phase_rows, cfg))
+            )
+        blocs.extend(
+            _bloc(
+                f"{stage.name} ({stage.stage_id})",
+                _render_cost_table(stage.rows, cfg),
+                anchor=stage.stage_id,
+            )
+            for stage in phase.stages
+        )
+        parts.append(
+            f"<section><h2>{esc(phase.name)} ({esc(phase.phase_id)}) —"
+            f" {esc(_fmt_cost_pair(phase.total))}</h2>{''.join(blocs)}</section>"
+        )
+    if view.phases:
+        parts.append(f"<p class='meta'>{esc(RO['cost_legend'])}</p>")
+    else:
+        parts.append(f"<p class='meta'>{esc(RO['costs_none'])}</p>")
+    parts.append(f"<p><a href='/'>{esc(RO['back_to_dashboard'])}</a></p>")
+    return (
+        "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{esc(RO['costs_title'])} — {esc(RO['page_title'])}</title>"
+        f"<style>{_CSS}</style></head><body>"
+        f"{''.join(parts)}"
         "</body></html>"
     )
 
@@ -2167,6 +2629,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             view = build_view(cfg)
             self._send(200, render_page(view, cfg))
+            return
+        if path == "/costuri":
+            # §11.2 (CCR-10): read-only, refresh-free, same mode=ro read path.
+            self._send(200, render_costs_page(build_costs_view(cfg), cfg))
             return
         if match := _ARTIFACT_RE.match(path):
             self._artifact_page(cfg, int(match.group(1)))

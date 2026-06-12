@@ -62,6 +62,20 @@ risk_classes:
 economics:
   dual_audit_structural: true  # second auditor's marginal cost ~0 on current subscriptions (DoD §7)
 
+pricing:
+  # USD per 1M tokens, keyed by LEDGER model strings (design §11.1, CCR-10). Founder-tunable;
+  # starter values = API list prices 06-2026 (reviewer-verified). Used ONLY where the CLI reports
+  # no exact cost (token_ledger.cost_usd NULL); such sums render with the `~` estimate prefix.
+  # Costs are API-equivalent value — subscriptions pay differently (the dashboard legend says so).
+  usd_per_mtok:
+    fable:    {input: 10,   output: 50}
+    sonnet:   {input: 3,    output: 15}
+    haiku:    {input: 1,    output: 5}
+    opus-4-8: {input: 5,    output: 25}   # reserved for the D-0025 downshift candidate — no route uses it today
+    # codex ledger rows record model 'default'; values operator-estimated, to be verified against
+    # the OpenAI account — codex sums are ~ estimates either way (design §11.5.4 watch item).
+    default:  {input: 1.25, output: 10}
+
 consultation_points:
   # The ONLY registered points. Any orchestrator LLM call outside this registry = governance breach (DoD §4),
   # detectable mechanically from logs. Adding a point = config change + macro decision-log entry.
