@@ -7,6 +7,7 @@ Fixtures beyond the frozen conftest are defined locally (design §9).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -124,6 +125,8 @@ def test_claude_build_cmd_full_argv_order() -> None:
     # agents carry `--permission-mode bypassPermissions` (print mode default-
     # denies writes; a denied write is a wedged stage), inserted after the
     # tools handling, before --append-system-prompt.
+    # Amended by CCR-8 (E2BIG): the prompt is NOT in argv — trailing `-p`
+    # reads it from stdin (CLI-verified against the installed claude).
     route = ModelRoute(cli="claude", model="fable", mode="print")
     cmd = ClaudeAdapter().build_cmd(
         route, "do it", system_append="CANON", resume_session="sid-1"
@@ -142,18 +145,18 @@ def test_claude_build_cmd_full_argv_order() -> None:
         "--resume",
         "sid-1",
         "-p",
-        "do it",
     ]
 
 
 def test_claude_build_cmd_minimal() -> None:
-    # Amended by the phase-seeding design (§5/§8, D-0024) — see the full-argv golden.
+    # Amended by the phase-seeding design (§5/§8, D-0024) — see the full-argv
+    # golden. Amended by CCR-8: trailing `-p`, prompt on stdin.
     route = ModelRoute(cli="claude", model="sonnet", mode="print")
     cmd = ClaudeAdapter().build_cmd(route, "hi")
     assert cmd == [
         "claude", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
         "--permission-mode", "bypassPermissions",
-        "-p", "hi",
+        "-p",
     ]
 
 
@@ -163,7 +166,8 @@ def test_claude_build_cmd_minimal() -> None:
 def test_claude_tools_off_flagset() -> None:
     """The decision_session tools-off spawn (dashboard design §4): tools='none'
     -> the installed CLI's verified flagset `--tools ""` (disables the FULL
-    built-in set); resume/canon flags unaffected."""
+    built-in set); resume/canon flags unaffected. Amended by CCR-8: trailing
+    `-p`, prompt on stdin."""
     route = ModelRoute(cli="claude", model="fable", mode="print", tools="none")
     cmd = ClaudeAdapter().build_cmd(
         route, "discuss", system_append="CANON", resume_session="sid-7"
@@ -182,7 +186,6 @@ def test_claude_tools_off_flagset() -> None:
         "--resume",
         "sid-7",
         "-p",
-        "discuss",
     ]
 
 
@@ -249,24 +252,28 @@ def test_claude_parse_lines() -> None:
 
 
 def test_codex_build_cmd_and_default_model() -> None:
+    # Amended by CCR-8: the trailing positional is `-` ("instructions are read
+    # from stdin", CLI-verified) — the prompt never rides argv.
     adapter = CodexAdapter()
     route = ModelRoute(cli="codex", model="default", mode="print")
     assert adapter.build_cmd(route, "build it") == [
         "codex", "exec", "--json", "--skip-git-repo-check",
-        "--sandbox", "workspace-write", "build it",
+        "--sandbox", "workspace-write", "-",
     ]
     named = ModelRoute(cli="codex", model="o3", mode="print")
     assert adapter.build_cmd(named, "x") == [
         "codex", "exec", "--json", "--skip-git-repo-check",
-        "--sandbox", "workspace-write", "--model", "o3", "x",
+        "--sandbox", "workspace-write", "--model", "o3", "-",
     ]
 
 
 def test_codex_build_cmd_resume_subcommand() -> None:
+    # Amended by CCR-8: `-` positional — `codex exec resume [SESSION_ID]
+    # [PROMPT]` documents the same stdin contract for `-`.
     route = ModelRoute(cli="codex", model="default", mode="print")
     assert CodexAdapter().build_cmd(route, "continue", resume_session="tid-9") == [
         "codex", "exec", "resume", "tid-9", "--json", "--skip-git-repo-check",
-        "--sandbox", "workspace-write", "continue",
+        "--sandbox", "workspace-write", "-",
     ]
 
 
@@ -398,7 +405,9 @@ async def test_success_lifecycle(renv: SimpleNamespace) -> None:
     assert payload["process_id"] == result.process_id
     assert payload["pid"] == row["pid"]  # event evidence matches the registry column
     (exit_event,) = _events(renv.db, "exit")
-    assert json.loads(exit_event["payload_json"])["exit_code"] == 0
+    exit_payload = json.loads(exit_event["payload_json"])
+    assert exit_payload["exit_code"] == 0
+    assert exit_payload["stdin_fed"] is True  # CCR-8: prompt fed + stdin closed cleanly
     assert _events(renv.db, "usage_missing") == []
 
     # stderr captured to its own file, never merged into the NDJSON stream (§5.1).
@@ -862,7 +871,8 @@ def test_stub_adapter_argv_carries_no_bypass_flag(tmp_path: Path) -> None:
 
 def test_claude_effort_flag_in_documented_position() -> None:
     """CCR-6: `--effort <e>` sits immediately after --verbose, before the
-    tools/permission handling — the amended §5.1 argv-order literal."""
+    tools/permission handling — the amended §5.1 argv-order literal.
+    Amended by CCR-8: trailing `-p`, prompt on stdin."""
     route = ModelRoute(cli="claude", model="fable", mode="print", effort="xhigh")
     cmd = ClaudeAdapter().build_cmd(
         route, "do it", system_append="CANON", resume_session="sid-1"
@@ -883,13 +893,12 @@ def test_claude_effort_flag_in_documented_position() -> None:
         "--resume",
         "sid-1",
         "-p",
-        "do it",
     ]
 
 
 def test_claude_effort_none_leaves_argv_unchanged() -> None:
     """effort=None (the default) adds no flag — every pre-CCR-6 route's argv
-    stays byte-identical."""
+    stays byte-identical. Amended by CCR-8: trailing `-p`, prompt on stdin."""
     route = ModelRoute(cli="claude", model="sonnet", mode="print")
     assert route.effort is None
     cmd = ClaudeAdapter().build_cmd(route, "hi")
@@ -897,18 +906,114 @@ def test_claude_effort_none_leaves_argv_unchanged() -> None:
     assert cmd == [
         "claude", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
         "--permission-mode", "bypassPermissions",
-        "-p", "hi",
+        "-p",
     ]
 
 
 def test_claude_tools_off_with_effort_decision_session_shape() -> None:
     """The ratified decision_session route shape: tools-off AND effort=high —
-    `--effort` precedes `--tools ""`; no permission bypass on a tools-off spawn."""
+    `--effort` precedes `--tools ""`; no permission bypass on a tools-off spawn.
+    Amended by CCR-8: trailing `-p`, prompt on stdin."""
     route = ModelRoute(cli="claude", model="fable", mode="print", tools="none", effort="high")
     cmd = ClaudeAdapter().build_cmd(route, "discuss")
     assert cmd == [
         "claude", "--model", "fable", "--output-format", "stream-json", "--verbose",
         "--effort", "high",
         "--tools", "",
-        "-p", "discuss",
+        "-p",
     ]
+
+
+# ------------------------------- prompt via stdin (CCR-8, E2BIG incident fix)
+
+#: Assertion budget for ONE argv element: comfortably under the ~128KB Linux
+#: MAX_ARG_STRLEN cap that produced `[Errno 7] Argument list too long`.
+MAX_SAFE_ARGV_ELEMENT_BYTES = 64 * 1024
+
+
+def _assert_argv_elements_within_budget(cmd: list[str]) -> None:
+    """CCR-8 helper: no single argv element may approach the kernel cap."""
+    oversized = {
+        arg[:48]: len(arg.encode("utf-8"))
+        for arg in cmd
+        if len(arg.encode("utf-8")) > MAX_SAFE_ARGV_ELEMENT_BYTES
+    }
+    assert oversized == {}, f"argv elements past the E2BIG budget: {oversized}"
+
+
+def test_no_adapter_argv_element_exceeds_e2big_budget(tmp_path: Path) -> None:
+    """§5.1 (CCR-8): argv carries flags only — with a Tier-2-sized prompt no
+    adapter may emit any argv element near MAX_ARG_STRLEN, and the prompt
+    itself never rides argv."""
+    huge = "x" * (300 * 1024 + 17)  # the config-bounded size class that E2BIGed
+    cmds = [
+        ClaudeAdapter().build_cmd(
+            ModelRoute(cli="claude", model="fable", mode="print"),
+            huge,
+            system_append="CANON",
+            resume_session="sid-1",
+        ),
+        CodexAdapter().build_cmd(
+            ModelRoute(cli="codex", model="default", mode="print"), huge
+        ),
+        CodexAdapter().build_cmd(
+            ModelRoute(cli="codex", model="default", mode="print"),
+            huge,
+            resume_session="tid-9",
+        ),
+        StubAdapter(tmp_path / "stub.py").build_cmd(
+            ModelRoute(cli="stub", model="stub-model", mode="print"), huge
+        ),
+    ]
+    for cmd in cmds:
+        _assert_argv_elements_within_budget(cmd)
+        assert huge not in cmd
+
+
+async def test_large_prompt_spawns_and_completes(renv: SimpleNamespace) -> None:
+    """E2BIG regression (CCR-8, incident 1): a >300KB prompt — past the ~128KB
+    MAX_ARG_STRLEN single-argv-string cap that killed the Tier-2 spawn on the
+    first real ERP stage — spawns and completes because the prompt travels on
+    stdin. The old argv path failed at exec before any NDJSON flowed."""
+    prompt = "tier2 contracts+plan+diffs " + "x" * (300 * 1024)
+    result = await renv.runner.run_agent(
+        "builder_routine", prompt, unit_level="stage", unit_id="stg-1", cwd=renv.cwd
+    )
+    assert result.exit_code == 0
+    assert not result.timed_out and not result.killed
+    assert result.result_text == "stub success"
+    # The stub DRAINED the full prompt from stdin: length + digest echoed in
+    # its init line (never the raw prompt — NDJSON line bound).
+    raw = prompt.encode("utf-8")
+    init = next(o for o in _log_objects(result.ndjson_log_path) if o.get("subtype") == "init")
+    assert init["stub"]["prompt_bytes"] == len(raw)
+    assert init["stub"]["prompt_sha256"] == hashlib.sha256(raw).hexdigest()
+    # Feeder wrote everything and closed stdin cleanly (EOF reached the stub).
+    (exit_event,) = _events(renv.db, "exit")
+    assert json.loads(exit_event["payload_json"])["stdin_fed"] is True
+    assert _proc_rows(renv.db)[0]["state"] == "exited"
+
+
+async def test_early_exit_child_with_pending_prompt_is_contained(
+    renv: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CCR-8 containment: the 'crash' stub exits 13 WITHOUT ever reading stdin
+    while >300KB of prompt is still pending in the feeder (well past the ~64KB
+    pipe buffer). BrokenPipeError/ConnectionResetError on the feed is a NORMAL
+    path: no deadlock against the readline loop, no unhandled exception —
+    AgentResult carries the exit semantics, the exit event records
+    stdin_fed=False."""
+    monkeypatch.setenv("SF_STUB_SCENARIO", "crash")
+    prompt = "y" * (300 * 1024)
+    result = await asyncio.wait_for(
+        renv.runner.run_agent(
+            "builder_routine", prompt, unit_level="stage", unit_id="stg-1", cwd=renv.cwd
+        ),
+        timeout=20.0,
+    )
+    assert result.exit_code == 13
+    assert not result.timed_out and not result.killed
+    assert result.result_text == "about to crash"  # the stream was still parsed
+    (exit_event,) = _events(renv.db, "exit")
+    assert json.loads(exit_event["payload_json"])["stdin_fed"] is False
+    assert _proc_rows(renv.db)[0]["state"] == "exited"

@@ -150,6 +150,10 @@ def test_missing_pidfile_pages_at_max_priority(factory_config, publish_calls) ->
     assert call["priority"] == factory_config.founder_channel.ntfy.priority_alert
     assert call["title"]  # founder-facing title present
     assert call["link"] is not None and call["link"].startswith("http://")
+    # CCR-8: the deep link lands on a REAL rendered dashboard anchor — the
+    # health strip lives in <section id='acum'> since the D-0027 UX slice;
+    # '#health' matched nothing on the rendered page.
+    assert call["link"].endswith("#acum")
 
 
 def test_dead_pid_pages(factory_config, publish_calls, capsys, spawn) -> None:

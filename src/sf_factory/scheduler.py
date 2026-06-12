@@ -1245,7 +1245,10 @@ class StageExecutor:
 
     async def _step_build(self, stage: Stage) -> bool:
         """BUILD: Validator-isolation assertion, Builder run (resume honored per
-        the entry transition payload), commit-all, churn recording, -> VALIDATE."""
+        the entry transition payload), commit-all, churn recording, -> VALIDATE.
+        CCR-8: a clean exit with nothing to commit and no declared failure is
+        ACCEPTED (event 'build_noop_accepted') and proceeds to VALIDATE — §5.5d
+        idempotent re-entry; independent validation is the gate."""
         worktree = self._worktree(stage)
         await self._assert_no_unregistered_files(stage, worktree)
 
@@ -1278,7 +1281,7 @@ class StageExecutor:
                     )
                 resume = None
 
-        await self._run_step_agent(
+        result = await self._run_step_agent(
             stage,
             role,
             self._build_prompt(stage, worktree, entry),
@@ -1298,14 +1301,31 @@ class StageExecutor:
         )
         if await self._apply_thresholds(stage, worktree):
             return False
-        if sha is None and not churn_diff:
-            raise ArtifactContractError(
-                f"builder produced no committed changes for stage {stage.id}"
-                " and declared no failure"
-            )
+        # CCR-8: a builder that exits clean (no declared-failure sentinel — the
+        # thresholds pass above already escalated that) with NOTHING to commit
+        # is a LEGAL no-op, not a contract breach. The §5.5d at-least-once model
+        # REQUIRES idempotent re-entry: a rework re-run may find the prior
+        # builder's work already committed on the stage branch, verify it and
+        # change nothing. VALIDATE is the arbiter — an empty no-op build with
+        # missing work FAILS independent validation and loops back via the
+        # §8-bounded fix loop; commit-counting was a false gate that turned
+        # legal idempotent re-entries into spurious escalations.
+        noop = sha is None and not churn_diff
         notes_path = self._unit_dir(worktree, stage) / STAGE_ARTIFACTS["build_notes"]
 
         def coupled(tx: sqlite3.Connection) -> None:
+            if noop:
+                fdb.insert_event(
+                    tx,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="build_noop_accepted",
+                    actor=_ACTOR,
+                    payload={
+                        "process_id": result.process_id,
+                        "note": "no new changes; validation is the gate",
+                    },
+                )
             self._thresholds.record_churn(tx, stage.id, churn_diff)
             if notes_path.is_file():
                 register_artifact(
@@ -2605,7 +2625,8 @@ class StageExecutor:
             f"Implement EXACTLY the spec at {unit_rel}/spec.md; verify your own work "
             "before finishing (run what you can). Do NOT modify _factory/contracts/ "
             "(a needed change = _CONTRACT_CHANGE_REQUEST.md + stop). You may write "
-            f"{unit_rel}/build-notes.md.{context}\n" + self._layout_note(stage)
+            f"{unit_rel}/build-notes.md. Never run `git commit` yourself — the "
+            f"control plane commits your work.{context}\n" + self._layout_note(stage)
         )
 
     def _validate_prompt(self, stage: Stage, scratch: Path) -> str:

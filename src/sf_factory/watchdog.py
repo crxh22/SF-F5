@@ -53,8 +53,11 @@ _PACKAGE_TOKENS = ("sf_factory", "sf-factory")
 _DOWN_TITLE = "Fabrica s-a oprit: orchestratorul nu mai răspunde"
 
 #: Dashboard fragment for the health strip (DoD §9: it shows the last
-#: orchestrator liveness timestamp for on-demand confirmation).
-_HEALTH_FRAGMENT = "health"
+#: orchestrator liveness timestamp for on-demand confirmation). CCR-8: the
+#: D-0027 UX slice renders the anchors 'acum'/'escaladari'/'decizii' and the
+#: health strip lives inside <section id='acum'> — a deep link must land on a
+#: REAL rendered anchor, never the dead '#health' fragment this replaced.
+_HEALTH_FRAGMENT = "acum"
 
 
 def _resolve(home: Path, path: Path) -> Path:

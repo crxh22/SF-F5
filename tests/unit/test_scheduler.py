@@ -2969,3 +2969,102 @@ async def test_stage_agent_run_with_signature_inserts_usage_limit_event(
     assert payload["role"] == "validator"
     assert payload["signature"] == "subscription access"
     assert any(t.startswith("Limită de utilizare suspectată") for t, _, _ in notify.published)
+
+# --------------------------------- BUILD no-op acceptance (CCR-8, incident 2)
+
+
+async def test_build_noop_accepted_transitions_to_validate(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-8 (§5.5d idempotent re-entry): a builder that exits clean with
+    NOTHING to commit and no declared-failure sentinel is a LEGAL no-op — the
+    step inserts 'build_noop_accepted' and proceeds to VALIDATE exactly like
+    the with-changes path. No ArtifactContractError, no escalation:
+    independent validation is the gate, and a no-op hiding missing work fails
+    there and loops back via the §8-bounded fix loop."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    # Rework-re-entry shape: the agent verifies prior committed work, writes
+    # nothing, exits 0 (FakeRunner's default result).
+    env.runner.behaviors["builder_routine"] = lambda cwd, unit_id, resume: None
+
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    progressed = await env.executor._step_build(stage)
+
+    assert progressed is True
+    assert stage_state(db, "ph.s1") is StageState.VALIDATE
+    (noop,) = events_of(db, "ph.s1", "build_noop_accepted")
+    payload = json.loads(noop["payload_json"])
+    assert payload["note"] == "no new changes; validation is the gate"
+    assert "process_id" in payload
+    assert open_escalations(db, "ph.s1") == []
+    # The VALIDATE entry is the same shape as the with-changes path (commit
+    # payload present, None = nothing was committed).
+    entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "VALIDATE"
+    ]
+    assert len(entry) == 1
+    assert json.loads(entry[0]["payload_json"])["commit"] is None
+
+
+async def test_build_with_changes_path_unchanged_no_noop_event(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-8 regression guard: a builder that DOES change files keeps the
+    pre-amendment behavior byte-for-byte — commit recorded on the VALIDATE
+    entry, churn recorded, and NO 'build_noop_accepted' event."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    progressed = await env.executor._step_build(stage)
+
+    assert progressed is True
+    assert stage_state(db, "ph.s1") is StageState.VALIDATE
+    assert events_of(db, "ph.s1", "build_noop_accepted") == []
+    entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "VALIDATE"
+    ]
+    assert json.loads(entry[0]["payload_json"])["commit"]  # real sha recorded
+    assert open_escalations(db, "ph.s1") == []
+
+
+async def test_build_declared_failure_path_unchanged_escalates(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-8 regression guard: the declared-failure path is untouched — a
+    builder writing _DECLARED_FAILURE.md escalates via the §8 always-fire
+    trigger (thresholds run BEFORE the no-op check) and never lands a
+    'build_noop_accepted' event."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+
+    def declaring_builder(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "_DECLARED_FAILURE.md").write_text("cannot proceed", encoding="utf-8")
+
+    env.runner.behaviors["builder_routine"] = declaring_builder
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    triggers = [r["trigger"] for r in open_escalations(db, "ph.s1")]
+    assert triggers == ["agent_declared_failure"]
+    assert events_of(db, "ph.s1", "build_noop_accepted") == []
+
+
+def test_build_prompt_forbids_self_commit(db, config_dict, tmp_path) -> None:
+    """CCR-8: the Builder prompt carries the no-self-commit line — an agent
+    committing its own work would hide changes from the control plane's
+    commit-all step (and from churn accounting)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    prompt = env.executor._build_prompt(stage, env.worktree, {})
+    assert "Never run `git commit` yourself — the control plane commits your work." in prompt

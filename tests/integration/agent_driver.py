@@ -12,6 +12,11 @@ driver adds exactly that, scripted per role from a JSON playbook.
 
 Stdlib only — it simulates an EXTERNAL binary with an arbitrary cwd.
 
+Prompt channel (CCR-8, same as tests/stub_agent.py): the runner passes flags
+only in argv and feeds the prompt on STDIN — the driver drains stdin to EOF
+when no argv positional is given (the positional remains a direct-invocation
+fallback).
+
 Playbook (path in env ``SF_DRIVER_PLAYBOOK``): a JSON object mapping a role
 KIND (detected from the prompt's fixed first line, written by scheduler.py's
 prompt builders) to ``{"calls": [spec, ...], "default": spec | null}``. Each
@@ -232,21 +237,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--append-system-prompt", dest="system_append", default=None)
     parser.add_argument("--resume", dest="resume", default=None)
-    parser.add_argument("prompt", nargs="?", default="")
+    parser.add_argument("prompt", nargs="?", default=None)
     args = parser.parse_args(argv)
     session_id = args.resume or os.environ.get("SF_STUB_SESSION_ID", "driver-sess-0001")
     cwd = Path.cwd()
 
-    kind = _detect_kind(args.prompt)
+    # CCR-8: the runner feeds the prompt on stdin (argv carries flags only);
+    # drain it to EOF so the feeder never blocks. argv positional = fallback
+    # for direct invocation; tty/absent stdin reads empty (never hangs).
+    prompt = args.prompt
+    if prompt is None:
+        prompt = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+
+    kind = _detect_kind(prompt)
     if kind is None:
-        return _fail(f"no role marker recognized in prompt: {args.prompt[:120]!r}")
+        return _fail(f"no role marker recognized in prompt: {prompt[:120]!r}")
     playbook_env = os.environ.get("SF_DRIVER_PLAYBOOK")
     if not playbook_env or not Path(playbook_env).is_file():
         return _fail(f"SF_DRIVER_PLAYBOOK unset or missing: {playbook_env!r}")
 
     key, fallback = kind, None
     if kind == "audit":
-        role = _audit_role(args.prompt)
+        role = _audit_role(prompt)
         key, fallback = (f"audit:{role}", "audit") if role else ("audit", None)
     spec = _pop_spec(Path(playbook_env), key, fallback)
     if spec is None:
@@ -267,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         _write(cwd / rel, content)
     if "script" in spec:
         _run_script(cwd, spec["script"])
-    result_text = _synthesize(kind, spec, cwd, args.prompt)
+    result_text = _synthesize(kind, spec, cwd, prompt)
 
     if spec.get("grandchild"):
         child = subprocess.Popen(  # same process group as the driver (group-kill tests)

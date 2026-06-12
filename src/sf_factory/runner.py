@@ -19,6 +19,16 @@ CCR-2 (approved, design v1.3 / D-0013): after exec the registry row flips
 orphan sweep finds its pids in ``process_registry`` alone; ``kill_running``
 uses in-memory handles for this process's own children plus those persisted
 pids for rows from a previous run.
+
+CCR-8 (E2BIG incident, 2026-06-12): the prompt travels on STDIN, never in
+argv. Linux MAX_ARG_STRLEN caps ONE argv string at ~128KB while Tier-2/CP
+prompt bounds are config-set well past it (300KB/unit) — the first real ERP
+stage died at exec with ``E2BIG`` before any NDJSON flowed. Adapters emit
+flags only (claude ``-p`` with no positional reads stdin; codex takes the
+``-`` positional; the stub drains stdin); ``run_agent`` spawns with
+stdin=PIPE and feeds the prompt from a concurrent task — a child that exits
+before reading all input is a NORMAL path, contained, recorded as
+``stdin_fed`` on the exit/timeout event.
 """
 
 from __future__ import annotations
@@ -132,7 +142,12 @@ class CliAdapter(Protocol):
     ) -> list[str]:
         """argv for a one-shot NDJSON-streaming run. system_append = canon bundle
         (D-0009: claude `--append-system-prompt`); resume_session = resume that
-        CLI session (claude `--resume <id>`)."""
+        CLI session (claude `--resume <id>`).
+
+        CCR-8: the ``prompt`` parameter stays in this frozen §4 signature, but
+        no adapter embeds it in argv any more — argv carries flags only and the
+        runner delivers the prompt on stdin (E2BIG: MAX_ARG_STRLEN caps one
+        argv string at ~128KB, below the configured Tier-2 prompt bounds)."""
         ...
 
     def materialize_workspace(self, cwd: Path, system_append: str | None) -> None:
@@ -156,9 +171,16 @@ class ClaudeAdapter:
         system_append: str | None = None,
         resume_session: str | None = None,
     ) -> list[str]:
-        # §5.1 literal argv order: claude --model <m> --output-format stream-json
-        # --verbose [--effort <e>] [--tools "" | --permission-mode bypassPermissions]
-        # --append-system-prompt <canon> [--resume <id>] -p <prompt>.
+        # §5.1 literal argv order (CCR-8 semantic amendment): claude --model <m>
+        # --output-format stream-json --verbose [--effort <e>]
+        # [--tools "" | --permission-mode bypassPermissions]
+        # --append-system-prompt <canon> [--resume <id>] -p
+        # The PROMPT is NOT in argv (CCR-8): Linux MAX_ARG_STRLEN caps one argv
+        # string at ~128KB and Tier-2 prompt bounds (300KB/unit) exceed it —
+        # `-p` with no positional reads the prompt from stdin, which run_agent
+        # pipes. CLI-verified 2026-06-12 against the installed claude 2.1.175:
+        #   echo hi | claude --model haiku --output-format stream-json --verbose -p
+        # → init/assistant/result NDJSON with the result line present, exit 0.
         cmd = ["claude", "--model", route.model, "--output-format", "stream-json", "--verbose"]
         if route.effort is not None:
             # CCR-6: per-role reasoning-effort knob (config models.<role>.effort;
@@ -186,7 +208,7 @@ class ClaudeAdapter:
             cmd += ["--append-system-prompt", system_append]
         if resume_session is not None:
             cmd += ["--resume", resume_session]
-        cmd += ["-p", prompt]
+        cmd.append("-p")  # prompt arrives on stdin (CCR-8) — never in argv
         return cmd
 
     def materialize_workspace(self, cwd: Path, system_append: str | None) -> None:
@@ -240,8 +262,10 @@ class CodexAdapter:
     """codex CLI adapter — facts verified by smoke test (D-0011/OPEN-3):
     `codex exec --json` emits JSONL `thread.started{thread_id}`,
     `item.completed{type: agent_message, text}`, `turn.completed{usage{...}}`;
-    resume = `codex exec resume <thread_id>`; needs `--skip-git-repo-check`
-    and stdin=devnull (the runner spawns every CLI with stdin=devnull)."""
+    resume = `codex exec resume <thread_id>`; needs `--skip-git-repo-check`.
+    CCR-8: the prompt arrives on PIPED STDIN via the `-` positional ("If `-`
+    is used, instructions are read from stdin" — codex exec --help, same
+    contract on `exec resume`); the D-0011-era stdin=devnull spawn is gone."""
 
     def build_cmd(
         self,
@@ -270,7 +294,14 @@ class CodexAdapter:
         cmd += ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
         if route.model != "default":  # 'default' = let the codex config decide (D-0005)
             cmd += ["--model", route.model]
-        cmd.append(prompt)
+        # CCR-8: prompt on stdin — `-` = "instructions are read from stdin"
+        # (both `codex exec` and `codex exec resume`). CLI-verified 2026-06-12
+        # against the installed codex-cli 0.139.0:
+        #   echo 'say OK' | codex exec --json --skip-git-repo-check \
+        #     --sandbox workspace-write -
+        # → thread.started / item.completed(agent_message "OK") /
+        #   turn.completed{usage}, exit 0.
+        cmd.append("-")
         return cmd
 
     def materialize_workspace(self, cwd: Path, system_append: str | None) -> None:
@@ -324,7 +355,10 @@ class StubAdapter(ClaudeAdapter):
     script path from config; the module-level ADAPTERS['stub'] entry is unbound
     and refuses to build argv (fail-explicit, never a half-spawn).
     ``ModelRoute.tools`` is ignored (dashboard design §4: the stub spawns no
-    tools to disable; its argv carries no tools flag)."""
+    tools to disable; its argv carries no tools flag). CCR-8: like the
+    production adapters the stub argv carries flags only — the prompt arrives
+    on stdin and the stub scripts drain it (so huge-prompt runner tests
+    exercise the same channel the real CLIs use, never E2BIG argv)."""
 
     def __init__(self, script_path: Path | None = None) -> None:
         self._script_path = script_path
@@ -347,7 +381,7 @@ class StubAdapter(ClaudeAdapter):
             cmd += ["--append-system-prompt", system_append]
         if resume_session is not None:
             cmd += ["--resume", resume_session]
-        cmd.append(prompt)
+        # CCR-8: no prompt positional — the stub reads the prompt from stdin.
         return cmd
 
 
@@ -472,7 +506,8 @@ class AgentRunner:
         throttled to process.heartbeat_min_interval_s; capture session_id; enforce timeout
         (terminate->kill grace from config, signals to the process GROUP); finalize
         registry+token_ledger in one tx; detect declared-failure sentinel. Raises
-        ProcessError only on spawn impossibility."""
+        ProcessError only on spawn impossibility. CCR-8: the prompt is fed on
+        stdin by a concurrent task (argv carries flags only — E2BIG)."""
         self._enforce_tagging(role=role, kind=kind, cp_id=cp_id)
         route = self._cfg.models[role]
         if route.mode != "print":
@@ -536,13 +571,15 @@ class AgentRunner:
                 # §5.1: stderr redirected at spawn to a FILE — inherited fd, no
                 # drain task, crash-safe evidence; never a PIPE (a full 64KB pipe
                 # deadlocks the child into a spurious timeout), never merged into
-                # stdout (would corrupt the NDJSON stream). stdin=devnull: codex
-                # reads piped stdin otherwise (D-0011); harmless for the others.
+                # stdout (would corrupt the NDJSON stream). stdin=PIPE (CCR-8,
+                # replacing the D-0011 devnull): the prompt travels on stdin —
+                # argv cannot carry large prompts (E2BIG at ~128KB/argv string)
+                # — fed by a concurrent task (_feed_stdin below).
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         *argv,
                         cwd=str(cwd),
-                        stdin=asyncio.subprocess.DEVNULL,
+                        stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=stderr_file,
                         start_new_session=True,
@@ -558,6 +595,12 @@ class AgentRunner:
             raise ProcessError(f"cannot open stderr file {stderr_path}: {exc}") from exc
 
         self._live[process_id] = proc
+        # CCR-8: feed the prompt CONCURRENTLY with supervision — the OS pipe
+        # buffer is ~64KB and the child may emit output before consuming stdin
+        # (or never consume it at all), so an inline pre-stream write of a
+        # large prompt would deadlock the feeder against the readline loop.
+        feeder = asyncio.create_task(_feed_stdin(proc, prompt.encode("utf-8")))
+        stdin_fed = False
         state = _StreamState()
         timeout = float(timeout_s if timeout_s is not None else self._cfg.process.agent_timeout_s)
         try:
@@ -596,6 +639,11 @@ class AgentRunner:
         finally:
             self._live.pop(process_id, None)
             log_file.close()
+            # CCR-8: settle the feeder on EVERY exit. The child is dead (or
+            # being killed) here, so a still-pending feeder is blocked on a
+            # pipe nobody will drain — cancel-then-await never hangs, and a
+            # broken/cancelled feed is the contained normal path.
+            stdin_fed = await _reap_feeder(feeder)
 
         ended_at = utc_now()
         duration_ms = int((loop.time() - started) * 1000)
@@ -657,6 +705,10 @@ class AgentRunner:
                     "garbage_lines": state.garbage_lines,
                     "duration_ms": duration_ms,
                     "stderr_path": str(stderr_path),
+                    # CCR-8: False = child exited before reading its whole
+                    # prompt (broken pipe contained as a normal path) — the
+                    # event-worthy stdin evidence; exit semantics above.
+                    "stdin_fed": stdin_fed,
                 },
             )
 
@@ -1000,6 +1052,42 @@ class AgentRunner:
 
 
 # ------------------------------------------------------------- process utilities
+
+
+async def _feed_stdin(proc: asyncio.subprocess.Process, data: bytes) -> bool:
+    """CCR-8 prompt feeder: write + drain + close the child's stdin, run as a
+    task CONCURRENT with the §5.2 readline loop (the pipe buffer is ~64KB and
+    the child may emit output before consuming stdin — an inline write of a
+    large prompt would deadlock both sides). Returns True when the full prompt
+    was written and stdin closed cleanly. A child that exits before reading
+    all input (BrokenPipeError/ConnectionResetError) is a NORMAL path —
+    contained here, surfaced as ``stdin_fed=False`` on the exit/timeout event;
+    exit semantics land in AgentResult as always. Never raises."""
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        return False
+    finally:
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # peer already gone — close is best-effort evidence hygiene
+    return True
+
+
+async def _reap_feeder(feeder: asyncio.Task) -> bool:
+    """Settle the stdin feeder after supervision (CCR-8). The child is dead by
+    now, so a feeder still pending is blocked on a pipe nobody will read (e.g.
+    an unkillable descendant holding the fd): cancel() — a no-op on a finished
+    task — then await; cancelled or broken feeds report False. Never raises,
+    never blocks."""
+    feeder.cancel()
+    try:
+        return bool(await feeder)
+    except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError, OSError):
+        return False
 
 
 def _signal_group(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:

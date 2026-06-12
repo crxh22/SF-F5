@@ -25,17 +25,28 @@ Scenario selection: ``--scenario <name>`` argv wins, else env
 - ``invalid_verdict``     CP role: result text is JSON with a verdict outside any
                           closed set.
 - ``valid_verdict:<value>`` CP role: well-formed verdict ``<value>`` + rationale.
-- ``crash``               nonzero exit (13) mid-stream, no result line.
+- ``crash``               nonzero exit (13) mid-stream, no result line. CCR-8:
+                          crash NEVER reads stdin — it models a CLI dying with
+                          its piped prompt unread, the runner's broken-pipe
+                          containment fixture.
 
 Other env knobs: SF_STUB_SESSION_ID (session id when not resuming). The runner
 passes ``--resume <id>`` on session resume; the stub then echoes that id as its
 session_id. ``--append-system-prompt`` is accepted and its byte length echoed in
 the init line (canon-injection assertions read it from the NDJSON log).
+
+Prompt channel (CCR-8): the runner no longer passes the prompt in argv (E2BIG
+— argv carries flags only); the stub READS THE PROMPT FROM STDIN, draining it
+to EOF so the runner's feeder never blocks. The optional argv positional
+remains as a direct-invocation fallback (and skips the stdin read). The init
+line echoes ``prompt_bytes``/``prompt_sha256`` — never the raw prompt, which
+at Tier-2 sizes would blow ``process.ndjson_max_line_bytes``.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -74,7 +85,20 @@ def _pdeathsig() -> int | None:
         return None
 
 
-def _emit_init(session_id: str, system_append: str | None, prompt: str) -> None:
+def _read_prompt(argv_prompt: str | None) -> str:
+    """CCR-8 prompt channel: argv positional when given (direct invocation),
+    else DRAIN stdin to EOF — the runner feeds the prompt there and its feeder
+    must never be left blocked on a full pipe. A tty/absent stdin reads as
+    empty (manual runs must not hang)."""
+    if argv_prompt is not None:
+        return argv_prompt
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
+def _emit_init(session_id: str, system_append: str | None, prompt: str | None) -> None:
+    raw = prompt.encode("utf-8") if prompt is not None else None
     _emit(
         {
             "type": "system",
@@ -86,7 +110,11 @@ def _emit_init(session_id: str, system_append: str | None, prompt: str) -> None:
                 "system_append_bytes": len(system_append.encode("utf-8"))
                 if system_append is not None
                 else None,
-                "prompt": prompt,
+                # CCR-8: length + digest, never the raw prompt (a Tier-2-sized
+                # echo would blow the runner's NDJSON line limit); None = the
+                # crash scenario, which exits without reading stdin.
+                "prompt_bytes": len(raw) if raw is not None else None,
+                "prompt_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None,
             },
         }
     )
@@ -120,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", default=None)
     parser.add_argument("--append-system-prompt", dest="system_append", default=None)
     parser.add_argument("--resume", dest="resume", default=None)
-    parser.add_argument("prompt", nargs="?", default="")
+    parser.add_argument("prompt", nargs="?", default=None)
     args = parser.parse_args(argv)
 
     scenario = args.scenario or os.environ.get("SF_STUB_SCENARIO", "success")
@@ -129,8 +157,12 @@ def main(argv: list[str] | None = None) -> int:
     sys.stderr.write(f"stub-stderr: scenario={scenario}\n")
     sys.stderr.flush()
 
+    # CCR-8: crash exits WITHOUT touching stdin — its pending prompt is the
+    # runner's broken-pipe containment input; every other scenario drains it.
+    prompt = None if scenario == "crash" else _read_prompt(args.prompt)
+
     if scenario == "success":
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_text(session_id, "stub working")
         _emit_result(session_id, "stub success")
         return 0
@@ -143,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         (report_dir / "validation-report.json").write_text(
             json.dumps(report), encoding="utf-8"
         )
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_result(session_id, f"validation failed: {failing} failing tests")
         return 0
 
@@ -154,14 +186,14 @@ def main(argv: list[str] | None = None) -> int:
             "# Declared failure\n\nI cannot proceed: scripted inability (stub).\n",
             encoding="utf-8",
         )
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_result(session_id, "declared inability, wrote _DECLARED_FAILURE.md")
         return 0
 
     if scenario == "timeout":
         if os.environ.get("SF_STUB_IGNORE_TERM") == "1":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         if os.environ.get("SF_STUB_GRANDCHILD") == "1":
             child = subprocess.Popen(  # same process group as the stub
                 [sys.executable, "-c", "import time; time.sleep(3600)"]
@@ -172,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # unreachable under a working kill ladder
 
     if scenario == "garbage":
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         sys.stdout.write("this is not json at all\n")
         sys.stdout.write("{broken json line\n")
         sys.stdout.write("[1, 2, 3]\n")  # valid JSON, not an object
@@ -184,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if scenario == "invalid_verdict":
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_result(
             session_id,
             json.dumps(
@@ -195,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if scenario.startswith("valid_verdict:"):
         verdict = scenario.split(":", 1)[1]
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_result(
             session_id,
             json.dumps({"verdict": verdict, "rationale": "scripted verdict (stub)"}),
@@ -203,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if scenario == "crash":
-        _emit_init(session_id, args.system_append, args.prompt)
+        _emit_init(session_id, args.system_append, prompt)
         _emit_text(session_id, "about to crash")
         return 13
 
