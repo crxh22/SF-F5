@@ -36,10 +36,14 @@ models:
   decision_session:      {cli: claude, model: fable,   mode: print, tools: none, effort: high}
 
 budgets:
-  per_stage:                          # tokens per stage by risk class (D-0005); keys mirror risk_classes
-    routine: 300000
-    structural: 1000000
-    critical: 2000000
+  per_stage:                          # tokens per stage by risk class; keys mirror risk_classes
+    # Recalibrated 12-06-2026 (D-0026) on FIRST real-stage evidence: the ledger counts RAW context
+    # flow (input + cache creation + cache reads — deliberate, see runner.py budget note); a healthy
+    # routine build run measured ~6M raw. Caps ≈ 5x healthy single-pass so the detector catches
+    # runaways, not honest work. D-0005 starter values (300k/1M/2M) predate any real run.
+    routine: 30000000
+    structural: 75000000
+    critical: 150000000
   usage_missing_policy: estimate      # estimate = logged-stream-bytes/4 into ledger (estimated=1) | escalate_after
   usage_missing_max_per_stage: 3      # used by escalate_after policy
 
