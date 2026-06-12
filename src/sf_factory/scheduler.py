@@ -76,6 +76,7 @@ from sf_factory.models import (
     NotifyError,
     Phase,
     PhaseState,
+    ProcessError,
     ProcessRecord,
     SchedCategory,
     Stage,
@@ -802,6 +803,33 @@ class _OutOfBoundsDetector:
 _USAGE_LIMIT_STDERR_TAIL_BYTES = 2048
 
 
+def _usage_limit_stderr_tail(stderr_path: str) -> str:
+    """Last ~2KB of the agent's stderr file; missing/unreadable = '' — a tail
+    read must never fail a step (the file may not exist for fakes)."""
+    try:
+        with open(stderr_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(size - _USAGE_LIMIT_STDERR_TAIL_BYTES, 0))
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _usage_limit_match(cfg: FactoryConfig, result: AgentResult) -> str | None:
+    """First configured signature found in result_text + the stderr tail
+    (config validates signatures lowercase; lowercasing the haystack makes the
+    match case-insensitive). One source for BOTH the CCR-6 detector and the
+    CCR-11 capacity-probe success check (Doctrine §9: no drifting copies)."""
+    haystack = (
+        result.result_text + "\n" + _usage_limit_stderr_tail(result.stderr_path)
+    ).lower()
+    for signature in cfg.founder_channel.usage_limit_signatures:
+        if signature in haystack:
+            return signature
+    return None
+
+
 class _UsageLimitDetector:
     """CCR-6 usage-limit detector (mechanical, Doctrine §20): scan each agent
     result's ``result_text`` plus the LAST ~2KB of its stderr file for the
@@ -829,41 +857,20 @@ class _UsageLimitDetector:
         #: One alert_delivery_failed event per delivery-failure streak.
         self._delivery_failed_logged = False
 
-    def _stderr_tail(self, stderr_path: str) -> str:
-        """Last ~2KB of the agent's stderr file; missing/unreadable = '' — a
-        tail read must never fail a step (the file may not exist for fakes)."""
-        try:
-            with open(stderr_path, "rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                size = fh.tell()
-                fh.seek(max(size - _USAGE_LIMIT_STDERR_TAIL_BYTES, 0))
-                return fh.read().decode("utf-8", errors="replace")
-        except OSError:
-            return ""
-
-    def _match(self, result: AgentResult) -> str | None:
-        """First configured signature found in result_text + the stderr tail
-        (config validates signatures lowercase; lowercasing the haystack makes
-        the match case-insensitive)."""
-        haystack = (
-            result.result_text + "\n" + self._stderr_tail(result.stderr_path)
-        ).lower()
-        for signature in self._cfg.founder_channel.usage_limit_signatures:
-            if signature in haystack:
-                return signature
-        return None
-
     async def check(
         self, result: AgentResult, *, unit_level: str, unit_id: str, role: str
-    ) -> None:
-        """Scan one agent result; page on a match (streak-deduplicated)."""
-        signature = self._match(result)
+    ) -> str | None:
+        """Scan one agent result; page on a match (streak-deduplicated).
+        Returns the matched signature (None on a clean check) — CCR-11: the
+        caller feeds the match into the capacity governor's HOLD entry and into
+        the incident-7 gate's ``usage_limit`` evidence mark."""
+        signature = _usage_limit_match(self._cfg, result)
         if signature is None:
             # Clean observation ends the streak: a future match re-pages.
             self._event_logged = False
             self._published = False
             self._delivery_failed_logged = False
-            return
+            return None
         if not self._event_logged:
             self._event_logged = True
             with self._db.transaction() as conn:
@@ -904,6 +911,331 @@ class _UsageLimitDetector:
                                 "error": str(exc),
                             },
                         )
+        return signature
+
+
+class CapacityGovernor:
+    """CCR-11 (D-0037) capacity governor (mechanical, Doctrine §20): when the
+    CCR-6 detector matches a usage-limit signature, the factory drains itself,
+    probes cheaply and resumes ALONE — no architect in the loop for limit-class
+    failures.
+
+    HOLD entry (``note_match``): in-memory flag + ONE persistent
+    'capacity_hold_started' event per hold episode (factory level; payload:
+    matched signature, role, process_id). The detector keeps its own CCR-6
+    page/event streak dedup — the governor never pages on entry.
+
+    HOLD semantics (``blocks``): while held, the executors skip any step whose
+    spawn set contains a claude-route role; codex/stub-routed steps proceed
+    (proven cross-provider independence — Tier-2/cross-audit keep flowing,
+    Tier-1 is mechanical and unaffected). A held step simply does not run this
+    tick: state untouched, NO event, NO escalation; the orchestrator keeps
+    ticking, so the §7 concurrency model and the watchdog's liveness
+    expectations are untouched.
+
+    PROBE (``tick``): every ``capacity_governor.probe_interval_s`` while held,
+    one canary run on the declared ``models.capacity_probe`` route (cheapest
+    claude). The probe is an ORDINARY registered run — process registry +
+    token ledger record it like everything else (role 'capacity_probe',
+    factory-level unit: the factory-level events precedent; the runner's unit
+    plumbing needs a non-NULL unit_id, so the honest minimal is the literal
+    'factory'). It bypasses the hold gate (it IS the gate's exit) and the
+    incident-7 gate (spawned directly through the runner, never through
+    ``_run_step_agent``), so a dead probe can NEVER escalate — explicitly:
+    probe failure is the held-state signal, nothing more, no escalation row.
+
+    AUTO-RESOLVE on hold lift: STRICTLY the open 'agent_run_failed'
+    escalations whose evidence carries ``usage_limit: true`` resolve through
+    the EXISTING machinery (db.resolve_escalation + 'escalation_resolved'
+    event, actor 'capacity_governor'); ``_step_escalated`` picks them up on
+    the next tick. Everything else stays open for the architect.
+
+    Hold state is in-memory ONLY (restart honesty, D-0037): an orchestrator
+    restart during an outage re-discovers the limit on its first dead claude
+    spawn — one wasted cheap spawn, accepted; ``reconcile_restart`` closes a
+    stale event pair at recovery so the dashboard read-path never lies.
+    """
+
+    #: The canary's config role key (models.capacity_probe, CCR-11).
+    PROBE_ROLE = "capacity_probe"
+
+    def __init__(
+        self, db: Database, cfg: FactoryConfig, runner: AgentRunner, notify: NtfyPublisher
+    ) -> None:
+        self._db = db
+        self._cfg = cfg
+        self._runner = runner
+        self._notify = notify
+        self._held = False
+        #: Loop-clock deadline of the next probe while held.
+        self._next_probe_at = 0.0
+        #: One alert_delivery_failed event per delivery-failure streak.
+        self._delivery_failed_logged = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._cfg.capacity_governor.enabled
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def blocks(self, roles: Sequence[str]) -> bool:
+        """True when the capacity hold gates a step that would spawn any
+        claude-route role. Config-unknown roles never block here — their
+        fail-explicit ConfigError belongs to the step itself."""
+        if not self._held:
+            return False
+        models = self._cfg.models
+        return any(role in models and models[role].cli == "claude" for role in roles)
+
+    def note_match(
+        self, *, signature: str, role: str, process_id: int | None
+    ) -> None:
+        """Mechanical HOLD entry (Doctrine §20) on a detector match. Idempotent
+        while held (one 'capacity_hold_started' event per episode); a no-op
+        when the governor is disabled (enabled:false = byte-identical to
+        pre-CCR-11, pinned by test)."""
+        if not self.enabled or self._held:
+            return
+        self._held = True
+        # First probe one full interval AFTER entry: capacity just proved
+        # dead — an immediate canary is a known-fail spawn.
+        self._next_probe_at = (
+            asyncio.get_running_loop().time()
+            + self._cfg.capacity_governor.probe_interval_s
+        )
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level="factory",
+                unit_id=None,
+                event_type="capacity_hold_started",
+                actor=_ACTOR,
+                payload={
+                    "signature": signature,
+                    "role": role,
+                    "process_id": process_id,
+                },
+            )
+
+    def reconcile_restart(self) -> None:
+        """Recovery-time honesty (D-0037 item 6): holds do NOT survive
+        restarts, so an unclosed capacity_hold_started/_ended event pair from
+        a previous process is closed here — otherwise the dashboard's
+        event-pair read-path would show a hold no live governor owns (forever,
+        if capacity returned while the orchestrator was down)."""
+        if self._hold_pair_open(self._db.read()):
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="capacity_hold_ended",
+                    actor=_ACTOR,
+                    payload={
+                        "reason": (
+                            "orchestrator restart — hold state is in-memory and"
+                            " is re-discovered on the first dead claude spawn"
+                            " (D-0037)"
+                        ),
+                    },
+                )
+
+    @staticmethod
+    def _hold_pair_open(conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT"
+            " COALESCE(MAX(CASE WHEN event_type='capacity_hold_started' THEN seq END), 0),"
+            " COALESCE(MAX(CASE WHEN event_type='capacity_hold_ended' THEN seq END), 0)"
+            " FROM events WHERE event_type IN"
+            " ('capacity_hold_started','capacity_hold_ended')"
+        ).fetchone()
+        return int(row[0]) > int(row[1])
+
+    async def tick(self) -> None:
+        """Scheduler-loop hook: when held and the probe is due, run it INLINE.
+        The await is bounded well under the watchdog staleness threshold (see
+        ``_probe``), and running executor tasks continue concurrently — only
+        new dispatches wait out the canary."""
+        if not self._held:
+            return
+        now = asyncio.get_running_loop().time()
+        if now < self._next_probe_at:
+            return
+        self._next_probe_at = now + self._cfg.capacity_governor.probe_interval_s
+        await self._probe()
+
+    async def _probe(self) -> None:
+        """One canary run. Success = exit 0 (not killed/timed out) AND no
+        usage-limit signature in the result — then the hold lifts; anything
+        else keeps the hold for the next interval. EXPLICITLY no escalation on
+        any probe outcome: the probe bypasses the incident-7 gate by
+        construction (direct runner spawn), and a dead canary every interval
+        would spam escalations that mean nothing beyond 'still held'."""
+        # Bound the inline await well under the watchdog staleness threshold:
+        # liveness is only touched between scheduler ticks, and a hung CLI must
+        # not turn the canary into a false 'orchestrator down' page.
+        timeout_s = max(
+            1,
+            min(
+                self._cfg.process.agent_timeout_s,
+                int(self._cfg.founder_channel.watchdog.staleness_threshold_s) // 2,
+            ),
+        )
+        try:
+            result = await self._runner.run_agent(
+                self.PROBE_ROLE,
+                'Răspunde cu un singur cuvânt: "pong".',
+                unit_level="factory",
+                unit_id="factory",
+                cwd=self._cfg.factory.home,
+                timeout_s=timeout_s,
+            )
+        except ProcessError as exc:
+            # Spawn impossibility (CLI missing, log dir unwritable, …): stay
+            # held, durable evidence, NO escalation row (probes never escalate).
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="alert",
+                    actor=_ACTOR,
+                    payload={"kind": "capacity_probe_spawn_failed", "error": str(exc)},
+                )
+            return
+        dead = result.exit_code != 0 or result.timed_out or result.killed
+        if dead or _usage_limit_match(self._cfg, result) is not None:
+            return  # still limited — hold stays, next probe in one interval
+        await self._lift_hold(probe_process_id=result.process_id)
+
+    async def _lift_hold(self, *, probe_process_id: int) -> None:
+        """Capacity is back: ONE tx = 'capacity_hold_ended' event + the strict
+        auto-resolve sweep (atomic resume facts), then the founder page OUTSIDE
+        the transaction (§7); delivery failure recorded, never raised."""
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level="factory",
+                unit_id=None,
+                event_type="capacity_hold_ended",
+                actor=_ACTOR,
+                payload={"probe_process_id": probe_process_id},
+            )
+            resolved = self._auto_resolve(conn)
+        self._held = False
+        try:
+            await self._notify.publish(
+                "Capacitate revenită — fabrica a reluat singură",
+                link=dashboard_link(self._cfg, "acum"),
+                priority=self._notify.priority_alert,
+            )
+            self._delivery_failed_logged = False
+        except NotifyError as exc:
+            if not self._delivery_failed_logged:
+                self._delivery_failed_logged = True
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert_delivery_failed",
+                        actor=_ACTOR,
+                        payload={
+                            "kind": "capacity_hold_ended",
+                            "resolved": resolved,
+                            "error": str(exc),
+                        },
+                    )
+
+    def _auto_resolve(self, conn: sqlite3.Connection) -> list[int]:
+        """STRICT auto-resolve scope (D-0037, pinned by test): open escalations
+        with trigger 'agent_run_failed' whose agent_run_failed EVENT evidence
+        carries ``usage_limit: true`` — nothing else, ever. Resolution token =
+        the stage's pre-escalation step, read from its ESCALATED transition's
+        from_state via ``_CAPACITY_RESOLUTIONS`` (AUDIT → 'rework:VALIDATE':
+        no rework:AUDIT exists in the vocabulary — the re-validation cost is
+        accepted; the transition tables stay untouched). Missing facts
+        (no event_seq, no limit mark, unmapped from_state such as MERGE_GATE)
+        leave the row open for the architect — never guessed (Doctrine §7).
+        Phase-level rows are out of scope by construction (the incident-7 gate
+        only inserts stage rows — phase spawns are the D-0036 watch item); the
+        unit_level filter pins that defensively. Resolution machinery = the
+        EXISTING pair (db.resolve_escalation + 'escalation_resolved' event,
+        the cli.cmd_resolve_escalation shape); the normal ``_step_escalated``
+        pickup routes the stage on the next tick."""
+        rows = conn.execute(
+            "SELECT * FROM escalations WHERE status = 'open'"
+            " AND trigger = 'agent_run_failed' AND unit_level = 'stage'"
+            " ORDER BY id"
+        ).fetchall()
+        resolved: list[int] = []
+        for row in rows:
+            if row["event_seq"] is None:
+                continue  # no evidence anchor — stays open, never guessed
+            erow = conn.execute(
+                "SELECT payload_json FROM events WHERE seq = ?", (row["event_seq"],)
+            ).fetchone()
+            if erow is None:
+                continue
+            try:
+                evidence = json.loads(erow["payload_json"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(evidence, dict) or evidence.get("usage_limit") is not True:
+                continue  # the limit mark is the WHOLE basis — no mark, no resume
+            trow = conn.execute(
+                "SELECT from_state FROM events WHERE unit_level = 'stage'"
+                " AND unit_id = ? AND event_type = 'transition'"
+                " AND to_state = 'ESCALATED' ORDER BY seq DESC LIMIT 1",
+                (row["unit_id"],),
+            ).fetchone()
+            token = (
+                None
+                if trow is None
+                else _CAPACITY_RESOLUTIONS.get(trow["from_state"] or "")
+            )
+            if token is None:
+                continue  # unmapped pre-escalation step — architect territory
+            fdb.resolve_escalation(conn, int(row["id"]), token)
+            fdb.insert_event(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=row["unit_id"],
+                event_type="escalation_resolved",
+                actor="capacity_governor",
+                payload={
+                    "escalation_id": int(row["id"]),
+                    "resolution": token,
+                    "reason": _CAPACITY_RESOLVE_REASON,
+                    "via": "capacity_governor",
+                },
+            )
+            resolved.append(int(row["id"]))
+        return resolved
+
+
+#: D-0037 auto-resolve rationale — lands in the escalation_resolved event and,
+#: via _resolution_reason, in the re-entered step's rework_context prompt line.
+_CAPACITY_RESOLVE_REASON = (
+    "capacity hold lifted — limit-class failure auto-resumed (D-0037)"
+)
+
+#: ESCALATED-transition from_state -> resolution token for the D-0037
+#: auto-resolve (every value ∈ models.STAGE_ESCALATION_RESOLUTIONS — pinned by
+#: test; the §3 transition tables are NOT touched). AUDIT maps to
+#: 'rework:VALIDATE' because no rework:AUDIT token exists in the vocabulary —
+#: the limit-killed auditor re-enters through a fresh validation pass
+#: (re-validation cost accepted). MERGE_GATE is deliberately absent: a
+#: limit-killed Tier-2 run has no declared mapping — it stays open for the
+#: architect.
+_CAPACITY_RESOLUTIONS: Mapping[str, str] = {
+    "SPEC": "rework:SPEC",
+    "BUILD": "rework:BUILD",
+    "VALIDATE": "rework:VALIDATE",
+    "AUDIT": "rework:VALIDATE",
+}
 
 
 # ------------------------------------------------------------- frozen interfaces
@@ -962,8 +1294,13 @@ class StageExecutor:
         thresholds: ThresholdEvaluator,
         consultor: Consultor,
         notify: NtfyPublisher,
+        governor: CapacityGovernor | None = None,
     ) -> None:
-        """Wires the stage conveyor; no policy outside config."""
+        """Wires the stage conveyor; no policy outside config. ``governor``
+        (CCR-11, optional): the SHARED capacity governor — cli wiring passes
+        one instance to both executors and the Scheduler so a hold entered
+        here gates the phase executor too and the loop probes it; standalone
+        construction (tests) gets a private instance."""
         self._db = db
         self._sm = sm
         self._cfg = cfg
@@ -976,6 +1313,8 @@ class StageExecutor:
         self._oob = _OutOfBoundsDetector(db, cfg, notify)
         #: CCR-6: usage-limit scan after every conveyor agent run.
         self._usage_limit = _UsageLimitDetector(db, cfg, notify)
+        #: CCR-11 (D-0037): capacity hold entry + step gate.
+        self._governor = governor or CapacityGovernor(db, cfg, runner, notify)
 
     # ---------------------------------------------------------------- protocol
 
@@ -996,6 +1335,14 @@ class StageExecutor:
             stage = self._stage(unit_id)
             step = steps.get(stage.state)
             if step is None:  # DONE / FAILED / CANCELLED
+                return
+            if self._governor.held and self._governor.blocks(
+                self._step_spawn_roles(stage)
+            ):
+                # CCR-11 (D-0037) capacity hold: this step would spawn a
+                # claude-route agent — it simply does not run this tick (state
+                # untouched, NO event, NO escalation); codex/stub-routed steps
+                # proceed, and the hold-exit probe's events re-dispatch us.
                 return
             try:
                 progressed = await step(stage)
@@ -1033,6 +1380,29 @@ class StageExecutor:
     def _unit_dir(self, root: Path, stage: Stage) -> Path:
         return unit_artifact_dir(root, Level.STAGE, stage.id)
 
+    def _step_spawn_roles(self, stage: Stage) -> tuple[str, ...]:
+        """Roles the CURRENT step may spawn — the capacity-hold predicate
+        (CCR-11/D-0037), evaluated only while held. Conservative by design: a
+        step is held when ANY role it might spawn routes to claude (VALIDATE
+        includes the conditional CP-1 consult; AUDIT includes the responder),
+        because a mid-step block would leave a half-run step behind. Steps
+        with no LLM spawn (dispatch, gates, ESCALATED — the auto-resolve
+        pickup) return () and are never held."""
+        if stage.state is StageState.SPEC:
+            return ("spec_agent",)
+        if stage.state is StageState.BUILD:
+            return (_builder_role(self._cfg, stage.risk_class),)
+        if stage.state is StageState.VALIDATE:
+            return (self._validator_role(stage), _cp_point(self._cfg, CP1_ID).role)
+        if stage.state is StageState.AUDIT:
+            return (
+                *self._risk_cfg(stage).audits,
+                _builder_role(self._cfg, stage.risk_class),
+            )
+        if stage.state is StageState.MERGE_GATE:
+            return ("integration_validator",)
+        return ()
+
     async def _run_step_agent(
         self,
         stage: Stage,
@@ -1057,9 +1427,15 @@ class StageExecutor:
         # CCR-6: capacity-event scan before anything consumes the result — a
         # usage-limited CLI exits "successfully" with a refusal text, and the
         # founder asked to be paged on the first suspicion (D-0021 class).
-        await self._usage_limit.check(
+        matched = await self._usage_limit.check(
             result, unit_level=Level.STAGE.value, unit_id=stage.id, role=role
         )
+        if matched is not None:
+            # CCR-11 (D-0037): mechanical HOLD entry — the detector already
+            # paged (its own streak dedup); the governor records the episode.
+            self._governor.note_match(
+                signature=matched, role=role, process_id=result.process_id
+            )
         sentinels = detect_sentinels(self._unit_dir(cwd, stage))
         if sentinels:
             with self._db.transaction() as conn:
@@ -1088,7 +1464,17 @@ class StageExecutor:
         if not sentinels and (
             result.exit_code != 0 or result.timed_out or result.killed
         ):
-            await self._escalate_agent_run_failed(stage, role, result, cwd)
+            # CCR-11 (D-0037): limit-mark the gate — the evidence carries
+            # usage_limit so the governor's auto-resolve can tell limit-class
+            # corpses from genuine failures. Recorded only while the governor
+            # is enabled (enabled:false stays byte-identical to pre-CCR-11).
+            await self._escalate_agent_run_failed(
+                stage,
+                role,
+                result,
+                cwd,
+                usage_limit=(matched is not None) if self._governor.enabled else None,
+            )
             raise _AgentRunFailed(
                 f"stage {stage.id}: {role} run failed (exit_code={result.exit_code},"
                 f" timed_out={result.timed_out}, killed={result.killed})"
@@ -1097,7 +1483,13 @@ class StageExecutor:
         return result
 
     async def _escalate_agent_run_failed(
-        self, stage: Stage, role: str, result: AgentResult, cwd: Path
+        self,
+        stage: Stage,
+        role: str,
+        result: AgentResult,
+        cwd: Path,
+        *,
+        usage_limit: bool | None = None,
     ) -> None:
         """Incident 7 (D-0035) gate bookkeeping: discard the dead run's
         uncommitted leftovers (stage worktree only — a scratch cwd is disposed
@@ -1118,6 +1510,12 @@ class StageExecutor:
             "duration_ms": result.duration_ms,
             "stderr_path": result.stderr_path,
         }
+        if usage_limit is not None:
+            # CCR-11 (D-0037): the limit mark — the governor's auto-resolve
+            # scope filter (True ⇔ the dead run matched a usage_limit
+            # signature). None = governor disabled: key omitted, payload
+            # byte-identical to pre-CCR-11.
+            evidence["usage_limit"] = usage_limit
         if (
             stage.worktree_path
             and cwd.resolve() == Path(stage.worktree_path).resolve()
@@ -2952,11 +3350,13 @@ class PhaseExecutor:
         runner: AgentRunner,
         wt: WorktreeManager,
         notify: NtfyPublisher,
+        governor: CapacityGovernor | None = None,
     ) -> None:
         """Ingests phase-plan.json strictly via artifacts.read_phase_plan (schema +
         acyclicity validated BEFORE the CONTRACTS_FROZEN→RUNNING transition; failure =
         ArtifactContractError → escalation) into stages+dag_edges. An LLM-produced plan
-        is never trusted unvalidated (Doctrine §7)."""
+        is never trusted unvalidated (Doctrine §7). ``governor`` (CCR-11,
+        optional): the SHARED capacity governor — see StageExecutor."""
         self._db = db
         self._sm = sm
         self._cfg = cfg
@@ -2965,6 +3365,8 @@ class PhaseExecutor:
         self._notify = notify
         #: CCR-6: usage-limit scan after the planning spawn.
         self._usage_limit = _UsageLimitDetector(db, cfg, notify)
+        #: CCR-11 (D-0037): capacity hold entry + step gate.
+        self._governor = governor or CapacityGovernor(db, cfg, runner, notify)
 
     # ---------------------------------------------------------------- protocol
 
@@ -2984,6 +3386,12 @@ class PhaseExecutor:
             phase = self._phase(unit_id)
             step = steps.get(phase.state)
             if step is None:
+                return
+            if self._governor.held and self._governor.blocks(
+                self._step_spawn_roles(phase)
+            ):
+                # CCR-11 (D-0037) capacity hold — same contract as the stage
+                # conveyor: a held step does not run this tick, no new state.
                 return
             if not await step(phase):
                 return
@@ -3007,6 +3415,19 @@ class PhaseExecutor:
 
     def _unit_dir(self, root: Path, phase: Phase) -> Path:
         return unit_artifact_dir(root, Level.PHASE, phase.id)
+
+    def _step_spawn_roles(self, phase: Phase) -> tuple[str, ...]:
+        """Roles the CURRENT phase step may spawn — the capacity-hold
+        predicate (CCR-11/D-0037; the StageExecutor contract). PLANNING spawns
+        the Phase Architect; INTEGRATING spawns the phase-level Tier-2
+        validator (Tier-1 is mechanical); everything else (dispatch, ingest,
+        RUNNING child reactions, gates, ESCALATED) spawns no LLM and is never
+        held."""
+        if phase.state is PhaseState.PLANNING:
+            return ("phase_architect",)
+        if phase.state is PhaseState.INTEGRATING:
+            return ("integration_validator",)
+        return ()
 
     def _stage_id(self, phase: Phase, plan_stage_id: str) -> str:
         """Plan-local stage ids are namespaced by phase (stages.id is a global PK)."""
@@ -3143,9 +3564,19 @@ class PhaseExecutor:
         )
         # CCR-6: capacity-event scan right after the spawn (same contract as
         # the stage conveyor's _run_step_agent).
-        await self._usage_limit.check(
+        matched = await self._usage_limit.check(
             result, unit_level=Level.PHASE.value, unit_id=phase.id, role="phase_architect"
         )
+        if matched is not None:
+            # CCR-11 (D-0037): mechanical HOLD entry from the planning spawn —
+            # phase-level escalations stay OUT of the auto-resolve scope (the
+            # incident-7 gate does not cover phase spawns yet, D-0036), but
+            # the hold itself is factory-wide.
+            self._governor.note_match(
+                signature=matched,
+                role="phase_architect",
+                process_id=result.process_id,
+            )
         if await self._detect_phase_sentinels(phase, worktree):
             return False
         unit_dir = self._unit_dir(worktree, phase)
@@ -4110,17 +4541,23 @@ class Scheduler:
         executors: Mapping[Level, UnitExecutor],
         notify: NtfyPublisher,
         dashboard: DashboardServer | None = None,
+        governor: CapacityGovernor | None = None,
     ) -> None:
         """Level-agnostic loop over sched categories + dag_edges; max
         process.max_parallel_agents concurrent units. ``dashboard`` (CCR-3,
         optional, default None — tests/run_until_blocked unaffected): when
-        present, ``_run`` hosts the contained ``_dashboard_supervisor``."""
+        present, ``_run`` hosts the contained ``_dashboard_supervisor``.
+        ``governor`` (CCR-11, optional, default None): the SHARED capacity
+        governor instance also wired into both executors — when present, the
+        loop runs its hold-exit probe every tick; None (tests that wire the
+        graph by hand) skips probing, exactly like enabled:false."""
         self._db = db
         self._sm = sm
         self._cfg = cfg
         self._executors = dict(executors)
         self._notify = notify
         self._dashboard = dashboard
+        self._governor = governor
         #: Total dashboard supervisor restarts (paging-dedup counter, design §6).
         self._dashboard_restarts = 0
         #: Internal worktree manager for recover()'s §5.5b git healing — a
@@ -4191,6 +4628,14 @@ class Scheduler:
         return asyncio.run(self._recover_async())
 
     async def _recover_async(self) -> RecoveryReport:
+        if self._governor is not None:
+            # CCR-11 (D-0037) restart honesty: holds are in-memory only —
+            # close a stale capacity_hold_started/_ended event pair from the
+            # previous process so the dashboard read-path never shows a hold
+            # no live governor owns. The limit, if still real, re-discovers
+            # itself on the first dead claude spawn (one cheap spawn wasted —
+            # accepted).
+            self._governor.reconcile_restart()
         orphaned, killed_groups = self._orphan_sweep()  # (a)
         self._touch_liveness()
         healed, heal_errors, dirty_reset = await self._heal_git()  # (b)
@@ -4507,6 +4952,13 @@ class Scheduler:
                     scan = self._scan_units()
                     await self._stall_detector(scan)
                     await self._decision_latency_alerts()
+                    if self._governor is not None:
+                        # CCR-11 (D-0037): hold-exit probe — a no-op unless a
+                        # capacity hold is active and the interval elapsed; a
+                        # successful canary lifts the hold + auto-resolves the
+                        # limit-marked escalations BEFORE this tick's dispatch,
+                        # so the freed units re-enter in the same tick.
+                        await self._governor.tick()
                     dispatched = self._dispatch(tg, scan)
                     if stop_when_blocked and not self._tasks and dispatched == 0:
                         return

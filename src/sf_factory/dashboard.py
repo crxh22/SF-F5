@@ -108,6 +108,7 @@ RO: Mapping[str, str] = {
     "pulse_missing": "fișierul de puls lipsește — orchestratorul nu a pornit încă",
     "pulse_stale": "posibil căzut",
     "pulse_now": "acum",
+    "capacity_hold": "pauză de capacitate — sondez la fiecare {minutes} min",
     "phases_label": "Faze",
     "queue_label": "Coadă etape",
     "queue_waiting": "în așteptarea dependențelor",
@@ -367,6 +368,7 @@ GLOSS: Mapping[str, str] = {
     "auditor_cross_model": "auditor încrucișat (codex)",
     "cp1_triage": "triaj CP-1",
     "decision_session": "sesiune de decizie",
+    "capacity_probe": "sondă de capacitate",
     # ledger model tokens (§11/F6: models.*.model values + pricing.usd_per_mtok
     # keys; codex rows record 'default' — the §11.5.4 attribution watch item)
     "fable": "Claude Fable",
@@ -945,6 +947,10 @@ class HealthStrip:
     incident: Incident | None
     escalations: tuple[EscalationRow, ...]
     last_resolved: ResolvedEscalation | None
+    #: CCR-11 (D-0037): pre-rendered RO hold line when a capacity hold is
+    #: active (a capacity_hold_started event without a later _ended one —
+    #: read-path only); None otherwise.
+    capacity_hold_display: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1276,6 +1282,23 @@ def _build_health(
                 decision_request_id=decision_request_id,
             )
         )
+    # CCR-11 (D-0037): the capacity hold is active when the newest
+    # capacity_hold_started event has no later capacity_hold_ended — pure
+    # read-path (the governor owns the writes; recover() closes stale pairs).
+    hold_row = conn.execute(
+        "SELECT"
+        " COALESCE(MAX(CASE WHEN event_type='capacity_hold_started' THEN seq END), 0)"
+        " AS started,"
+        " COALESCE(MAX(CASE WHEN event_type='capacity_hold_ended' THEN seq END), 0)"
+        " AS ended"
+        " FROM events WHERE event_type IN"
+        " ('capacity_hold_started','capacity_hold_ended')"
+    ).fetchone()
+    capacity_hold_display = None
+    if int(hold_row["started"]) > int(hold_row["ended"]):
+        minutes = max(1, round(cfg.capacity_governor.probe_interval_s / 60))
+        capacity_hold_display = RO["capacity_hold"].format(minutes=minutes)
+
     resolved_row = conn.execute(
         "SELECT * FROM escalations WHERE status = 'resolved'"
         " ORDER BY resolved_at DESC, id DESC LIMIT 1"
@@ -1307,6 +1330,7 @@ def _build_health(
         incident=incident,
         escalations=tuple(escalations),
         last_resolved=last_resolved,
+        capacity_hold_display=capacity_hold_display,
     )
 
 
@@ -1708,8 +1732,18 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     stale_mark = (
         f" <span class='rosu'>{esc(RO['pulse_stale'])}</span>" if health.liveness_stale else ""
     )
+    # CCR-11 (D-0037): one extra Puls line while a capacity hold is active —
+    # the founder sees the factory paused itself and is probing, nothing more.
+    hold_line = (
+        f"<p class='rosu'>{esc(health.capacity_hold_display)}</p>"
+        if health.capacity_hold_display
+        else ""
+    )
     blocks.append(
-        _bloc(RO["pulse_label"], f"<p>{esc(health.liveness_display)}{stale_mark}</p>")
+        _bloc(
+            RO["pulse_label"],
+            f"<p>{esc(health.liveness_display)}{stale_mark}</p>{hold_line}",
+        )
     )
 
     if health.phases:

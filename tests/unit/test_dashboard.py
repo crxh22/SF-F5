@@ -573,6 +573,42 @@ def test_health_strip_budget_and_incident(denv) -> None:
     assert dash.RO["pulse_stale"] in page
 
 
+def test_health_strip_capacity_hold_line(denv) -> None:
+    """CCR-11 (D-0037 item 8): an open capacity_hold_started/_ended event pair
+    renders ONE extra Puls line („pauză de capacitate — sondez la fiecare X
+    min", X from capacity_governor.probe_interval_s); a closed pair renders
+    nothing. Read-path only — no governor needs to be running."""
+    _seed_unit(denv)
+    expected = dash.RO["capacity_hold"].format(minutes=5)  # default 300s
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert expected not in page  # no hold events yet
+    with denv.db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="factory",
+            unit_id=None,
+            event_type="capacity_hold_started",
+            actor="control_plane",
+            payload={"signature": "usage limit", "role": "validator", "process_id": 1},
+        )
+    view = dash.build_view(denv.cfg)
+    assert view.health.capacity_hold_display == expected
+    page = dash.render_page(view, denv.cfg)
+    assert expected in page
+    with denv.db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="factory",
+            unit_id=None,
+            event_type="capacity_hold_ended",
+            actor="control_plane",
+            payload={"probe_process_id": 2},
+        )
+    view = dash.build_view(denv.cfg)
+    assert view.health.capacity_hold_display is None
+    assert expected not in dash.render_page(view, denv.cfg)
+
+
 def test_plan_section_groups_and_footer(denv) -> None:
     _seed_unit(denv)
     now = utc_now()

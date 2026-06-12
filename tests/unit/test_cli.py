@@ -115,10 +115,13 @@ def _install_fake_graph(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             executors: Any,
             notify: Any,
             dashboard: Any = None,
+            governor: Any = None,
         ) -> None:
             record["scheduler_args"] = (db, sm, cfg, executors, notify)
             # CCR-3 kwarg: the (real) DashboardServer cli run wires, None on resume.
             record["scheduler_dashboard"] = dashboard
+            # CCR-11 kwarg: the SHARED capacity governor.
+            record["scheduler_governor"] = governor
             self._dashboard = dashboard
 
         def recover(self) -> SimpleNamespace:
@@ -137,12 +140,18 @@ def _install_fake_graph(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             record["ran"] = "until_blocked"
 
     class FakeStageExecutor:
-        def __init__(self, *args: Any) -> None:
+        def __init__(self, *args: Any, governor: Any = None) -> None:
             record["stage_executor_args"] = args
+            record["stage_executor_governor"] = governor
 
     class FakePhaseExecutor:
-        def __init__(self, *args: Any) -> None:
+        def __init__(self, *args: Any, governor: Any = None) -> None:
             record["phase_executor_args"] = args
+            record["phase_executor_governor"] = governor
+
+    class FakeCapacityGovernor:
+        def __init__(self, *args: Any) -> None:
+            record["governor_args"] = args
 
     class FakeConsultor:
         def __init__(self, *args: Any) -> None:
@@ -152,6 +161,7 @@ def _install_fake_graph(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sched_mod.Scheduler = FakeScheduler  # type: ignore[attr-defined]
     sched_mod.StageExecutor = FakeStageExecutor  # type: ignore[attr-defined]
     sched_mod.PhaseExecutor = FakePhaseExecutor  # type: ignore[attr-defined]
+    sched_mod.CapacityGovernor = FakeCapacityGovernor  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "sf_factory.scheduler", sched_mod)
 
     cons_mod = types.ModuleType("sf_factory.consultation")
@@ -404,6 +414,16 @@ def test_run_wires_frozen_graph_recovers_and_runs_forever(
     assert len(record["consultor_args"]) == 3
     assert record["consultor_args"][0] is cfg
     assert record["consultor_args"][1] is db
+
+    # CCR-11 (D-0037): ONE shared CapacityGovernor(db, cfg, runner, notify) —
+    # the SAME instance reaches both executors and the Scheduler.
+    governor = record["scheduler_governor"]
+    assert governor is not None
+    assert record["stage_executor_governor"] is governor
+    assert record["phase_executor_governor"] is governor
+    assert len(record["governor_args"]) == 4
+    assert record["governor_args"][0] is db
+    assert record["governor_args"][1] is cfg
 
     # CCR-4 production wiring (dashboard design §1/§6): run constructs the REAL
     # DashboardServer, hands the same instance to Scheduler(dashboard=...), and

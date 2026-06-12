@@ -16,7 +16,7 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +44,7 @@ from sf_factory.models import (
 )
 from sf_factory.runner import AgentResult
 from sf_factory.scheduler import (
+    CapacityGovernor,
     PhaseExecutor,
     RecoveryReport,
     Scheduler,
@@ -742,7 +743,7 @@ async def test_liveness_and_pidfile_refreshed(db, config_dict) -> None:
 
 
 def make_phase_executor(
-    db, cfg: FactoryConfig, runner=None, wt=None, notify=None
+    db, cfg: FactoryConfig, runner=None, wt=None, notify=None, governor=None
 ) -> PhaseExecutor:
     return PhaseExecutor(
         db,
@@ -751,6 +752,7 @@ def make_phase_executor(
         runner or FakeRunner(),
         wt or FakeWorktrees(Path(cfg.factory.home) / "scratch"),
         notify or FakeNotify(),
+        governor=governor,
     )
 
 
@@ -3366,6 +3368,474 @@ async def test_agent_run_failed_rework_build_reenters_cleanly(
     assert open_escalations(db, "ph.s1") == []
     builder_calls = [c for c in env.runner.calls if c.role == "builder_routine"]
     assert len(builder_calls) == 2  # the failed spawn + the healthy completion
+
+
+# ------------------------------------ CCR-11 (D-0037): capacity governor
+
+
+class _RefusalRunner(FakeRunner):
+    """FakeRunner that injects a usage-limit refusal text into the results of
+    the given roles (others — the probe role included — stay clean); the
+    per-role FIFO ``outcomes`` still controls the exit shape."""
+
+    def __init__(self, db, refusal_text: str, roles: set[str]) -> None:
+        super().__init__(db)
+        self._text = refusal_text
+        self._roles = set(roles)
+
+    async def run_agent(self, role: str, prompt: str, **kwargs: Any) -> AgentResult:
+        result = await super().run_agent(role, prompt, **kwargs)
+        if role in self._roles:
+            result = replace(result, result_text=self._text)
+        return result
+
+
+def _enable_governor(config_dict, *, probe_interval_s: float = 0.01) -> None:
+    config_dict["capacity_governor"] = {
+        "enabled": True,
+        "probe_interval_s": probe_interval_s,
+    }
+    config_dict["models"]["capacity_probe"] = {
+        "cli": "claude",
+        "model": "haiku",
+        "mode": "print",
+    }
+
+
+def make_governor_env(
+    db, config_dict, tmp_path: Path, *, risk: str = "routine", runner=None
+):
+    """make_stage_env shape with the governor ENABLED and SHARED (the cli
+    wiring contract): one CapacityGovernor instance across executor + tests."""
+    _enable_governor(config_dict)
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.RUNNING)
+    worktree = tmp_path / "stage-wt"
+    init_repo(worktree)
+    insert_stage(db, "ph.s1", "ph", StageState.VALIDATE, risk=risk, worktree=worktree)
+    runner = runner if runner is not None else FakeRunner(db)
+    notify = FakeNotify()
+    governor = CapacityGovernor(db, cfg, runner, notify)
+    executor = StageExecutor(
+        db,
+        StateMachine(db),
+        cfg,
+        runner,
+        FakeWorktrees(tmp_path / "scratch"),
+        ThresholdEvaluator(db, cfg),
+        FakeConsultor([]),
+        notify,
+        governor=governor,
+    )
+    return SimpleNamespace(
+        cfg=cfg,
+        worktree=worktree,
+        runner=runner,
+        notify=notify,
+        governor=governor,
+        executor=executor,
+    )
+
+
+def _factory_events(db, event_type: str) -> list[dict]:
+    rows = (
+        db.read()
+        .execute(
+            "SELECT * FROM events WHERE unit_level = 'factory' AND event_type = ?"
+            " ORDER BY seq",
+            (event_type,),
+        )
+        .fetchall()
+    )
+    return [dict(row) for row in rows]
+
+
+def _all_escalations(db) -> list[dict]:
+    rows = db.read().execute("SELECT * FROM escalations ORDER BY id").fetchall()
+    return [dict(row) for row in rows]
+
+
+async def test_capacity_hold_starts_on_signature_match_and_marks_gate(
+    db, config_dict, tmp_path
+) -> None:
+    """HOLD entry (D-0037 item 1+2): a detector match enters the capacity hold
+    mechanically — ONE factory-level 'capacity_hold_started' event (signature,
+    role, process_id) — and the dead run's incident-7 escalation evidence
+    carries the limit mark ``usage_limit: true``."""
+    runner = _RefusalRunner(db, "claude: usage limit reached", {"validator"})
+    env = make_governor_env(db, config_dict, tmp_path, runner=runner)
+    env.runner.outcomes["validator"] = [{"exit_code": 1, "process_id": 9}]
+
+    await env.executor.execute("ph.s1")
+
+    assert env.governor.held is True
+    (hold,) = _factory_events(db, "capacity_hold_started")
+    assert hold["actor"] == "control_plane"
+    assert json.loads(hold["payload_json"]) == {
+        "signature": "usage limit",
+        "role": "validator",
+        "process_id": 9,
+    }
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_run_failed"
+    (event,) = events_of(db, "ph.s1", "agent_run_failed")
+    assert json.loads(event["payload_json"])["usage_limit"] is True
+    # The CCR-6 detector behavior is untouched: event + page still land.
+    assert len(events_of(db, "ph.s1", "usage_limit_suspected")) == 1
+    # A second match while held adds no second hold event (one per episode).
+    insert_stage(db, "ph.s2", "ph", StageState.BUILD, worktree=env.worktree)
+    runner._roles.add("builder_routine")
+    env.runner.outcomes["builder_routine"] = [{"exit_code": 1}]
+    # builder_routine routes to the stub here — the hold does not block it.
+    await env.executor.execute("ph.s2")
+    assert len(_factory_events(db, "capacity_hold_started")) == 1
+
+
+async def test_capacity_hold_blocks_claude_steps_codex_proceeds(
+    db, config_dict, tmp_path
+) -> None:
+    """HOLD semantics (D-0037 item 3): while held, a step whose spawn set
+    contains a claude-route role does not run this tick — state untouched, NO
+    event, NO escalation — while codex-routed steps proceed through the
+    conveyor (cross-provider independence) up to the next claude-gated step."""
+    config_dict["models"]["builder_routine"]["cli"] = "claude"
+    config_dict["models"]["builder_heavy"]["cli"] = "codex"
+    config_dict["models"]["validator_structural"]["cli"] = "codex"
+    config_dict["models"]["integration_validator"]["cli"] = "claude"
+    config_dict["risk_classes"]["structural"]["audits"] = []
+    env = make_governor_env(db, config_dict, tmp_path, risk="routine")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    codex_wt = tmp_path / "stage-wt-2"
+    init_repo(codex_wt)
+    insert_stage(db, "ph.s2", "ph", StageState.BUILD, risk="structural", worktree=codex_wt)
+    env.governor.note_match(signature="usage limit", role="validator", process_id=1)
+
+    env.runner.behaviors["builder_heavy"] = builder_writing([0])
+    env.runner.behaviors["validator_structural"] = validator_writing(0)
+    await env.executor.execute("ph.s1")  # claude builder — held
+    await env.executor.execute("ph.s2")  # codex builder + validator — proceeds
+
+    assert stage_state(db, "ph.s1") is StageState.BUILD  # untouched
+    assert events_of(db, "ph.s1") == []  # holding writes NOTHING for the unit
+    assert open_escalations(db, "ph.s1") == []  # holding never escalates
+    assert [c.role for c in env.runner.calls if c.unit_id == "ph.s1"] == []
+    # The codex stage flowed BUILD -> VALIDATE -> MERGE_GATE, then held at the
+    # claude-routed Tier-2 spawn BEFORE the OPEN-2 ConfigError the gate would
+    # raise — proof the held MERGE_GATE step never started.
+    assert stage_state(db, "ph.s2") is StageState.MERGE_GATE
+    assert [c.role for c in env.runner.calls if c.unit_id == "ph.s2"] == [
+        "builder_heavy",
+        "validator_structural",
+    ]
+    assert open_escalations(db, "ph.s2") == []
+
+
+async def test_capacity_probe_failure_keeps_hold_and_never_escalates(
+    db, config_dict, tmp_path
+) -> None:
+    """PROBE failure (D-0037 item 4): a dead canary (exit 1) and a canary that
+    answers with a refusal text both keep the hold — and NEITHER produces an
+    escalation row (probes are exempt from the incident-7 gate by
+    construction: spawned directly through the runner)."""
+    env = make_governor_env(db, config_dict, tmp_path)
+    env.governor.note_match(signature="usage limit", role="validator", process_id=1)
+    escalations_before = _all_escalations(db)
+
+    env.runner.outcomes["capacity_probe"] = [{"exit_code": 1}]
+    await asyncio.sleep(0.02)  # past probe_interval_s=0.01
+    await env.governor.tick()
+    assert env.governor.held is True
+
+    # Exit-0 refusal: the result text still matches a signature — held.
+    env.runner.outcomes["capacity_probe"] = [
+        {"exit_code": 0, "result_text": "error: usage limit reached, retry later"}
+    ]
+    await asyncio.sleep(0.02)
+    await env.governor.tick()
+    assert env.governor.held is True
+
+    probe_calls = [c for c in env.runner.calls if c.role == "capacity_probe"]
+    assert len(probe_calls) == 2
+    assert all(c.unit_id == "factory" for c in probe_calls)
+    assert _factory_events(db, "capacity_hold_ended") == []
+    assert _all_escalations(db) == escalations_before  # NO escalation rows
+    assert env.notify.published == []  # no resume page while held
+
+
+async def test_capacity_probe_success_lifts_hold_pages_and_auto_resolves_strictly(
+    db, config_dict, tmp_path
+) -> None:
+    """PROBE success + AUTO-RESOLVE (D-0037 items 4+5): the hold lifts with a
+    'capacity_hold_ended' event and the Romanian founder page, and EXACTLY the
+    limit-marked agent_run_failed escalations resolve (rework token from the
+    ESCALATED transition's from_state) — a non-limit agent_run_failed and an
+    unresolved_contest stay open (pinned)."""
+    runner = _RefusalRunner(db, "error: usage limit reached", {"validator"})
+    env = make_governor_env(db, config_dict, tmp_path, runner=runner)
+    # Limit-marked corpse: validator dies with the refusal -> usage_limit: true.
+    env.runner.outcomes["validator"] = [{"exit_code": 1}]
+    await env.executor.execute("ph.s1")
+    assert env.governor.held is True
+    # Non-limit corpse on a sibling: clean exit-1 builder, no signature.
+    wt2 = tmp_path / "stage-wt-2"
+    init_repo(wt2)
+    insert_stage(db, "ph.s2", "ph", StageState.BUILD, worktree=wt2)
+    env.runner.outcomes["builder_routine"] = [{"exit_code": 1}]
+    await env.executor.execute("ph.s2")
+    assert json.loads(
+        events_of(db, "ph.s2", "agent_run_failed")[0]["payload_json"]
+    )["usage_limit"] is False
+    # A different open trigger on a third stage: NEVER auto-resolved.
+    insert_stage(db, "ph.s3", "ph", StageState.ESCALATED)
+    with db.transaction() as conn:
+        fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s3",
+                trigger="unresolved_contest",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+
+    await asyncio.sleep(0.02)
+    await env.governor.tick()  # default FakeRunner result: exit 0, clean text
+
+    assert env.governor.held is False
+    (ended,) = _factory_events(db, "capacity_hold_ended")
+    assert "probe_process_id" in json.loads(ended["payload_json"])
+    # The resume page (the detector/B7 pages preceded it during the outage).
+    (resume,) = [
+        p
+        for p in env.notify.published
+        if p[0] == "Capacitate revenită — fabrica a reluat singură"
+    ]
+    assert resume[2] == "max" and resume[1] is not None and resume[1].startswith("http")
+    # STRICT scope: only the limit-marked ph.s1 row resolved.
+    rows = {(r["unit_id"], r["trigger"]): r for r in _all_escalations(db)}
+    s1 = rows[("ph.s1", "agent_run_failed")]
+    assert s1["status"] == "resolved"
+    assert s1["resolution"] == "rework:VALIDATE"  # from_state VALIDATE
+    assert rows[("ph.s2", "agent_run_failed")]["status"] == "open"
+    assert rows[("ph.s3", "unresolved_contest")]["status"] == "open"
+    (resolved_event,) = events_of(db, "ph.s1", "escalation_resolved")
+    assert resolved_event["actor"] == "capacity_governor"
+    payload = json.loads(resolved_event["payload_json"])
+    assert payload["resolution"] == "rework:VALIDATE"
+    assert payload["reason"] == (
+        "capacity hold lifted — limit-class failure auto-resumed (D-0037)"
+    )
+    # The normal _step_escalated pickup routes the stage back to VALIDATE and
+    # the conveyor completes to MERGE_GATE (OPEN-2 raises there, as always).
+    env.runner.behaviors["validator"] = validator_writing(0)
+    runner._roles.discard("validator")
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await env.executor.execute("ph.s1")
+    assert ("ESCALATED", "VALIDATE") in transitions_of(db, "ph.s1")
+
+
+async def test_capacity_resolution_map_audit_maps_to_rework_validate(
+    db, config_dict, tmp_path
+) -> None:
+    """from_state -> token mapping (D-0037 item 5): AUDIT resolves as
+    'rework:VALIDATE' (no rework:AUDIT exists in the vocabulary — pinned), the
+    map's values all belong to STAGE_ESCALATION_RESOLUTIONS, and the routing
+    re-enters VALIDATE through the untouched transition table."""
+    from sf_factory.models import STAGE_ESCALATION_RESOLUTIONS
+
+    assert sched_mod._CAPACITY_RESOLUTIONS == {
+        "SPEC": "rework:SPEC",
+        "BUILD": "rework:BUILD",
+        "VALIDATE": "rework:VALIDATE",
+        "AUDIT": "rework:VALIDATE",
+    }
+    assert set(sched_mod._CAPACITY_RESOLUTIONS.values()) <= set(
+        STAGE_ESCALATION_RESOLUTIONS
+    )
+
+    env = make_governor_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "AUDIT")
+    sm = StateMachine(db)
+
+    def coupled(conn) -> None:
+        seq = fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="agent_run_failed",
+            actor="control_plane",
+            payload={"role": "auditor_same_model", "usage_limit": True},
+        )
+        fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="agent_run_failed",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=seq,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+
+    sm.transition(
+        Level.STAGE,
+        "ph.s1",
+        StageState.ESCALATED.value,
+        actor="control_plane",
+        reason="agent run failed: not-cleanly-zero exit, no sentinel declared",
+        coupled=coupled,
+    )
+    env.governor.note_match(
+        signature="usage limit", role="auditor_same_model", process_id=1
+    )
+    await asyncio.sleep(0.02)
+    await env.governor.tick()
+
+    (row,) = _all_escalations(db)
+    assert row["status"] == "resolved" and row["resolution"] == "rework:VALIDATE"
+
+
+async def test_capacity_governor_disabled_is_byte_identical(
+    db, config_dict, tmp_path
+) -> None:
+    """enabled:false pin (D-0037 item 7): without the section (default
+    disabled) a signature-matching dead run behaves EXACTLY like pre-CCR-11 —
+    same escalation with NO usage_limit key in the evidence, no hold events,
+    no blocking, no probe spawns; the CCR-6 detector page is unchanged."""
+    assert "capacity_governor" not in config_dict
+    runner = _RefusalRunner(db, "claude: usage limit reached", {"validator"})
+    env = make_stage_env(db, config_dict, tmp_path)
+    executor = StageExecutor(
+        db,
+        StateMachine(db),
+        env.cfg,
+        runner,
+        FakeWorktrees(tmp_path / "scratch"),
+        ThresholdEvaluator(db, env.cfg),
+        FakeConsultor([]),
+        env.notify,
+    )
+    runner.outcomes["validator"] = [{"exit_code": 1}]
+
+    await executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (event,) = events_of(db, "ph.s1", "agent_run_failed")
+    assert "usage_limit" not in json.loads(event["payload_json"])  # byte-identical
+    assert _factory_events(db, "capacity_hold_started") == []
+    assert [c.role for c in runner.calls] == ["validator"]  # no probe spawn
+    assert len(events_of(db, "ph.s1", "usage_limit_suspected")) == 1  # CCR-6 kept
+    # Holding never engages: a later step on a fresh stage spawns normally.
+    insert_stage(db, "ph.s2", "ph", StageState.BUILD, worktree=env.worktree)
+    runner.behaviors["builder_routine"] = builder_writing([0])
+    runner.behaviors["validator"] = validator_writing(0)
+    runner._roles.clear()
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await executor.execute("ph.s2")
+    assert stage_state(db, "ph.s2") is StageState.MERGE_GATE
+
+
+async def test_phase_planning_signature_enters_hold_and_blocks_planning(
+    db, config_dict, tmp_path
+) -> None:
+    """PhaseExecutor wiring: a planning-spawn match enters the SHARED hold,
+    and while held a claude-routed PLANNING step does not run (the phase
+    executor's spawn path is gated like the stage conveyor)."""
+    _enable_governor(config_dict)
+    config_dict["models"]["phase_architect"]["cli"] = "claude"
+    config_dict["models"]["phase_architect"]["mode"] = "print"
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph-a", PhaseState.PLANNING)
+    insert_phase(db, "ph-b", PhaseState.PLANNING)
+    notify = FakeNotify()
+    runner = _SignatureRunner(db, "claude: usage limit reached for this window")
+    governor = CapacityGovernor(db, cfg, runner, notify)
+    executor = make_phase_executor(
+        db, cfg, runner=runner, notify=notify, governor=governor
+    )
+
+    await executor.execute("ph-a")  # match -> hold (plan also fails validation)
+    assert governor.held is True
+    assert len(_factory_events(db, "capacity_hold_started")) == 1
+
+    calls_before = len(runner.calls)
+    await executor.execute("ph-b")  # held claude planning: does not run
+    assert len(runner.calls) == calls_before
+    assert phase_state(db, "ph-b") is PhaseState.PLANNING
+    assert open_escalations(db, "ph-b") == []
+
+
+async def test_scheduler_loop_probes_and_resumes_alone(db, config_dict) -> None:
+    """Loop wiring (D-0037 item 4): Scheduler.run_until_blocked drives the
+    governor's tick — a due probe runs and a successful canary lifts the hold
+    with the resume page, no architect in the loop."""
+    _enable_governor(config_dict)
+    cfg = make_config(config_dict)
+    notify = FakeNotify()
+    runner = FakeRunner(db)
+    governor = CapacityGovernor(db, cfg, runner, notify)
+    sm = StateMachine(db)
+    executors = {
+        Level.PHASE: ScriptedExecutor(Level.PHASE, db, sm),
+        Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm),
+    }
+    scheduler = Scheduler(db, sm, cfg, executors, notify, governor=governor)
+    governor.note_match(signature="usage limit", role="validator", process_id=1)
+    await asyncio.sleep(0.02)
+
+    await run_blocked(scheduler)
+
+    assert governor.held is False
+    assert [c.role for c in runner.calls] == ["capacity_probe"]
+    assert len(_factory_events(db, "capacity_hold_ended")) == 1
+    assert notify.published[0][0] == "Capacitate revenită — fabrica a reluat singură"
+
+
+def test_recover_reconciles_stale_hold_event_pair(db, config_dict) -> None:
+    """Restart honesty (D-0037 item 6): holds are in-memory — recover() closes
+    an unclosed capacity_hold_started pair from a previous process so the
+    dashboard read-path never shows a hold no live governor owns; a closed
+    pair is left alone."""
+    _enable_governor(config_dict)
+    cfg = make_config(config_dict)
+    with db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="factory",
+            unit_id=None,
+            event_type="capacity_hold_started",
+            actor="control_plane",
+            payload={"signature": "usage limit", "role": "validator", "process_id": 1},
+        )
+    notify = FakeNotify()
+    governor = CapacityGovernor(db, cfg, FakeRunner(db), notify)
+    sm = StateMachine(db)
+    executors = {
+        Level.PHASE: ScriptedExecutor(Level.PHASE, db, sm),
+        Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm),
+    }
+    scheduler = Scheduler(db, sm, cfg, executors, notify, governor=governor)
+    scheduler.recover()
+    (ended,) = _factory_events(db, "capacity_hold_ended")
+    assert "restart" in json.loads(ended["payload_json"])["reason"]
+    scheduler.recover()  # closed pair: idempotent, no second closing event
+    assert len(_factory_events(db, "capacity_hold_ended")) == 1
 
 
 def test_build_prompt_forbids_self_commit(db, config_dict, tmp_path) -> None:

@@ -122,6 +122,17 @@ class TestGoldenRealConfig:
         assert all(s and s == s.lower() for s in signatures)
         assert "usage limit" in signatures
 
+    def test_capacity_governor_declared(self, cfg: FactoryConfig):
+        # CCR-11 (D-0037): the governor is ON in production and its hold-exit
+        # canary route is declared — cheapest claude, print mode. The interval
+        # VALUE is founder-tunable; enabled + route shape are DoD-locked.
+        assert cfg.capacity_governor.enabled is True
+        assert cfg.capacity_governor.probe_interval_s == 300
+        probe = cfg.models["capacity_probe"]
+        assert probe.cli == "claude"
+        assert probe.model == "haiku"
+        assert probe.mode == "print"
+
     def test_pricing_table_structure(self, cfg: FactoryConfig):
         # CCR-10 (dashboard design §11.1): pricing.usd_per_mtok keyed by LEDGER
         # model strings — VALUES are founder-tunable, the structure is not. The
@@ -315,6 +326,39 @@ class TestCrossChecks:
     def test_cp_role_not_in_models(self, tmp_path, config_dict):
         config_dict["consultation_points"][0]["role"] = "ghost_role"
         _expect_config_error(tmp_path, config_dict, match="ghost_role")
+
+    # ------------------------------------------- CCR-11: capacity governor
+
+    def test_capacity_governor_optional_default_disabled(self, config_dict):
+        # The section is OPTIONAL, default DISABLED (the pricing precedent):
+        # the frozen minimal fixture predates it and must keep validating.
+        assert "capacity_governor" not in config_dict
+        cfg = FactoryConfig.model_validate(config_dict)
+        assert cfg.capacity_governor.enabled is False
+        assert cfg.capacity_governor.probe_interval_s == 300
+
+    def test_capacity_governor_enabled_requires_probe_route(
+        self, tmp_path, config_dict
+    ):
+        # The probe is the ONLY hold exit — enabling without the canary route
+        # would wedge every hold forever (fail-explicit at load).
+        config_dict["capacity_governor"] = {"enabled": True}
+        _expect_config_error(tmp_path, config_dict, match="capacity_probe")
+
+    def test_capacity_governor_probe_route_must_be_print(self, tmp_path, config_dict):
+        config_dict["capacity_governor"] = {"enabled": True}
+        config_dict["models"]["capacity_probe"] = {
+            "cli": "claude",
+            "model": "haiku",
+            "mode": "interactive",
+        }
+        _expect_config_error(tmp_path, config_dict, match="print")
+
+    def test_capacity_governor_nonpositive_interval_rejected(
+        self, tmp_path, config_dict
+    ):
+        config_dict["capacity_governor"] = {"enabled": False, "probe_interval_s": 0}
+        _expect_config_error(tmp_path, config_dict)
 
     def test_cp_duplicate_ids(self, tmp_path, config_dict):
         config_dict["consultation_points"].append(

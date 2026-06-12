@@ -30,6 +30,9 @@ models:
   auditor_same_model:    {cli: claude, model: fable,   mode: print, effort: xhigh}
   auditor_cross_model:   {cli: codex,  model: default, mode: print}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
+  # CCR-11 (D-0037): the capacity governor's hold-exit canary — cheapest claude
+  # print run; an ordinary registered agent run (process registry + ledger).
+  capacity_probe:        {cli: claude, model: haiku,   mode: print}
   # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
   # enforcement); founder-facing trade-off reasoning warrants the strongest model
   # (D-0017, OPEN-D3 resolved).
@@ -61,6 +64,14 @@ risk_classes:
 
 economics:
   dual_audit_structural: true  # second auditor's marginal cost ~0 on current subscriptions (DoD §7)
+
+capacity_governor:
+  # CCR-11 (D-0037): on a usage-limit detection the factory drains itself (no new
+  # claude-route spawns; codex/stub proceed), probes with models.capacity_probe and
+  # resumes ALONE — limit-marked agent_run_failed escalations auto-resolve on lift.
+  # enabled: false = behavior identical to pre-CCR-11 (pinned by test).
+  enabled: true
+  probe_interval_s: 300
 
 pricing:
   # USD per 1M tokens, keyed by LEDGER model strings (design §11.1, CCR-10). Founder-tunable;

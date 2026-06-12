@@ -59,6 +59,18 @@ class PricingCfg(_StrictModel):
     usd_per_mtok: dict[str, ModelPrice] = {}
 
 
+class CapacityGovernorCfg(_StrictModel):
+    """capacity_governor (CCR-11 / D-0037): auto-drain on a usage-limit
+    detection, periodic haiku probe, auto-resume of limit-class failures.
+    ``enabled: false`` ⇒ scheduler behavior byte-identical to pre-CCR-11
+    (pinned by test). The default is DISABLED — the golden config flips it on
+    explicitly (the optional-``pricing`` precedent: minimal fixtures predate
+    the section and must keep validating without a capacity_probe route)."""
+
+    enabled: bool = False
+    probe_interval_s: float = Field(default=300, gt=0)
+
+
 class ConsultationPointCfg(_StrictModel):
     """id, purpose, inputs: list[str], verdicts: list[str], fallback: str, role: str,
     max_input_bytes: int."""
@@ -286,6 +298,9 @@ class FactoryConfig(_StrictModel):
     #: CCR-10 (design §11.3.1): OPTIONAL top-level section, default empty — the
     #: golden config carries the real table; minimal test fixtures need none.
     pricing: PricingCfg = PricingCfg()
+    #: CCR-11 (D-0037): OPTIONAL top-level section, default DISABLED — the
+    #: golden config enables it and declares the models.capacity_probe route.
+    capacity_governor: CapacityGovernorCfg = CapacityGovernorCfg()
 
     @model_validator(mode="after")
     def _cross_checks(self) -> FactoryConfig:
@@ -327,6 +342,21 @@ class FactoryConfig(_StrictModel):
             if cp.role not in self.models:
                 raise ValueError(
                     f"consultation_points[{cp.id}].role {cp.role!r} is not a models.* key"
+                )
+        # CCR-11 (D-0037): an ENABLED capacity governor needs its canary route —
+        # the probe is the only hold exit, so a missing/non-print route would
+        # wedge every hold forever (Doctrine §7: fail-explicit at load).
+        if self.capacity_governor.enabled:
+            probe = self.models.get("capacity_probe")
+            if probe is None:
+                raise ValueError(
+                    "capacity_governor.enabled requires a models.capacity_probe"
+                    " route (the hold-exit canary, CCR-11/D-0037)"
+                )
+            if probe.mode != "print":
+                raise ValueError(
+                    "models.capacity_probe must be mode='print' — the governor"
+                    f" probes through the print-mode runner, got {probe.mode!r}"
                 )
         # Documented relation (design §10 / config comment): watchdog staleness must be
         # >= 10x the scheduler tick, or a healthy orchestrator pages the founder.

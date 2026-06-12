@@ -388,7 +388,12 @@ def _build_scheduler(
     from sf_factory.dashboard import DashboardServer
     from sf_factory.notify import NtfyPublisher
     from sf_factory.runner import AgentRunner
-    from sf_factory.scheduler import PhaseExecutor, Scheduler, StageExecutor
+    from sf_factory.scheduler import (
+        CapacityGovernor,
+        PhaseExecutor,
+        Scheduler,
+        StageExecutor,
+    )
     from sf_factory.statemachine import StateMachine
     from sf_factory.thresholds import ThresholdEvaluator
     from sf_factory.worktrees import WorktreeManager
@@ -399,12 +404,22 @@ def _build_scheduler(
     thresholds = ThresholdEvaluator(db, cfg)
     consultor = Consultor(cfg, db, runner)
     notify = NtfyPublisher(cfg)
+    # CCR-11 (D-0037): ONE shared capacity governor — a hold entered by either
+    # executor gates both, and the Scheduler loop runs its hold-exit probe.
+    governor = CapacityGovernor(db, cfg, runner, notify)
     executors = {
-        Level.STAGE: StageExecutor(db, sm, cfg, runner, wt, thresholds, consultor, notify),
-        Level.PHASE: PhaseExecutor(db, sm, cfg, runner, wt, notify),
+        Level.STAGE: StageExecutor(
+            db, sm, cfg, runner, wt, thresholds, consultor, notify, governor=governor
+        ),
+        Level.PHASE: PhaseExecutor(db, sm, cfg, runner, wt, notify, governor=governor),
     }
     dashboard = DashboardServer(cfg, db, runner, notify) if with_dashboard else None
-    return Scheduler(db, sm, cfg, executors, notify, dashboard=dashboard), dashboard
+    return (
+        Scheduler(
+            db, sm, cfg, executors, notify, dashboard=dashboard, governor=governor
+        ),
+        dashboard,
+    )
 
 
 def cmd_run(cfg: FactoryConfig, *, until_blocked: bool) -> int:
