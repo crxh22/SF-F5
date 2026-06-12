@@ -789,3 +789,566 @@ def test_decide_without_db_fails_explicitly(
 ) -> None:
     assert _cli(cli_env, "decide", "1", "approve") == 1
     assert "sf-factory init" in capsys.readouterr().err
+
+
+# --------------------------------- seed-phases (phase-seeding design §2.3/§7/§8)
+# Append-only file: helpers below use function-level imports rather than
+# amending the frozen import block.
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, f"git {' '.join(args)} failed: {proc.stderr or proc.stdout}"
+    return proc.stdout.strip()
+
+
+def _bootstrap_workspace(workspace: Path) -> None:
+    """The runbook §3 shape: integration branch `main`, committed scripts/test.sh,
+    non-empty _factory/contracts/, .worktrees/ gitignored."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "factory@test"],
+        ["git", "config", "user.name", "factory"],
+    ):
+        subprocess.run(args, cwd=workspace, check=True, capture_output=True)
+    (workspace / "scripts").mkdir()
+    (workspace / "scripts" / "test.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    contracts = workspace / "_factory" / "contracts"
+    contracts.mkdir(parents=True)
+    (contracts / "api-contract.md").write_text("# ratified contract v0\n", encoding="utf-8")
+    (workspace / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "workspace bootstrap"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.fixture()
+def seed_env(cli_env: SimpleNamespace) -> SimpleNamespace:
+    """cli_env with every §2.3 precondition satisfied: factory home is a git repo
+    holding a COMMITTED 2-phase macro plan; workspace bootstrapped per the
+    runbook; projects.proj.test_command set; db initialized."""
+    _git_init_home(cli_env.home)
+    plan = {
+        "project": "proj",
+        "phases": [{"id": "ph-a", "name": "Phase A"}, {"id": "ph-b", "name": "Phase B"}],
+        "dag_edges": [["ph-a", "ph-b"]],
+    }
+    plan_rel = "docs/projects/proj/macro-plan.json"
+    plan_path = cli_env.home / plan_rel
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(plan, indent=1), encoding="utf-8")
+    _git(cli_env.home, "add", "--", plan_rel)
+    _git(cli_env.home, "commit", "-q", "-m", "macro plan ratified")
+    workspace = Path(cli_env.config["projects"]["proj"]["workspace"])
+    _bootstrap_workspace(workspace)
+    cli_env.config["projects"]["proj"]["test_command"] = "bash scripts/test.sh"
+    cli_env.config_path.write_text(yaml.safe_dump(cli_env.config), encoding="utf-8")
+    assert _cli(cli_env, "init") == 0
+    cli_env.plan = plan
+    cli_env.plan_rel = plan_rel
+    cli_env.plan_path = plan_path
+    cli_env.workspace = workspace
+    return cli_env
+
+
+def _seed_db_state(env: SimpleNamespace) -> SimpleNamespace:
+    """Phases / phase-level edges / macro_plan refs / phase_seeded events."""
+    from sf_factory.db import list_dag_edges, list_units
+
+    db = _open_factory_db(env)
+    try:
+        conn = db.read()
+        phases = {p.id: p for p in list_units(conn, Level.PHASE) if isinstance(p, Phase)}
+        edges = list_dag_edges(conn, Level.PHASE)
+        refs = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM artifact_refs WHERE kind='macro_plan' ORDER BY id"
+            )
+        ]
+        seed_events = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM events WHERE event_type='phase_seeded' ORDER BY seq"
+            )
+        ]
+    finally:
+        db.close()
+    return SimpleNamespace(phases=phases, edges=edges, refs=refs, seed_events=seed_events)
+
+
+def _insert_phase_row(
+    env: SimpleNamespace, phase_id: str, state: PhaseState, *, project: str = "proj"
+) -> None:
+    db = _open_factory_db(env)
+    try:
+        with db.transaction() as conn:
+            now = utc_now()
+            insert_phase(
+                conn,
+                Phase(phase_id, project, f"Phase {phase_id}", state, None, None, now, now),
+            )
+    finally:
+        db.close()
+
+
+def _commit_plan(env: SimpleNamespace, rel: str, payload: dict) -> Path:
+    path = env.home / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    _git(env.home, "add", "--", rel)
+    _git(env.home, "commit", "-q", "-m", f"plan {rel}")
+    return path
+
+
+def _rewrite_config(env: SimpleNamespace) -> None:
+    env.config_path.write_text(yaml.safe_dump(env.config), encoding="utf-8")
+
+
+def test_seed_phases_happy_path_atomic(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.5: ONE transaction — phase rows (PENDING, branch/plan_artifact_id
+    NULL) + phase dag_edges + exactly ONE factory-level macro_plan ref + one
+    phase_seeded event per phase; summary names the anchor commit sha."""
+    anchor = _git(seed_env.home, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    out = capsys.readouterr().out
+    assert anchor in out  # the operator must know the pinned factory commit
+
+    state = _seed_db_state(seed_env)
+    assert set(state.phases) == {"ph-a", "ph-b"}
+    for phase in state.phases.values():
+        assert phase.state is PhaseState.PENDING
+        assert phase.branch is None  # dispatch derives phase/<id>
+        assert phase.plan_artifact_id is None  # consistent with _step_planning
+        assert phase.project == "proj"
+    assert state.edges == [("ph-a", "ph-b")]
+    (ref,) = state.refs  # exactly ONE macro_plan ref (per-phase refs impossible)
+    assert ref["unit_level"] == "factory" and ref["unit_id"] == "proj"
+    assert ref["repo"] == "factory" and ref["git_commit"] == anchor
+    assert ref["path"] == seed_env.plan_rel
+    assert ref["sha256"] == sha256_file(seed_env.plan_path)
+    assert sorted(e["unit_id"] for e in state.seed_events) == ["ph-a", "ph-b"]
+    for event in state.seed_events:
+        assert event["actor"] == "main_architect"
+        payload = json.loads(event["payload_json"])
+        assert payload == {
+            "plan": seed_env.plan_rel,
+            "anchor": anchor,
+            "macro_plan_ref": ref["id"],
+        }
+
+
+def test_seed_phases_flock_held_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§7 row 1: orchestrator running → abort before any read/write (claim-free
+    flock test on the SAME inode run/resume locks)."""
+    seed_env.pid_file.write_bytes(b"99999\nsome-live-orchestrator --flag\n")
+    holder_fd = os.open(seed_env.pid_file, os.O_RDWR)
+    try:
+        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = _cli(seed_env, "seed-phases", str(seed_env.plan_path))
+    finally:
+        os.close(holder_fd)
+    assert rc == 1
+    assert "orchestrator running — stop it first" in capsys.readouterr().err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_claim_free_lock_leaves_pidfile_untouched(
+    seed_env: SimpleNamespace,
+) -> None:
+    """§2.3.1: claim=False takes the flock but SKIPS the truncate/write/fsync —
+    pidfile bytes AND mtime untouched (stat before/after), so a seeder never
+    grants the watchdog's freshness grace nor records itself as orchestrator."""
+    content = b"99999\ndead-orchestrator --old\n"
+    seed_env.pid_file.write_bytes(content)
+    before = os.stat(seed_env.pid_file)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    after = os.stat(seed_env.pid_file)
+    assert seed_env.pid_file.read_bytes() == content
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_size == before.st_size
+
+
+def test_seed_phases_multi_project_guard(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.2 single-project guard: existing phases of a DIFFERENT project →
+    abort naming the fresh-DB-per-project posture (D-0022) and the archived-DB
+    convention (D-0023); nothing written."""
+    _insert_phase_row(seed_env, "zz-other", PhaseState.DONE, project="other-project")
+    rc = _cli(seed_env, "seed-phases", str(seed_env.plan_path))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "fresh-DB-per-project" in err and "D-0022" in err and "D-0023" in err
+    assert set(_seed_db_state(seed_env).phases) == {"zz-other"}
+
+
+def test_seed_phases_idempotent_replay_exits_zero(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.2 replay rule: every id exists AND the registered macro_plan ref
+    matches this file's (path, sha256, git_commit) → exit 0, zero new writes
+    (a crash after commit but before output must not present as a collision)."""
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    capsys.readouterr()
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    out = capsys.readouterr().out
+    assert "already seeded at" in out and "nothing to do" in out
+    state = _seed_db_state(seed_env)
+    assert len(state.refs) == 1
+    assert len(state.seed_events) == 2
+
+
+def test_seed_phases_divergent_plan_same_ids_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§7: phase ids exist but the plan content diverged → nonzero, naming the
+    ids and the ref mismatch; nothing written."""
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    diverged = dict(seed_env.plan)
+    diverged["phases"] = [
+        {"id": "ph-a", "name": "Phase A RENAMED"},
+        {"id": "ph-b", "name": "Phase B"},
+    ]
+    _commit_plan(seed_env, seed_env.plan_rel, diverged)
+    capsys.readouterr()
+    rc = _cli(seed_env, "seed-phases", str(seed_env.plan_path))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "divergent plan" in err and "ph-a" in err
+    assert len(_seed_db_state(seed_env).seed_events) == 2  # first seeding only
+
+
+def test_seed_phases_partial_overlap_names_differing_ids(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-b", "name": "Phase B"}, {"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [],
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    capsys.readouterr()
+    rc = _cli(seed_env, "seed-phases", str(path2))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ph-b" in err and "ph-c" in err and "divergent" in err
+    assert "ph-c" not in _seed_db_state(seed_env).phases
+
+
+# --------------------------------------- §2.3.3 workspace precondition aborts
+
+
+def test_seed_phases_missing_workspace_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import shutil
+
+    shutil.rmtree(seed_env.workspace)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "does not exist" in err and "first-live-run.md" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_workspace_not_a_repo_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import shutil
+
+    shutil.rmtree(seed_env.workspace)
+    seed_env.workspace.mkdir()
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "not a git repository" in err and "first-live-run.md" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_missing_integration_branch_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git(seed_env.workspace, "branch", "-m", "main", "trunk")
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "no integration branch 'main'" in err and "first-live-run.md" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_null_test_command_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.3: a null command otherwise dies as ConfigError at the FIRST
+    MERGE_GATE — after the full SPEC/BUILD/VALIDATE token spend."""
+    seed_env.config["projects"]["proj"]["test_command"] = None
+    _rewrite_config(seed_env)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "test_command is unset (OPEN-2)" in err and "first-live-run.md" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_missing_test_script_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_env.config["projects"]["proj"]["test_command"] = "bash scripts/absent.sh"
+    _rewrite_config(seed_env)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "scripts/absent.sh" in err and "does not exist" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_uncommitted_test_script_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The script must exist AND be committed in the workspace — a working-tree
+    -only script vanishes from every fresh worktree the gate runs in."""
+    extra = seed_env.workspace / "scripts" / "extra.sh"
+    extra.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")  # present, NOT committed
+    seed_env.config["projects"]["proj"]["test_command"] = "bash scripts/extra.sh"
+    _rewrite_config(seed_env)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "scripts/extra.sh" in err and "not committed" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_empty_contracts_dir_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.3: an empty _factory/contracts/ would make every Tier-2 gate
+    validate against nothing — silently voiding the B8-proved mechanism."""
+    _git(seed_env.workspace, "rm", "-r", "-q", "_factory/contracts")
+    _git(seed_env.workspace, "commit", "-q", "-m", "drop contracts")
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "_factory/contracts/" in err and "first-live-run.md" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+# ------------------------------------------ §2.3.4 committed-plan precondition
+
+
+def test_seed_phases_untracked_plan_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loose = seed_env.home / "docs" / "projects" / "proj" / "loose-plan.json"
+    loose.write_text(json.dumps(seed_env.plan), encoding="utf-8")  # never git-added
+    assert _cli(seed_env, "seed-phases", str(loose)) == 1
+    err = capsys.readouterr().err
+    assert "loose-plan.json" in err and "not tracked" in err and "factory repo" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_gitignored_plan_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R1-7: porcelain-empty alone would false-pass a gitignored plan, whose
+    blob resolves at no commit and poisons the next recover() — the
+    trackedness probe (`git ls-files --error-unmatch`) catches it."""
+    (seed_env.home / ".gitignore").write_text("ignored-plan.json\n", encoding="utf-8")
+    _git(seed_env.home, "add", "--", ".gitignore")
+    _git(seed_env.home, "commit", "-q", "-m", "ignore rule")
+    ignored = seed_env.home / "docs" / "projects" / "proj" / "ignored-plan.json"
+    ignored.write_text(json.dumps(seed_env.plan), encoding="utf-8")
+    assert _cli(seed_env, "seed-phases", str(ignored)) == 1
+    err = capsys.readouterr().err
+    assert "ignored-plan.json" in err and "not tracked" in err and "gitignored" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_dirty_plan_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_env.plan_path.write_text(
+        json.dumps(seed_env.plan, indent=2), encoding="utf-8"  # same plan, dirty bytes
+    )
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    err = capsys.readouterr().err
+    assert "uncommitted changes" in err and seed_env.plan_rel in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+# ----------------------------------------------- §2.3.2 edge rules vs the DB
+
+
+def test_seed_phases_edge_from_existing_done_phase_accepted(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OPEN-S3 incremental seeding: an edge whose endpoint resolves to an
+    existing DONE phase is accepted (deps_done sees it satisfied)."""
+    _insert_phase_row(seed_env, "base", PhaseState.DONE)
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [["base", "ph-c"]],
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    assert _cli(seed_env, "seed-phases", str(path2)) == 0
+    state = _seed_db_state(seed_env)
+    assert ("base", "ph-c") in state.edges
+    assert state.phases["ph-c"].state is PhaseState.PENDING
+
+
+def test_seed_phases_edge_to_failed_phase_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.2/R2-9: a FAILED/CANCELLED endpoint is a dead prerequisite —
+    deps_done requires DONE, so it would seed a permanently-WAITING unit."""
+    _insert_phase_row(seed_env, "dead", PhaseState.FAILED)
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [["dead", "ph-c"]],
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    assert _cli(seed_env, "seed-phases", str(path2)) == 1
+    err = capsys.readouterr().err
+    assert "'dead'" in err and "FAILED" in err and "dead prerequisite" in err
+    assert "ph-c" not in _seed_db_state(seed_env).phases
+
+
+def test_seed_phases_unknown_edge_endpoint_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [["ghost", "ph-c"]],
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    assert _cli(seed_env, "seed-phases", str(path2)) == 1
+    err = capsys.readouterr().err
+    assert "'ghost'" in err and "unknown phase" in err
+    assert _seed_db_state(seed_env).phases == {}
+
+
+def test_seed_phases_duplicate_edge_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.2: an edge already in the DB is a NAMED abort, never a raw PK
+    IntegrityError."""
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [["ph-a", "ph-b"]],  # already seeded by the first plan
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    capsys.readouterr()
+    assert _cli(seed_env, "seed-phases", str(path2)) == 1
+    err = capsys.readouterr().err
+    assert "ph-a -> ph-b" in err and "already exists" in err
+    assert "ph-c" not in _seed_db_state(seed_env).phases
+
+
+def test_seed_phases_combined_cycle_aborts(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.2: the plan is acyclic on its own, but existing ∪ plan edges close a
+    cycle (ph-a → ph-b → ph-c → ph-a) — named abort, nothing written."""
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    plan2 = {
+        "project": "proj",
+        "phases": [{"id": "ph-c", "name": "Phase C"}],
+        "dag_edges": [["ph-b", "ph-c"], ["ph-c", "ph-a"]],
+    }
+    path2 = _commit_plan(seed_env, "docs/projects/proj/macro-plan-2.json", plan2)
+    capsys.readouterr()
+    assert _cli(seed_env, "seed-phases", str(path2)) == 1
+    err = capsys.readouterr().err
+    assert "cyclic" in err
+    state = _seed_db_state(seed_env)
+    assert "ph-c" not in state.phases
+    assert state.edges == [("ph-a", "ph-b")]  # rollback left the first seed only
+
+
+def test_seed_phases_dry_run_writes_nothing(
+    seed_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§2.3.6: --dry-run runs ALL validation, prints the would-be inserts
+    (including the anchor sha), writes NOTHING — and the real run still works."""
+    anchor = _git(seed_env.home, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path), "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out and "would seed 2 phase(s)" in out
+    assert anchor in out and "nothing written" in out
+    state = _seed_db_state(seed_env)
+    assert state.phases == {} and state.edges == [] and state.refs == []
+    assert state.seed_events == []
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 0
+    assert set(_seed_db_state(seed_env).phases) == {"ph-a", "ph-b"}
+
+
+# ------------------------------- status: proving-hold marker (design §5b/§8)
+
+
+def test_status_renders_proving_hold_marker(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§5b: held units render as PENDING with a 'held: proving' marker in
+    cli status (JSON key + text marker); proving phases themselves unmarked."""
+    assert _cli(cli_env, "init") == 0
+    db = _open_factory_db(cli_env)
+    try:
+        with db.transaction() as conn:
+            now = utc_now()
+            insert_phase(
+                conn,
+                Phase("foundation", "proj", "Foundation", PhaseState.RUNNING,
+                      None, None, now, now),
+            )
+            insert_phase(
+                conn,
+                Phase("ph-x", "proj", "Held one", PhaseState.PENDING, None, None, now, now),
+            )
+    finally:
+        db.close()
+    capsys.readouterr()
+    assert _cli(cli_env, "status", "--json") == 0
+    view = json.loads(capsys.readouterr().out)
+    by_id = {p["id"]: p for p in view["phases"]}
+    assert by_id["ph-x"]["held"] == "proving"  # conftest: proving_phases=["foundation"]
+    assert by_id["foundation"]["held"] is None
+    assert _cli(cli_env, "status") == 0
+    text = capsys.readouterr().out
+    assert "ph-x — PENDING, held: proving" in text
+    assert "foundation — RUNNING (" in text  # no marker on the proving phase
+
+
+def test_seed_phases_tx_failure_rolls_back_everything(
+    seed_env: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """§7 'tx failure mid-insert' row: ONE transaction means a failure at the
+    ref registration (after phases + edges were already inserted in the same
+    tx) rolls back to ZERO rows — never a half-seeded DAG."""
+    import sf_factory.cli as cli_mod
+
+    reached = {}
+
+    def boom(conn: Any, **kwargs: Any) -> None:
+        reached["yes"] = True  # phases + edges already executed in this tx
+        raise FactoryError("forced mid-transaction failure (test)")
+
+    monkeypatch.setattr(cli_mod, "register_artifact", boom)
+    assert _cli(seed_env, "seed-phases", str(seed_env.plan_path)) == 1
+    assert reached.get("yes") is True
+    state = _seed_db_state(seed_env)
+    assert state.phases == {} and state.edges == []
+    assert state.refs == [] and state.seed_events == []

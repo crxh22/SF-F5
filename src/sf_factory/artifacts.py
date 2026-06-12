@@ -252,6 +252,113 @@ def read_phase_plan(path: Path, risk_classes: Collection[str]) -> PhasePlan:
     return plan
 
 
+# --------------------------------------------------------- macro-plan contract
+
+
+class MacroPhase(BaseModel):
+    """One phase row of macro-plan.json: id, name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+
+
+class MacroPlan(BaseModel):
+    """Schema of macro-plan.json: project, phases[{id, name}],
+    dag_edges[[from_id, to_id]]; extra='forbid'."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    phases: list[MacroPhase]
+    dag_edges: list[tuple[str, str]]
+
+
+def read_macro_plan(path: Path, *, projects: Collection[str]) -> MacroPlan:
+    """Strict-validate the ratified macro plan BEFORE any DB write (phase-seeding
+    design §2.2; mirrors the read_phase_plan contract): project ∈ projects; phase
+    ids unique, non-empty, and matching the same id grammar as plan-local stage
+    ids (_PLAN_ID_RE — ids feed branch names, artifact dirs and stage
+    namespacing; a malformed id must die here, not at dispatch); dag edges
+    cycle-checked over the subgraph induced by the plan's OWN phases — edge
+    endpoints NOT declared in the plan are tolerated here (they may resolve to
+    existing DB phases; the CALLER owns that resolution and the combined-graph
+    re-check, because this module's file-contract validators stay DB-free even
+    though the module may import db — placement rationale, not an import-rule
+    claim). Malformed → ArtifactContractError (fail-explicit, Doctrine §7)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactContractError(f"cannot read macro plan {path}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ArtifactContractError(f"macro plan {path} is not valid JSON: {exc}") from exc
+    try:
+        plan = MacroPlan.model_validate(data)
+    except ValidationError as exc:
+        raise ArtifactContractError(f"macro plan {path} violates the schema:\n{exc}") from exc
+
+    if plan.project not in projects:
+        raise ArtifactContractError(
+            f"macro plan {path}: unknown project {plan.project!r} "
+            f"(configured: {sorted(projects)})"
+        )
+    if not plan.phases:
+        raise ArtifactContractError(f"macro plan {path} declares no phases")
+
+    ids: list[str] = [phase.id for phase in plan.phases]
+    id_set = set(ids)
+    if len(id_set) != len(ids):
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        raise ArtifactContractError(f"macro plan {path}: duplicate phase ids {dupes}")
+    for phase in plan.phases:
+        # Same safe grammar as plan-local stage ids: no separators, no '..',
+        # no leading '-'/'.', no trailing '.' (ids feed branch names + dirs).
+        if not _PLAN_ID_RE.fullmatch(phase.id) or ".." in phase.id or phase.id.endswith("."):
+            raise ArtifactContractError(f"macro plan {path}: malformed phase id {phase.id!r}")
+
+    seen_edges: set[tuple[str, str]] = set()
+    for from_id, to_id in plan.dag_edges:
+        if (from_id, to_id) in seen_edges:
+            raise ArtifactContractError(
+                f"macro plan {path}: duplicate dag edge {[from_id, to_id]}"
+            )
+        seen_edges.add((from_id, to_id))
+
+    _assert_macro_acyclic(plan, path)
+    return plan
+
+
+def _assert_macro_acyclic(plan: MacroPlan, path: Path) -> None:
+    """Kahn toposort over the subgraph induced by the plan's OWN phases; edges
+    with a foreign endpoint are excluded here (caller resolves them against the
+    DB and re-checks the combined graph). Remainder = cycle -> ArtifactContractError."""
+    indegree: dict[str, int] = {phase.id: 0 for phase in plan.phases}
+    adjacency: dict[str, list[str]] = {phase.id: [] for phase in plan.phases}
+    for from_id, to_id in plan.dag_edges:
+        if from_id not in indegree or to_id not in indegree:
+            continue  # foreign endpoint: tolerated, resolved by the caller
+        adjacency[from_id].append(to_id)
+        indegree[to_id] += 1
+    ready = sorted(uid for uid, deg in indegree.items() if deg == 0)
+    processed = 0
+    while ready:
+        unit = ready.pop(0)
+        processed += 1
+        for dependent in adjacency[unit]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+                ready.sort()
+    if processed != len(indegree):
+        cyclic = sorted(uid for uid, deg in indegree.items() if deg > 0)
+        raise ArtifactContractError(
+            f"macro plan {path}: phase DAG is cyclic (phases in/behind a cycle: {cyclic})"
+        )
+
+
 def _assert_acyclic(plan: PhasePlan, path: Path) -> None:
     """Kahn toposort; any unprocessed remainder = cycle -> ArtifactContractError."""
     indegree: dict[str, int] = {stage.id: 0 for stage in plan.stages}

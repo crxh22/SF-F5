@@ -610,6 +610,170 @@ def _read_response_sidecar(path: Path, open_refs: Sequence[str]) -> dict[str, di
     return responses
 
 
+def proving_held_phase_ids(
+    cfg: FactoryConfig, phases: Sequence[Phase]
+) -> frozenset[str]:
+    """Phase-seeding design §5b proving-ground dispatch hold — the pure predicate
+    behind the scheduler's RUNNABLE selection AND the `cli status`
+    'held: proving' marker (one source, no drifting copies).
+
+    A PENDING phase whose id is NOT in its project's ``proving_phases`` is held
+    (not dispatched, state untouched) while ANY phase row of that project whose
+    id IS listed there is non-DONE. Once every proving phase is DONE the hold
+    dissolves and the DAG governs alone. Empty/absent list = no hold. Only
+    EXISTING rows gate: a listed-but-unseeded proving id holds nothing —
+    synthetic/b8 projects and pre-seed states must never wedge behind a config
+    string that has no unit behind it.
+    """
+    held: set[str] = set()
+    gating_by_project: dict[str, bool] = {}
+    for phase in phases:
+        if phase.state is not PhaseState.PENDING:
+            continue  # the hold is a dispatch filter; only PENDING units dispatch
+        project = cfg.projects.get(phase.project)
+        if project is None or not project.proving_phases:
+            continue
+        proving = project.proving_phases
+        if phase.id in proving:
+            continue  # proving phases themselves are never held
+        if phase.project not in gating_by_project:
+            gating_by_project[phase.project] = any(
+                other.project == phase.project
+                and other.id in proving
+                and other.state is not PhaseState.DONE
+                for other in phases
+            )
+        if gating_by_project[phase.project]:
+            held.add(phase.id)
+    return frozenset(held)
+
+
+class _OutOfBoundsDetector:
+    """Phase-seeding design §5 out-of-bounds detector (mechanical, Doctrine §20):
+    `git status --porcelain` on (a) factory.home and (b) every project workspace
+    integration checkout, filtered through process.isolation_ignore_globs
+    (precedent: D-0022/c50bf37) — unexpected dirt = an agent (or anything else)
+    wrote outside its worktree. The §10 falsifiability trigger made observable:
+    detected by the machine at the next gate/recover, never a silent pass.
+
+    Run at every stage MERGE_GATE entry and during Scheduler.recover(). Alerts
+    are deduplicated per streak per repo (the _stall_published /
+    _delivery_failed_logged pattern): one 'alert' event + one ntfy per
+    consecutive-dirty streak; a clean observation clears the latch. Configured
+    worktrees_dirs under a scanned root are control-plane-managed state
+    (worktree add / §5.5b canonicalization territory), not agent dirt. A root
+    that is missing or not a git repo has no git state to monitor (pre-bootstrap
+    workspace) and is skipped. Residual risk accepted explicitly in the design:
+    foreign writes to the SQLite DB / gitignored operational files stay
+    undetected until a first incident justifies a tripwire (Doctrine §8).
+    """
+
+    def __init__(self, db: Database, cfg: FactoryConfig, notify: NtfyPublisher) -> None:
+        self._db = db
+        self._cfg = cfg
+        self._notify = notify
+        #: One 'alert' event per consecutive-dirty streak per repo label.
+        self._event_logged: set[str] = set()
+        #: One successful ntfy publish per streak (retried until delivered).
+        self._published: set[str] = set()
+        #: One alert_delivery_failed event per delivery-failure streak.
+        self._delivery_failed_logged: set[str] = set()
+
+    def _roots(self) -> list[tuple[str, Path]]:
+        home = self._cfg.factory.home
+        roots: list[tuple[str, Path]] = [("factory", Path(home))]
+        for name, project in sorted(self._cfg.projects.items()):
+            roots.append((f"workspace:{name}", _resolve(home, project.workspace)))
+        return roots
+
+    def _sanctioned_subtrees(self, root: Path) -> list[str]:
+        """Root-relative POSIX prefixes of configured worktrees_dirs under this
+        root — factory-managed checkouts, never out-of-bounds dirt."""
+        prefixes: list[str] = []
+        for project in self._cfg.projects.values():
+            wt_dir = _resolve(self._cfg.factory.home, project.worktrees_dir)
+            try:
+                rel = wt_dir.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if rel not in ("", "."):
+                prefixes.append(rel)
+        return prefixes
+
+    def _unexpected_paths(self, status_out: str, root: Path) -> list[str]:
+        ignore_globs = self._cfg.process.isolation_ignore_globs
+        sanctioned = self._sanctioned_subtrees(root)
+        paths: list[str] = []
+        for line in status_out.splitlines():
+            if not line.strip():
+                continue
+            path = line[3:]
+            if _isolation_ignored(path, ignore_globs):
+                continue
+            norm = path.rstrip("/")
+            if any(norm == s or norm.startswith(s + "/") for s in sanctioned):
+                continue
+            paths.append(path)
+        return paths
+
+    async def check(self, *, where: str) -> None:
+        """Scan all roots; alert on unexpected dirt (streak-deduplicated)."""
+        for repo, root in self._roots():
+            if not root.is_dir():
+                continue
+            code, out, _err = await run_git("status", "--porcelain", cwd=root)
+            if code != 0:
+                continue  # not a git repo yet (pre-bootstrap) — nothing to monitor
+            paths = self._unexpected_paths(out, root)
+            if not paths:
+                # Clean observation ends the streak: future dirt re-alerts.
+                self._event_logged.discard(repo)
+                self._published.discard(repo)
+                self._delivery_failed_logged.discard(repo)
+                continue
+            if repo not in self._event_logged:
+                self._event_logged.add(repo)
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert",
+                        actor=_ACTOR,
+                        payload={
+                            "kind": "out_of_bounds",
+                            "repo": repo,
+                            "paths": paths[:100],
+                            "where": where,
+                        },
+                    )
+            if repo not in self._published:
+                try:
+                    await self._notify.publish(
+                        f"Scriere în afara limitelor detectată în {repo}",
+                        link=dashboard_link(self._cfg, "health"),
+                        priority=self._notify.priority_alert,
+                    )
+                    self._published.add(repo)
+                    self._delivery_failed_logged.discard(repo)
+                except NotifyError as exc:
+                    if repo not in self._delivery_failed_logged:
+                        self._delivery_failed_logged.add(repo)
+                        with self._db.transaction() as conn:
+                            fdb.insert_event(
+                                conn,
+                                unit_level="factory",
+                                unit_id=None,
+                                event_type="alert_delivery_failed",
+                                actor=_ACTOR,
+                                payload={
+                                    "kind": "out_of_bounds",
+                                    "repo": repo,
+                                    "error": str(exc),
+                                },
+                            )
+
+
 # ------------------------------------------------------------- frozen interfaces
 
 
@@ -676,6 +840,8 @@ class StageExecutor:
         self._thresholds = thresholds
         self._consultor = consultor
         self._notify = notify
+        #: Phase-seeding design §5: out-of-bounds check at every MERGE_GATE entry.
+        self._oob = _OutOfBoundsDetector(db, cfg, notify)
 
     # ---------------------------------------------------------------- protocol
 
@@ -1931,8 +2097,11 @@ class StageExecutor:
     # -------------------------------------------------------------- merge gate
 
     async def _step_merge_gate(self, stage: Stage) -> bool:
-        """MERGE_GATE: Tier 1 (mechanical rebase+suite) then the §3.1 Tier-2
+        """MERGE_GATE: out-of-bounds detector at gate ENTRY (phase-seeding design
+        §5 — the §10 falsifiability trigger checked by the machine at every
+        gate), then Tier 1 (mechanical rebase+suite), then the §3.1 Tier-2
         contract, then the serialized integration merge."""
+        await self._oob.check(where="merge_gate")
         phase, project, repo_root, target_branch = self._context(stage)
         worktree = self._worktree(stage)
         test_cmd = _test_cmd(project)
@@ -3527,12 +3696,34 @@ class PhaseExecutor:
     def _planning_prompt(self, phase: Phase) -> str:
         risk_classes = sorted(self._cfg.risk_classes)
         unit_rel = f"_factory/phases/{phase.id}"
+        contracts_ns = f"_factory/contracts/phase-{phase.id}/"
+        project = _project_for_phase(self._cfg, phase)
+        context = ""
+        if project.project_md is not None:
+            # Phase-seeding design §4: config-driven project-context block —
+            # fully absent when projects.<p>.project_md is None (synthetic/b8).
+            home = self._cfg.factory.home
+            docs_repo = _resolve(home, project.docs_repo)
+            project_md = _resolve(home, project.project_md)
+            context = (
+                "Project context (read before planning):\n"
+                f"- Business documentation (canonical source of truth): {docs_repo}\n"
+                f"- Macro plan & project brief: {project_md} (PROJECT.md; the macro "
+                "decision log sits next to it)\n"
+                "- Cross-phase contracts already in force: _factory/contracts/*.md "
+                "(READ-ONLY — a needed change is a _CONTRACT_CHANGE_REQUEST.md + stop)\n"
+                f"- Write YOUR intra-phase contracts under {contracts_ns} (namespace "
+                "convention: cross-phase files at the root are never edited by a phase; "
+                "both Tier-2 collection sites rglob recursively, so namespaced contracts "
+                "are picked up unchanged)\n"
+            )
         return (
             f"You are the Phase Architect for phase '{phase.id}' ({phase.name}).\n"
-            "Decompose the phase into stages sized at the upper bound of one-pass "
+            + context
+            + "Decompose the phase into stages sized at the upper bound of one-pass "
             "builder confidence; declare per-stage acceptance criteria and risk class; "
             "freeze the intra-phase contracts (shared schemas, API signatures, named "
-            "invariants) as files under _factory/contracts/ BEFORE any fan-out.\n"
+            f"invariants) as files under {contracts_ns} BEFORE any fan-out.\n"
             f"Write {unit_rel}/phase-plan.md (rationale) and {unit_rel}/phase-plan.json — "
             'EXACTLY {"stages": [{"id": "<plan-local-id>", "name": "...", '
             '"risk_class": "<one of ' + "|".join(risk_classes) + '>", '
@@ -3574,6 +3765,8 @@ class Scheduler:
         #: Internal worktree manager for recover()'s §5.5b git healing — a
         #: mechanics helper, not an executor dependency.
         self._wt = WorktreeManager(cfg)
+        #: Phase-seeding design §5: out-of-bounds check during recover().
+        self._oob = _OutOfBoundsDetector(db, cfg, notify)
         self._tasks: dict[tuple[Level, str], asyncio.Task] = {}
         #: max events.seq at the end of a unit's last drive — the re-dispatch
         #: edge trigger (a no-progress unit is not respun until facts change).
@@ -3640,6 +3833,11 @@ class Scheduler:
         orphaned, killed_groups = self._orphan_sweep()  # (a)
         self._touch_liveness()
         healed, heal_errors, dirty_reset = await self._heal_git()  # (b)
+        self._touch_liveness()
+        # Phase-seeding design §5: out-of-bounds detector — dirt in the factory
+        # repo / workspace integration checkout left across the down window is
+        # alerted at recovery, never a silent pass (Doctrine §20).
+        await self._oob.check(where="recover")
         self._touch_liveness()
         checked, warnings = await self._integrity_gate()  # (c)
         self._touch_liveness()
@@ -3964,16 +4162,30 @@ class Scheduler:
             del self._tasks[key]
 
     def _scan_units(self) -> list[tuple[Level, str, SchedCategory]]:
-        """One categorized pass over all units (feeds dispatch + stall detector)."""
+        """One categorized pass over all units (feeds dispatch + stall detector).
+
+        Phase-seeding design §5b: the RUNNABLE selection applies the
+        proving-phases dispatch hold at PHASE level — a held phase is
+        categorized WAITING (state stays PENDING, never transitioned), so it is
+        neither dispatched nor mistaken for progress by the stall detector."""
         conn = self._db.read()
         scan: list[tuple[Level, str, SchedCategory]] = []
         for level in self._levels():
-            for unit in fdb.list_units(conn, level):
+            units = fdb.list_units(conn, level)
+            held: frozenset[str] = frozenset()
+            if level is Level.PHASE:
+                held = proving_held_phase_ids(
+                    self._cfg, [u for u in units if isinstance(u, Phase)]
+                )
+            for unit in units:
                 state = unit.state.value
                 deps = (
                     fdb.deps_done(conn, level, unit.id) if state == "PENDING" else True
                 )
-                scan.append((level, unit.id, sched_category(level, state, deps)))
+                category = sched_category(level, state, deps)
+                if category is SchedCategory.RUNNABLE and unit.id in held:
+                    category = SchedCategory.WAITING  # §5b hold: not dispatched
+                scan.append((level, unit.id, category))
         return scan
 
     def _dispatch(

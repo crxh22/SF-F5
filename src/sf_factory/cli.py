@@ -1,9 +1,19 @@
-"""Operator entry (design §4): ``init`` / ``run`` / ``status`` / ``resume`` / ``decide``.
+"""Operator entry (design §4): ``init`` / ``run`` / ``resume`` / ``seed-phases`` /
+``status`` / ``decide``.
 
-Command contracts (design §4 ``cli.main`` docstring, implemented exactly):
+Command contracts (design §4 ``cli.main`` docstring, implemented exactly; the
+``seed-phases`` subcommand and the ``_InstanceLock.acquire(claim=...)`` flock
+narrative are the phase-seeding design CCR-5 amendments, D-0024):
 
 - ``init`` — validate config, create the DB + apply migrations, environment
   sanity check (git, model-route CLIs, canon files, operational dirs).
+- ``seed-phases <plan.json> [--dry-run]`` — THE sanctioned phase-creation path
+  (phase-seeding design §2.3): claim-free flock on the run/resume pidfile inode
+  (mutual exclusion without touching pidfile bytes/mtime — a seeder must never
+  grant the watchdog's freshness grace or record itself as the orchestrator),
+  strict validation (macro plan, DB DAG, workspace bootstrap, committed plan),
+  then ONE transaction inserting phases + dag_edges + exactly one factory-level
+  ``macro_plan`` ref + one ``phase_seeded`` event per phase.
 - ``run`` / ``resume`` — FIRST acquire an exclusive ``flock`` on
   ``process.pid_file`` and hold it for the process lifetime; if it is held, or
   the recorded pid+cmdline is alive, abort with a clear message (a second
@@ -54,22 +64,33 @@ import fcntl
 import json
 import logging
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-from sf_factory.artifacts import register_artifact, unit_artifact_dir
+from sf_factory.artifacts import (
+    MacroPlan,
+    read_macro_plan,
+    register_artifact,
+    sha256_file,
+    unit_artifact_dir,
+)
 from sf_factory.config import FactoryConfig, load_config
 from sf_factory.db import (
     MIGRATIONS_DIR,
     Database,
     answer_decision,
+    insert_dag_edge,
     insert_event,
+    insert_phase,
+    latest_artifact,
+    list_dag_edges,
     list_units,
     pending_decisions,
     processes_in_state,
@@ -81,6 +102,7 @@ from sf_factory.models import (
     GitError,
     Level,
     Phase,
+    PhaseState,
     Stage,
     utc_now,
 )
@@ -169,6 +191,15 @@ class _InstanceLock:
     cmdline. Only after both checks does it claim the file (truncate + write
     pid/cmdline). The fd stays open until ``release``; children never inherit it
     (asyncio subprocesses close fds on exec).
+
+    ``claim=False`` (phase-seeding design §2.3.1, ``seed-phases``): take the
+    SAME exclusive flock on the SAME inode (mutual exclusion with run/resume)
+    but SKIP the pidfile truncate/write/fsync entirely — bytes AND mtime stay
+    untouched. A short-lived seeder must never (a) reset the pidfile mtime,
+    which grants the watchdog's freshness grace and can silence an
+    actively-paging watchdog for up to staleness_threshold_s while the
+    orchestrator is down, nor (b) record itself as "the orchestrator" for
+    ``cli status`` and the next ``run``'s pid-liveness refusal.
     """
 
     def __init__(self, path: Path) -> None:
@@ -179,7 +210,7 @@ class _InstanceLock:
     def path(self) -> Path:
         return self._path
 
-    def acquire(self) -> None:
+    def acquire(self, *, claim: bool = True) -> None:
         if self._fd is not None:
             raise FactoryError(f"instance lock already acquired: {self._path}")
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,13 +240,15 @@ class _InstanceLock:
                             " start a second instance (flock was lost: pidfile"
                             " replaced?)"
                         )
-            # Both checks passed: claim the file (pidfile contract, watchdog reads it).
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            cmdline = _self_cmdline()
-            content = f"{os.getpid()}\n" + (f"{cmdline}\n" if cmdline else "")
-            os.write(fd, content.encode("utf-8"))
-            os.fsync(fd)
+            if claim:
+                # Both checks passed: claim the file (pidfile contract, watchdog
+                # reads it). claim=False holds the flock only — content untouched.
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                cmdline = _self_cmdline()
+                content = f"{os.getpid()}\n" + (f"{cmdline}\n" if cmdline else "")
+                os.write(fd, content.encode("utf-8"))
+                os.fsync(fd)
         except BaseException:
             os.close(fd)  # releases the flock if we held it
             raise
@@ -409,6 +442,374 @@ def cmd_run(cfg: FactoryConfig, *, until_blocked: bool) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- seed-phases
+
+#: The operator bootstrap runbook every workspace-precondition abort points at.
+_SEED_RUNBOOK = "docs/runbooks/first-live-run.md"
+
+
+def _seed_git(repo: Path, *args: str) -> tuple[int, str, str]:
+    """Synchronous read-only git call for the seed-phases preconditions;
+    returns (exit_code, stdout, stderr) stripped — never raises on nonzero exit."""
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed git argv, read-only queries
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FactoryError(f"seed-phases: git {' '.join(args)} failed in {repo}: {exc}") from exc
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _seed_head(repo: Path) -> str:
+    code, head, err = _seed_git(repo, "rev-parse", "HEAD")
+    if code != 0:
+        raise FactoryError(
+            f"seed-phases: git rev-parse HEAD failed in the factory repo {repo}: {err or head}"
+        )
+    return head
+
+
+def _seed_replay_or_divergence(
+    conn: sqlite3.Connection,
+    home: Path,
+    plan: MacroPlan,
+    plan_path: Path,
+    rel_posix: str,
+    existing_ids: set[str],
+) -> str:
+    """Idempotent-replay rule (design §2.3.2): some plan id already exists.
+    EVERY id existing AND the registered macro_plan ref matching this file's
+    (path, sha256, git_commit) = crash replay → return the exit-0 message;
+    any divergence → FactoryError naming the differing ids / ref mismatch."""
+    plan_ids = [mp.id for mp in plan.phases]
+    overlap = [pid for pid in plan_ids if pid in existing_ids]
+    new_ids = [pid for pid in plan_ids if pid not in existing_ids]
+    if new_ids:
+        raise FactoryError(
+            f"seed-phases: phase id(s) {overlap} already exist in the DB while "
+            f"{new_ids} are new — divergent plan; refusing the partial overlap"
+        )
+    ref = latest_artifact(conn, "factory", plan.project, "macro_plan")
+    digest = sha256_file(plan_path)
+    head = _seed_head(home)
+    if (
+        ref is not None
+        and ref.path == rel_posix
+        and ref.sha256 == digest
+        and ref.git_commit == head
+    ):
+        return f"already seeded at {ref.created_at} — nothing to do"
+    recorded = (
+        f"recorded (path={ref.path}, sha256={ref.sha256[:12]}…, git_commit={ref.git_commit})"
+        if ref is not None
+        else "no macro_plan ref is registered"
+    )
+    raise FactoryError(
+        f"seed-phases: phase id(s) {sorted(overlap)} already exist but the registered "
+        f"macro_plan ref does not match this file's (path={rel_posix}, "
+        f"sha256={digest[:12]}…, git_commit={head}) — {recorded} — divergent plan"
+    )
+
+
+def _seed_check_edges(
+    conn: sqlite3.Connection, plan: MacroPlan, existing: dict[str, Phase]
+) -> list[tuple[str, str]]:
+    """§2.3.2 edge rules: endpoint ∈ plan ∪ DB; DB-resolving endpoints not in a
+    dead state; edge not already in the DB; combined graph acyclic. Returns the
+    existing DB edges (also the duplicate-edge probe input)."""
+    plan_ids = {mp.id for mp in plan.phases}
+    known = plan_ids | set(existing)
+    dead = {PhaseState.FAILED, PhaseState.CANCELLED}
+    db_edges = list_dag_edges(conn, Level.PHASE)
+    db_edge_set = set(db_edges)
+    for from_id, to_id in plan.dag_edges:
+        for endpoint in (from_id, to_id):
+            if endpoint not in known:
+                raise FactoryError(
+                    f"seed-phases: dag edge {from_id} -> {to_id} references unknown "
+                    f"phase {endpoint!r} (neither in the plan nor in the DB)"
+                )
+            unit = existing.get(endpoint)
+            if unit is not None and unit.state in dead:
+                raise FactoryError(
+                    f"seed-phases: dag edge {from_id} -> {to_id} references phase "
+                    f"{endpoint!r} in dead state {unit.state.value} — deps_done "
+                    "requires DONE, so a dead prerequisite seeds a "
+                    "permanently-WAITING unit"
+                )
+        if (from_id, to_id) in db_edge_set:
+            raise FactoryError(
+                f"seed-phases: dag edge {from_id} -> {to_id} already exists in the DB"
+            )
+    _assert_combined_acyclic(plan.dag_edges, db_edges, known)
+    return db_edges
+
+
+def _assert_combined_acyclic(
+    plan_edges: Sequence[tuple[str, str]],
+    db_edges: Sequence[tuple[str, str]],
+    nodes: set[str],
+) -> None:
+    """Kahn toposort over existing ∪ plan edges; remainder = cycle (§2.3.2 —
+    named abort, the plan-local check in read_macro_plan covers only the plan)."""
+    edges = [*db_edges, *plan_edges]
+    all_nodes = set(nodes)
+    for from_id, to_id in edges:
+        all_nodes.add(from_id)
+        all_nodes.add(to_id)
+    indegree: dict[str, int] = dict.fromkeys(all_nodes, 0)
+    adjacency: dict[str, list[str]] = {node: [] for node in all_nodes}
+    for from_id, to_id in edges:
+        adjacency[from_id].append(to_id)
+        indegree[to_id] += 1
+    ready = sorted(node for node, deg in indegree.items() if deg == 0)
+    processed = 0
+    while ready:
+        node = ready.pop(0)
+        processed += 1
+        for dependent in adjacency[node]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+        ready.sort()
+    if processed != len(all_nodes):
+        cyclic = sorted(node for node, deg in indegree.items() if deg > 0)
+        raise FactoryError(
+            "seed-phases: combined phase DAG (existing ∪ plan edges) would be "
+            f"cyclic (phases in/behind a cycle: {cyclic}) — nothing written"
+        )
+
+
+def _seed_workspace_preconditions(cfg: FactoryConfig, project_id: str) -> None:
+    """§2.3.3 fail-early workspace preconditions (not at the first gate, after
+    the full SPEC/BUILD/VALIDATE token spend); each abort points at the
+    bootstrap runbook."""
+    project = cfg.projects[project_id]
+    home = cfg.factory.home
+    workspace = _resolve(home, project.workspace)
+    hint = f"bootstrap the workspace first ({_SEED_RUNBOOK})"
+    if not workspace.is_dir():
+        raise FactoryError(f"seed-phases: workspace {workspace} does not exist — {hint}")
+    # The workspace must be its OWN repo root: a bare --is-inside-work-tree
+    # probe walks up and false-passes a plain dir nested inside another repo.
+    code, toplevel, _ = _seed_git(workspace, "rev-parse", "--show-toplevel")
+    if code != 0 or Path(toplevel).resolve() != workspace.resolve():
+        raise FactoryError(
+            f"seed-phases: workspace {workspace} is not a git repository"
+            f" (its own repo root) — {hint}"
+        )
+    branch = project.integration_branch
+    code, _, _ = _seed_git(workspace, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if code != 0:
+        raise FactoryError(
+            f"seed-phases: workspace {workspace} has no integration branch {branch!r} — {hint}"
+        )
+    if project.test_command is None:
+        raise FactoryError(
+            f"seed-phases: projects.{project_id}.test_command is unset (OPEN-2) — a null "
+            "command otherwise dies as ConfigError at the first MERGE_GATE, after the "
+            f"full stage token spend; set it before seeding ({_SEED_RUNBOOK})"
+        )
+    argv = (
+        shlex.split(project.test_command)
+        if isinstance(project.test_command, str)
+        else [str(part) for part in project.test_command]
+    )
+    for token in argv:
+        # Workspace-relative script reference = a relative token with a path
+        # separator (the runbook's `scripts/test.sh` shape). Options, bare
+        # command names and absolute paths are not workspace files.
+        if token.startswith(("-", "/")) or "/" not in token:
+            continue
+        rel = str(PurePosixPath(token))  # normalizes a leading './'
+        candidate = workspace / rel
+        if not candidate.is_file():
+            raise FactoryError(
+                f"seed-phases: test_command references workspace-relative script "
+                f"{token!r} which does not exist at {candidate} — {hint}"
+            )
+        code, _, _ = _seed_git(workspace, "cat-file", "-e", f"{branch}:{rel}")
+        if code != 0:
+            raise FactoryError(
+                f"seed-phases: test_command script {token!r} exists but is not "
+                f"committed on {branch!r} in {workspace} — {hint}"
+            )
+    code, out, _ = _seed_git(
+        workspace, "ls-tree", "-r", "--name-only", branch, "--", "_factory/contracts"
+    )
+    if code != 0 or not out.strip():
+        raise FactoryError(
+            f"seed-phases: _factory/contracts/ is empty or missing on {branch!r} in "
+            f"{workspace} — an empty contracts dir would make every Tier-2 gate "
+            f"validate against nothing (D-0022); {hint}"
+        )
+
+
+def _seed_plan_precondition(home: Path, rel_posix: str) -> str:
+    """§2.3.4 committed-plan precondition in the FACTORY repo: tracked
+    (`git ls-files --error-unmatch` — porcelain-empty alone false-passes a
+    gitignored file, whose blob would resolve at no commit and poison the next
+    recover()), unmodified, anchored at HEAD. Returns the anchor sha."""
+    code, _, _ = _seed_git(home, "ls-files", "--error-unmatch", "--", rel_posix)
+    if code != 0:
+        raise FactoryError(
+            f"seed-phases: plan file {rel_posix} is not tracked in the factory repo "
+            f"{home} (untracked or gitignored) — commit it first"
+        )
+    code, out, err = _seed_git(home, "status", "--porcelain", "--", rel_posix)
+    if code != 0:
+        raise FactoryError(
+            f"seed-phases: git status failed for {rel_posix} in the factory repo "
+            f"{home}: {err or out}"
+        )
+    if out.strip():
+        raise FactoryError(
+            f"seed-phases: plan file {rel_posix} has uncommitted changes in the "
+            f"factory repo {home} — commit them first (the macro_plan ref anchors at HEAD)"
+        )
+    return _seed_head(home)
+
+
+def cmd_seed_phases(cfg: FactoryConfig, plan_arg: Path, *, dry_run: bool) -> int:
+    """THE sanctioned phase-creation path (phase-seeding design §2.3, D-0024):
+    claim-free flock guard → read_macro_plan → DB checks (single-project guard,
+    all-new ids / idempotent replay, endpoint resolution plan ∪ DB,
+    dead-prerequisite + duplicate-edge + combined-cycle aborts) → workspace
+    preconditions → committed-plan precondition (anchor = factory HEAD) → ONE
+    transaction: phases (PENDING, branch/plan_artifact_id NULL) + phase
+    dag_edges + exactly ONE factory-level macro_plan ref + one phase_seeded
+    event per phase. ``--dry-run`` runs all validation, prints the would-be
+    inserts, writes nothing. Exit nonzero on any precondition failure; zero
+    writes on failure (single tx)."""
+    home = Path(cfg.factory.home).resolve()
+    plan_path = plan_arg if plan_arg.is_absolute() else Path.cwd() / plan_arg
+    plan_path = plan_path.resolve()
+    try:
+        rel_posix = plan_path.relative_to(home).as_posix()
+    except ValueError:
+        raise FactoryError(
+            f"seed-phases: plan {plan_path} is not inside the factory repo {home} — "
+            "the committed-plan precondition anchors the macro_plan ref there"
+        ) from None
+
+    # §2.3.1 exclusive-instance guard: same flock inode as run/resume, but
+    # claim-free — a seeder never rewrites pidfile bytes or mtime.
+    lock = _InstanceLock(_resolve(cfg.factory.home, cfg.process.pid_file))
+    try:
+        lock.acquire(claim=False)
+    except FactoryError as exc:
+        raise FactoryError(
+            "orchestrator running — stop it first (runbook: seed only while stopped)"
+        ) from exc
+    try:
+        plan = read_macro_plan(plan_path, projects=set(cfg.projects))
+        db = _open_db(cfg)
+        try:
+            conn = db.read()
+            phases = [p for p in list_units(conn, Level.PHASE) if isinstance(p, Phase)]
+            # §2.3.2 single-project guard (D-0022 item 3 / D-0023).
+            foreign = sorted({p.project for p in phases} - {plan.project})
+            if foreign:
+                raise FactoryError(
+                    f"seed-phases: the DB already contains phases of project(s) "
+                    f"{foreign} — seeding project {plan.project!r} alongside them is "
+                    "refused: the MVP posture is fresh-DB-per-project (D-0022 item 3; "
+                    "finished DBs are archived, D-0023). A second project in a live DB "
+                    "would make every subsequent recover() abort at _repo_roots."
+                )
+            existing = {p.id: p for p in phases}
+            if any(mp.id in existing for mp in plan.phases):
+                message = _seed_replay_or_divergence(
+                    conn, home, plan, plan_path, rel_posix, set(existing)
+                )
+                print(message)
+                return 0
+            _seed_check_edges(conn, plan, existing)
+            _seed_workspace_preconditions(cfg, plan.project)
+            anchor = _seed_plan_precondition(home, rel_posix)
+
+            plan_ids = [mp.id for mp in plan.phases]
+            edge_str = (
+                ", ".join(f"{f} -> {t}" for f, t in plan.dag_edges)
+                if plan.dag_edges
+                else "none"
+            )
+            if dry_run:
+                digest = sha256_file(plan_path)
+                print(
+                    f"dry-run: would seed {len(plan.phases)} phase(s) for project "
+                    f"{plan.project}: "
+                    + ", ".join(f"{mp.id} ({mp.name})" for mp in plan.phases)
+                )
+                print(f"dry-run: would insert phase dag edge(s): {edge_str}")
+                print(
+                    f"dry-run: would register ONE macro_plan ref (repo=factory, "
+                    f"path={rel_posix}, sha256={digest[:12]}…, git_commit={anchor}) "
+                    f"+ {len(plan.phases)} phase_seeded event(s)"
+                )
+                print(f"dry-run: anchor commit {anchor} — nothing written")
+                return 0
+
+            now = utc_now()
+            with db.transaction() as tx:
+                for mp in plan.phases:
+                    insert_phase(
+                        tx,
+                        Phase(
+                            id=mp.id,
+                            project=plan.project,
+                            name=mp.name,
+                            state=PhaseState.PENDING,
+                            branch=None,  # dispatch derives phase/<id>
+                            plan_artifact_id=None,  # consistent with _step_planning
+                            created_at=now,
+                            updated_at=now,
+                        ),
+                    )
+                for from_id, to_id in plan.dag_edges:
+                    insert_dag_edge(tx, Level.PHASE, from_id, to_id)
+                ref = register_artifact(
+                    tx,
+                    unit_level="factory",
+                    unit_id=plan.project,
+                    kind="macro_plan",
+                    repo="factory",
+                    repo_root=home,
+                    path=plan_path,
+                    git_commit=anchor,
+                )
+                for mp in plan.phases:
+                    insert_event(
+                        tx,
+                        unit_level=Level.PHASE.value,
+                        unit_id=mp.id,
+                        event_type="phase_seeded",
+                        actor="main_architect",
+                        payload={
+                            "plan": rel_posix,
+                            "anchor": anchor,
+                            "macro_plan_ref": ref.id,
+                        },
+                    )
+            print(
+                f"seeded {len(plan.phases)} phase(s) [{', '.join(plan_ids)}] and "
+                f"{len(plan.dag_edges)} dag edge(s) [{edge_str}] for project {plan.project}"
+            )
+            print(
+                f"macro_plan ref {ref.id} (path {rel_posix}) anchored at factory "
+                f"commit {anchor}"
+            )
+            return 0
+        finally:
+            db.close()
+    finally:
+        lock.release()
+
+
 # ------------------------------------------------------------------------ status
 
 
@@ -501,6 +902,13 @@ def _collect_status(cfg: FactoryConfig, db: Database) -> dict[str, Any]:
     phases = [p for p in list_units(conn, Level.PHASE) if isinstance(p, Phase)]
     stages = [s for s in list_units(conn, Level.STAGE) if isinstance(s, Stage)]
 
+    # Proving-phases dispatch hold (phase-seeding design §5b): the held state is
+    # the scheduler's pure predicate — imported lazily so init/status/decide
+    # keep their module-level independence from the run/resume object graph.
+    from sf_factory.scheduler import proving_held_phase_ids
+
+    held = proving_held_phase_ids(cfg, phases)
+
     stage_views: dict[str, list[dict[str, Any]]] = {}
     for stage in stages:
         stage_views.setdefault(stage.phase_id, []).append(
@@ -520,6 +928,7 @@ def _collect_status(cfg: FactoryConfig, db: Database) -> dict[str, Any]:
             "name": phase.name,
             "state": phase.state.value,
             "branch": phase.branch,
+            "held": "proving" if phase.id in held else None,
             "tokens": unit_token_total(conn, Level.PHASE.value, phase.id),
             "stages": stage_views.get(phase.id, []),
         }
@@ -614,8 +1023,10 @@ def _render_status(view: dict[str, Any]) -> str:
 
     lines += ["", "## Phases"]
     for phase in view["phases"]:
+        # Phase-seeding design §5b: the dispatch hold is visible, never silent.
+        held = ", held: proving" if phase.get("held") == "proving" else ""
         lines.append(
-            f"### {phase['id']} — {phase['state']} (project {phase['project']},"
+            f"### {phase['id']} — {phase['state']}{held} (project {phase['project']},"
             f" tokens {phase['tokens']})"
         )
         for stage in phase["stages"]:
@@ -818,6 +1229,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     with a clear message (a second instance would orphan-sweep the live instance's
     agents, double-write the DB behind busy_timeout, and mask watchdog death
     detection); only then recover() + run_forever() (resume: run_until_blocked()).
+    seed-phases <plan.json> [--dry-run]: THE sanctioned phase-creation path
+    (phase-seeding design §2.3, D-0024) — claim-free flock on the same pidfile
+    inode (mutual exclusion with run/resume; pidfile bytes/mtime untouched),
+    strict macro-plan + DB + workspace + committed-plan validation, then ONE
+    transaction seeding phases + DAG + the factory-level macro_plan ref + events.
     status [--json] [--write]: render generated view from a READ-ONLY db connection
     (mode=ro — legitimately concurrent with a live orchestrator, §2) + git
     (non-canonical, Doctrine §9). decide <request_id> <option>: emergency-fallback
@@ -844,6 +1260,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "resume",
         help="single-instance orchestrator: flock, recover, run_until_blocked",
     )
+    p_seed = sub.add_parser(
+        "seed-phases",
+        help="seed a ratified, committed macro plan into phases + DAG"
+        " (the sanctioned path; orchestrator must be stopped)",
+    )
+    p_seed.add_argument(
+        "plan", type=Path, help="path to the committed macro-plan.json in the factory repo"
+    )
+    p_seed.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run all validation, print the would-be inserts, write nothing",
+    )
     p_status = sub.add_parser("status", help="generated view from a read-only db connection")
     p_status.add_argument("--json", action="store_true", dest="as_json", help="emit JSON")
     p_status.add_argument(
@@ -866,6 +1295,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_run(cfg, until_blocked=False)
         if args.command == "resume":
             return cmd_run(cfg, until_blocked=True)
+        if args.command == "seed-phases":
+            return cmd_seed_phases(cfg, args.plan, dry_run=args.dry_run)
         if args.command == "status":
             return cmd_status(cfg, as_json=args.as_json, write=args.write)
         if args.command == "decide":

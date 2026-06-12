@@ -157,8 +157,8 @@ class ClaudeAdapter:
         resume_session: str | None = None,
     ) -> list[str]:
         # §5.1 literal argv order: claude --model <m> --output-format stream-json
-        # --verbose [--tools ""] --append-system-prompt <canon> [--resume <id>]
-        # -p <prompt>.
+        # --verbose [--tools "" | --permission-mode bypassPermissions]
+        # --append-system-prompt <canon> [--resume <id>] -p <prompt>.
         cmd = ["claude", "--model", route.model, "--output-format", "stream-json", "--verbose"]
         if route.tools == "none":
             # CCR-3/D-0017 tools-off spawn (Decision Sessions): structural
@@ -167,6 +167,17 @@ class ClaudeAdapter:
             # to disable all tools" — disables the FULL built-in set in one flag,
             # with no tool-name enumeration to drift as the CLI grows.
             cmd += ["--tools", ""]
+        else:
+            # Phase-seeding design §5 (D-0024): claude print mode default-DENIES
+            # writes and a print-mode agent has no human to answer prompts — a
+            # denied write is a wedged stage, so every tools-on pipeline agent
+            # bypasses claude's own gating. NOT symmetric with the codex
+            # OS-enforced `--sandbox workspace-write`: the lost guardrail is
+            # replaced by the control plane's out-of-bounds detector
+            # (scheduler, §5); narrowing later is the pre-registered
+            # `models.<role>.permission_mode` config key shape — a config
+            # addition, not a contract change. Tools-off sessions unchanged.
+            cmd += ["--permission-mode", "bypassPermissions"]
         if system_append is not None:
             cmd += ["--append-system-prompt", system_append]
         if resume_session is not None:

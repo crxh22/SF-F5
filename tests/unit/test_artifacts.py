@@ -586,3 +586,106 @@ def test_verify_integrity_checks_only_latest_ref_per_kind(db, repo: Path):
     report = artifacts.verify_integrity(db, {"workspace": repo})
     assert report.checked == 1
     assert report.ok
+
+
+# ----------------------------- macro-plan contract (phase-seeding design §2.2/§8)
+
+
+def _macro(
+    project: str = "proj",
+    phase_ids: list[str] | None = None,
+    edges: list[list[str]] | None = None,
+) -> dict:
+    ids = phase_ids if phase_ids is not None else ["a", "b"]
+    return {
+        "project": project,
+        "phases": [{"id": pid, "name": f"Phase {pid}"} for pid in ids],
+        "dag_edges": edges if edges is not None else [],
+    }
+
+
+def _write_macro(tmp_path: Path, payload) -> Path:
+    path = tmp_path / "macro-plan.json"
+    path.write_text(
+        payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8"
+    )
+    return path
+
+
+PROJECTS = ("proj", "erp")
+
+
+def test_read_macro_plan_happy(tmp_path: Path):
+    path = _write_macro(tmp_path, _macro(phase_ids=["found", "inv"], edges=[["found", "inv"]]))
+    plan = artifacts.read_macro_plan(path, projects=PROJECTS)
+    assert plan.project == "proj"
+    assert [(p.id, p.name) for p in plan.phases] == [
+        ("found", "Phase found"),
+        ("inv", "Phase inv"),
+    ]
+    assert plan.dag_edges == [("found", "inv")]
+
+
+def test_read_macro_plan_rejects_unknown_project(tmp_path: Path):
+    path = _write_macro(tmp_path, _macro(project="ghost"))
+    with pytest.raises(ArtifactContractError, match="unknown project"):
+        artifacts.read_macro_plan(path, projects=PROJECTS)
+
+
+def test_read_macro_plan_tolerates_foreign_edge_endpoints(tmp_path: Path):
+    """Edge endpoints NOT declared in the plan may resolve to existing DB phases —
+    tolerated HERE; the caller (seed-phases) owns resolution + the combined-graph
+    re-check (design §2.2)."""
+    path = _write_macro(
+        tmp_path,
+        _macro(phase_ids=["new1"], edges=[["already-in-db", "new1"], ["x", "y"]]),
+    )
+    plan = artifacts.read_macro_plan(path, projects=PROJECTS)
+    assert plan.dag_edges == [("already-in-db", "new1"), ("x", "y")]
+
+
+def test_read_macro_plan_plan_local_cycle_uses_only_declared_phases(tmp_path: Path):
+    """The cycle check runs over the subgraph induced by the plan's OWN phases:
+    a cycle through declared ids is rejected even when other edges are foreign."""
+    payload = _macro(phase_ids=["a", "b"], edges=[["a", "b"], ["b", "a"], ["db-ph", "a"]])
+    with pytest.raises(ArtifactContractError, match="cyclic"):
+        artifacts.read_macro_plan(_write_macro(tmp_path, payload), projects=PROJECTS)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{ truncated",  # not JSON
+        {"project": "proj", "phases": []},  # missing dag_edges key
+        _macro(phase_ids=[]),  # plans nothing
+        {**_macro(), "surprise": 1},  # extra top-level key
+        {
+            "project": "proj",
+            "phases": [{"id": "a", "name": "A", "owner": "x"}],
+            "dag_edges": [],
+        },  # extra phase key
+        {"project": "proj", "phases": [{"id": "a"}], "dag_edges": []},  # missing name
+        _macro(phase_ids=["a", "a"]),  # duplicate phase id
+        _macro(phase_ids=["a", "b"], edges=[["a", "b"], ["a", "b"]]),  # duplicate edge
+        _macro(phase_ids=["a"], edges=[["a", "a"]]),  # self-loop on a declared id
+        _macro(phase_ids=["a", "b"], edges=[["a", "b", "c"]]),  # 3-element edge
+    ],
+)
+def test_read_macro_plan_rejects_malformed(tmp_path: Path, payload):
+    with pytest.raises(ArtifactContractError):
+        artifacts.read_macro_plan(_write_macro(tmp_path, payload), projects=PROJECTS)
+
+
+@pytest.mark.parametrize("bad_id", ["", "has space", "../escape", "a/b", "-flag", "a..b", "end."])
+def test_read_macro_plan_rejects_unsafe_phase_ids(tmp_path: Path, bad_id: str):
+    """Phase ids feed branch names ('phase/<id>'), artifact dirs and stage
+    namespacing ('<phase>.<stage>') — same _PLAN_ID_RE grammar as stage ids; a
+    malformed id must die here, not at dispatch (design §2.2)."""
+    path = _write_macro(tmp_path, _macro(phase_ids=[bad_id]))
+    with pytest.raises(ArtifactContractError):
+        artifacts.read_macro_plan(path, projects=PROJECTS)
+
+
+def test_read_macro_plan_missing_file(tmp_path: Path):
+    with pytest.raises(ArtifactContractError):
+        artifacts.read_macro_plan(tmp_path / "absent.json", projects=PROJECTS)

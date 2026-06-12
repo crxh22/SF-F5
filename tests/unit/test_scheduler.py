@@ -2439,3 +2439,293 @@ def test_recover_failed_heal_persists_heal_failed_alert(
     assert payload["kind"] == "heal_failed"
     assert payload["path"] == str(not_a_repo)
     assert "not a git worktree" in payload["error"]
+
+
+# ----------------- phase-seeding design §4/§5/§5b (Phase-Architect context,
+# ----------------- out-of-bounds detector, proving-phases dispatch hold)
+
+
+def _mk_phase(
+    phase_id: str, state: PhaseState, *, project: str = "proj"
+) -> Phase:
+    now = utc_now()
+    return Phase(phase_id, project, f"Phase {phase_id}", state, None, None, now, now)
+
+
+def _phase_executor(db, cfg, tmp_path: Path) -> PhaseExecutor:
+    return PhaseExecutor(
+        db, StateMachine(db), cfg, FakeRunner(), FakeWorktrees(tmp_path), FakeNotify()
+    )
+
+
+def test_planning_prompt_context_block_present_iff_project_md(
+    db, config_dict, tmp_path
+) -> None:
+    """Design §4: the project-context block appears when projects.<p>.project_md
+    is set — docs_repo abs path, <factory.home>/<project_md> path, contracts
+    READ-ONLY note, intra-phase namespace instruction."""
+    config_dict["projects"]["proj"]["project_md"] = "docs/projects/proj/PROJECT.md"
+    cfg = make_config(config_dict)
+    prompt = _phase_executor(db, cfg, tmp_path)._planning_prompt(
+        _mk_phase("ph1", PhaseState.PLANNING)
+    )
+    # The driver/role marker stays the prompt's first line (agent_driver contract).
+    assert prompt.startswith("You are the Phase Architect for phase 'ph1'")
+    assert "Project context (read before planning):" in prompt
+    assert config_dict["projects"]["proj"]["docs_repo"] in prompt  # abs docs_repo
+    home = Path(config_dict["factory"]["home"])
+    assert str(home / "docs/projects/proj/PROJECT.md") in prompt
+    assert "READ-ONLY" in prompt and "_CONTRACT_CHANGE_REQUEST.md" in prompt
+    assert "Write YOUR intra-phase contracts under _factory/contracts/phase-ph1/" in prompt
+
+
+def test_planning_prompt_block_absent_for_b8_style_project(
+    db, config_dict, tmp_path
+) -> None:
+    """Design §4: project_md is None (the conftest/b8 shape) ⇒ the block is fully
+    absent — but the existing freeze line is amended to the namespaced path
+    unconditionally."""
+    cfg = make_config(config_dict)  # conftest 'proj' has no project_md key
+    assert cfg.projects["proj"].project_md is None
+    prompt = _phase_executor(db, cfg, tmp_path)._planning_prompt(
+        _mk_phase("ph1", PhaseState.PLANNING)
+    )
+    assert "Project context" not in prompt
+    assert "Business documentation" not in prompt
+    assert "READ-ONLY" not in prompt
+    # Namespaced intra-phase contracts dir (design §4 amendment), not the root:
+    assert "as files under _factory/contracts/phase-ph1/ BEFORE any fan-out" in prompt
+    assert "as files under _factory/contracts/ BEFORE" not in prompt
+
+
+# ------------------------------------------------------- §5b proving-phases hold
+
+
+def test_proving_held_phase_ids_semantics(config_dict) -> None:
+    """The §5b pure predicate: held while ANY listed proving row is non-DONE;
+    proving phases themselves never held; release on all-DONE; only EXISTING
+    rows gate; PENDING-scoped (a dispatch filter, not a state)."""
+    cfg = make_config(config_dict)  # proj: proving_phases == ["foundation"]
+    held = sched_mod.proving_held_phase_ids
+    pending = _mk_phase("ph-x", PhaseState.PENDING)
+
+    # Held while the proving phase is non-DONE (PENDING / RUNNING / even FAILED).
+    for state in (PhaseState.PENDING, PhaseState.RUNNING, PhaseState.FAILED):
+        assert held(cfg, [_mk_phase("foundation", state), pending]) == {"ph-x"}
+    # The proving phase itself is never held.
+    assert "foundation" not in held(
+        cfg, [_mk_phase("foundation", PhaseState.PENDING), pending]
+    )
+    # Released once every proving phase is DONE — the DAG governs alone.
+    assert held(cfg, [_mk_phase("foundation", PhaseState.DONE), pending]) == frozenset()
+    # A listed-but-unseeded proving id holds nothing (b8/pre-seed states).
+    assert held(cfg, [pending]) == frozenset()
+    # Non-PENDING units are not "held" — the hold is a dispatch filter only.
+    assert held(
+        cfg,
+        [_mk_phase("foundation", PhaseState.RUNNING), _mk_phase("ph-x", PhaseState.RUNNING)],
+    ) == frozenset()
+    # Unknown project: no config, no hold.
+    assert held(cfg, [_mk_phase("g1", PhaseState.PENDING, project="ghost")]) == frozenset()
+
+
+def test_proving_held_empty_list_means_no_hold(config_dict) -> None:
+    config_dict["projects"]["proj"]["proving_phases"] = []
+    cfg = make_config(config_dict)
+    phases = [_mk_phase("foundation", PhaseState.FAILED), _mk_phase("ph-x", PhaseState.PENDING)]
+    assert sched_mod.proving_held_phase_ids(cfg, phases) == frozenset()
+
+
+async def test_proving_hold_blocks_dispatch_while_proving_non_done(
+    db, config_dict
+) -> None:
+    """Loop-level §5b: a deps-free PENDING phase outside proving_phases is NOT
+    dispatched while the proving phase is non-DONE — it stays PENDING (no
+    transition), invisible to RUNNABLE selection."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "foundation", PhaseState.FAILED)  # non-DONE, terminal: never redispatched
+    insert_phase(db, "ph-x", PhaseState.PENDING)
+    executor = ScriptedExecutor(level=Level.PHASE, db=db, sm=StateMachine(db))
+    scheduler, _ = make_scheduler(db, cfg, {Level.PHASE: executor})
+    await run_blocked(scheduler)
+    assert ("phase", "ph-x") not in executor.started
+    assert phase_state(db, "ph-x") is PhaseState.PENDING
+
+
+async def test_proving_hold_releases_when_proving_done(db, config_dict) -> None:
+    cfg = make_config(config_dict)
+    insert_phase(db, "foundation", PhaseState.DONE)
+    insert_phase(db, "ph-x", PhaseState.PENDING)
+    executor = ScriptedExecutor(level=Level.PHASE, db=db, sm=StateMachine(db))
+    scheduler, _ = make_scheduler(db, cfg, {Level.PHASE: executor})
+    await run_blocked(scheduler)
+    assert ("phase", "ph-x") in executor.started
+    assert phase_state(db, "ph-x") is PhaseState.DONE
+
+
+async def test_proving_hold_empty_list_dispatches_normally(db, config_dict) -> None:
+    config_dict["projects"]["proj"]["proving_phases"] = []
+    cfg = make_config(config_dict)
+    insert_phase(db, "foundation", PhaseState.FAILED)  # would gate if it were listed
+    insert_phase(db, "ph-x", PhaseState.PENDING)
+    executor = ScriptedExecutor(level=Level.PHASE, db=db, sm=StateMachine(db))
+    scheduler, _ = make_scheduler(db, cfg, {Level.PHASE: executor})
+    await run_blocked(scheduler)
+    assert ("phase", "ph-x") in executor.started
+    assert phase_state(db, "ph-x") is PhaseState.DONE
+
+
+# ------------------------------------------------ §5 out-of-bounds detector
+
+
+def _git_factory_home(home: Path) -> None:
+    """factory.home as a git repo for detector tests; the conftest db files and
+    the .factory operational tree are gitignored so only deliberate dirt shows."""
+    for args in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "factory@test"],
+        ["git", "config", "user.name", "factory"],
+    ):
+        subprocess.run(args, cwd=home, check=True, capture_output=True)
+    (home / ".gitignore").write_text("factory.db*\n.factory/\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "--", ".gitignore"], cwd=home, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "home seed"], cwd=home, check=True, capture_output=True
+    )
+
+
+def _oob_alerts(db, event_type: str = "alert") -> list[dict]:
+    rows = (
+        db.read()
+        .execute("SELECT * FROM events WHERE event_type = ? ORDER BY seq", (event_type,))
+        .fetchall()
+    )
+    return [
+        dict(row)
+        for row in rows
+        if json.loads(row["payload_json"]).get("kind") == "out_of_bounds"
+    ]
+
+
+def test_recover_out_of_bounds_dirt_alerts_once_per_streak(
+    db, config_dict, tmp_path
+) -> None:
+    """Design §5: unexpected dirt in the factory repo at recover() → ONE 'alert'
+    event (kind=out_of_bounds, repo, paths) + ONE ntfy at alert priority per
+    consecutive-dirty streak; a clean observation clears the latch and future
+    dirt re-alerts — never a silent pass, never a page-per-tick."""
+    home = Path(config_dict["factory"]["home"])
+    _git_factory_home(home)
+    rogue = home / "rogue.txt"
+    rogue.write_text("foreign write outside any worktree\n", encoding="utf-8")
+    cfg = make_config(config_dict)
+    scheduler, notify = make_scheduler(db, cfg, {})
+
+    scheduler.recover()
+    (alert,) = _oob_alerts(db)
+    payload = json.loads(alert["payload_json"])
+    assert alert["unit_level"] == "factory" and alert["unit_id"] is None
+    assert payload["repo"] == "factory"
+    assert "rogue.txt" in payload["paths"][0]
+    assert payload["where"] == "recover"
+    assert notify.published == [
+        (
+            "Scriere în afara limitelor detectată în factory",
+            notify.published[0][1],
+            "max",
+        )
+    ]
+
+    # Same streak: a second recover() re-observes the SAME dirt — no re-alert.
+    scheduler.recover()
+    assert len(_oob_alerts(db)) == 1
+    assert len(notify.published) == 1
+
+    # Clean observation ends the streak; new dirt is a NEW streak → re-alert.
+    rogue.unlink()
+    scheduler.recover()
+    (home / "rogue2.txt").write_text("again\n", encoding="utf-8")
+    scheduler.recover()
+    assert len(_oob_alerts(db)) == 2
+    assert len(notify.published) == 2
+
+
+def test_out_of_bounds_ignores_droppings_and_clean_repo(db, config_dict) -> None:
+    """Design §5: porcelain output is filtered through
+    process.isolation_ignore_globs (D-0022/c50bf37 precedent) — build/test
+    droppings never alert; a clean repo produces no event and no publish."""
+    home = Path(config_dict["factory"]["home"])
+    _git_factory_home(home)
+    pycache = home / "__pycache__"
+    pycache.mkdir()
+    (pycache / "junk.cpython-312.pyc").write_bytes(b"\x00")
+    cfg = make_config(config_dict)
+    scheduler, notify = make_scheduler(db, cfg, {})
+    scheduler.recover()
+    assert _oob_alerts(db) == []
+    assert notify.published == []
+
+
+def test_out_of_bounds_skips_non_repo_roots(db, config_dict) -> None:
+    """A root that is not a git repo (pre-bootstrap workspace, plain test home)
+    has no git state to monitor — skipped, never a crash or a false alert."""
+    cfg = make_config(config_dict)  # home is a plain tmp dir; workspace absent
+    scheduler, notify = make_scheduler(db, cfg, {})
+    scheduler.recover()
+    assert _oob_alerts(db) == []
+    assert notify.published == []
+
+
+async def test_merge_gate_entry_runs_out_of_bounds_detector(
+    db, config_dict, tmp_path
+) -> None:
+    """Design §5: the detector runs at stage MERGE_GATE ENTRY — the alert lands
+    even when the gate then aborts (here: OPEN-2 null test_command →
+    ConfigError), so a foreign write is observed at the next gate, not lost."""
+    home = Path(config_dict["factory"]["home"])
+    _git_factory_home(home)
+    (home / "rogue.txt").write_text("agent wrote outside its worktree\n", encoding="utf-8")
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph1")
+    insert_stage(db, "s1", "ph1", StageState.MERGE_GATE, worktree=tmp_path / "wt")
+    notify = FakeNotify()
+    executor = StageExecutor(
+        db,
+        StateMachine(db),
+        cfg,
+        FakeRunner(db),
+        FakeWorktrees(tmp_path / "scratch"),
+        ThresholdEvaluator(db, cfg),
+        FakeConsultor([]),
+        notify,
+    )
+    stage = fdb.get_stage(db.read(), "s1")
+    assert stage is not None
+    with pytest.raises(ConfigError, match="test_command"):
+        await executor._step_merge_gate(stage)
+    (alert,) = _oob_alerts(db)
+    payload = json.loads(alert["payload_json"])
+    assert payload["repo"] == "factory" and payload["where"] == "merge_gate"
+    assert any("rogue.txt" in p for p in payload["paths"])
+    assert [(t, p) for t, _, p in notify.published] == [
+        ("Scriere în afara limitelor detectată în factory", "max")
+    ]
+
+
+def test_out_of_bounds_worktrees_dir_is_sanctioned(db, config_dict) -> None:
+    """Configured worktrees_dirs under a scanned root are factory-managed
+    checkouts (worktree add / §5.5b canonicalization territory) — their
+    porcelain entries are never out-of-bounds dirt. Production shape: the
+    workspace contains its own .worktrees/ before any .gitignore exists."""
+    workspace = Path(config_dict["projects"]["proj"]["workspace"])
+    init_repo(workspace)  # real repo; worktrees_dir == workspace/.worktrees
+    wt_dir = Path(config_dict["projects"]["proj"]["worktrees_dir"])
+    (wt_dir / "ph1").mkdir(parents=True)
+    (wt_dir / "ph1" / "scratch.txt").write_text("factory-managed\n", encoding="utf-8")
+    cfg = make_config(config_dict)
+    scheduler, notify = make_scheduler(db, cfg, {})
+    scheduler.recover()
+    assert _oob_alerts(db) == []
+    assert notify.published == []

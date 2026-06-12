@@ -78,6 +78,9 @@ class ProjectCfg(_StrictModel):
     # OPEN-2: null until the founder sets the canonical suite command; string or argv list.
     test_command: str | list[str] | None
     proving_phases: list[str]
+    # Phase-seeding design §4: factory-repo-relative PROJECT.md path; None ⇒ the
+    # Phase Architect project-context block is omitted (synthetic/b8 projects).
+    project_md: Path | None = None
 
 
 class BudgetsCfg(_StrictModel):

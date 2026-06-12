@@ -120,6 +120,10 @@ def test_adapters_registry_keys() -> None:
 
 
 def test_claude_build_cmd_full_argv_order() -> None:
+    # Amended by the phase-seeding design (§5/§8, D-0024): tools-on print-mode
+    # agents carry `--permission-mode bypassPermissions` (print mode default-
+    # denies writes; a denied write is a wedged stage), inserted after the
+    # tools handling, before --append-system-prompt.
     route = ModelRoute(cli="claude", model="fable", mode="print")
     cmd = ClaudeAdapter().build_cmd(
         route, "do it", system_append="CANON", resume_session="sid-1"
@@ -131,6 +135,8 @@ def test_claude_build_cmd_full_argv_order() -> None:
         "--output-format",
         "stream-json",
         "--verbose",
+        "--permission-mode",
+        "bypassPermissions",
         "--append-system-prompt",
         "CANON",
         "--resume",
@@ -141,10 +147,12 @@ def test_claude_build_cmd_full_argv_order() -> None:
 
 
 def test_claude_build_cmd_minimal() -> None:
+    # Amended by the phase-seeding design (§5/§8, D-0024) — see the full-argv golden.
     route = ModelRoute(cli="claude", model="sonnet", mode="print")
     cmd = ClaudeAdapter().build_cmd(route, "hi")
     assert cmd == [
         "claude", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
+        "--permission-mode", "bypassPermissions",
         "-p", "hi",
     ]
 
@@ -812,3 +820,38 @@ def test_stub_agent_unknown_scenario_fails_explicitly(tmp_path: Path) -> None:
     )
     assert proc.returncode == 64
     assert b"unknown scenario" in proc.stderr
+
+
+# ------------------- claude print-mode permissions (phase-seeding design §5/§8)
+
+
+def test_claude_bypass_flag_present_iff_tools_enabled() -> None:
+    """Phase-seeding design §5: `--permission-mode bypassPermissions` is appended
+    exactly when route.tools != 'none' (print mode default-denies writes — a
+    denied write is a wedged stage); tools-off Decision Sessions stay unchanged
+    (their structural no-write guarantee must not be voided)."""
+    adapter = ClaudeAdapter()
+    tools_on = adapter.build_cmd(ModelRoute(cli="claude", model="fable", mode="print"), "x")
+    tools_off = adapter.build_cmd(
+        ModelRoute(cli="claude", model="fable", mode="print", tools="none"), "x"
+    )
+    assert tools_on[tools_on.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "--permission-mode" not in tools_off
+    assert "bypassPermissions" not in tools_off
+
+
+def test_claude_bypass_flag_position_after_tools_before_canon() -> None:
+    """§5.1 argv-order literal: the bypass flag sits after the tools handling and
+    before --append-system-prompt (the position the frozen comment documents)."""
+    route = ModelRoute(cli="claude", model="sonnet", mode="print")
+    cmd = ClaudeAdapter().build_cmd(route, "go", system_append="CANON")
+    assert cmd.index("--verbose") < cmd.index("--permission-mode")
+    assert cmd.index("--permission-mode") < cmd.index("--append-system-prompt")
+
+
+def test_stub_adapter_argv_carries_no_bypass_flag(tmp_path: Path) -> None:
+    """The stub adapter overrides build_cmd entirely — test routes never grow the
+    claude permission flag."""
+    route = ModelRoute(cli="stub", model="stub-model", mode="print")
+    cmd = StubAdapter(tmp_path / "stub.py").build_cmd(route, "x")
+    assert "--permission-mode" not in cmd

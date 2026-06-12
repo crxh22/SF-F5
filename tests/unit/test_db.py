@@ -1385,3 +1385,41 @@ class TestModuleSurface:
             "pending_decisions",
         ):
             assert callable(getattr(dbmod, name)), name
+
+
+# -------------------------- list_dag_edges (phase-seeding design §2.3.2 read path)
+
+
+class TestListDagEdges:
+    """`dbmod.list_dag_edges` — seed-phases' duplicate-edge probe + the
+    combined-graph acyclicity input. Accessed via the module (append-only file:
+    the frozen import block above is not amended)."""
+
+    def test_empty_level_returns_empty_list(self, db: Database):
+        assert dbmod.list_dag_edges(db.read(), Level.PHASE) == []
+        assert dbmod.list_dag_edges(db.read(), Level.STAGE) == []
+
+    def test_returns_edges_scoped_by_level(self, db: Database):
+        with db.transaction() as conn:
+            insert_phase(conn, make_phase("ph-1"))
+            insert_phase(conn, make_phase("ph-2"))
+            for sid in ("st-a", "st-b"):
+                insert_stage(conn, make_stage(sid))
+            insert_dag_edge(conn, Level.PHASE, "ph-1", "ph-2")
+            insert_dag_edge(conn, Level.STAGE, "st-a", "st-b")
+        conn = db.read()
+        assert dbmod.list_dag_edges(conn, Level.PHASE) == [("ph-1", "ph-2")]
+        assert dbmod.list_dag_edges(conn, Level.STAGE) == [("st-a", "st-b")]
+
+    def test_deterministic_ordering(self, db: Database):
+        with db.transaction() as conn:
+            for pid in ("ph-1", "ph-2", "ph-3"):
+                insert_phase(conn, make_phase(pid))
+            insert_dag_edge(conn, Level.PHASE, "ph-2", "ph-3")
+            insert_dag_edge(conn, Level.PHASE, "ph-1", "ph-3")
+            insert_dag_edge(conn, Level.PHASE, "ph-1", "ph-2")
+        assert dbmod.list_dag_edges(db.read(), Level.PHASE) == [
+            ("ph-1", "ph-2"),
+            ("ph-1", "ph-3"),
+            ("ph-2", "ph-3"),
+        ]

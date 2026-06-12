@@ -383,6 +383,17 @@ def insert_dag_edge(conn: sqlite3.Connection, level: Level, from_id: str, to_id:
     )
 
 
+def list_dag_edges(conn: sqlite3.Connection, level: Level) -> list[tuple[str, str]]:
+    """All (from_id, to_id) edges at one level — the seed-phases read path
+    (phase-seeding design §2.3.2: duplicate-edge named abort + combined-graph
+    acyclicity over existing ∪ plan edges). Deterministic ordering."""
+    rows = conn.execute(
+        "SELECT from_id, to_id FROM dag_edges WHERE level = ? ORDER BY from_id, to_id",
+        (Level(level).value,),
+    ).fetchall()
+    return [(row["from_id"], row["to_id"]) for row in rows]
+
+
 def deps_done(conn: sqlite3.Connection, level: Level, unit_id: str) -> bool:
     """True iff every prerequisite of the unit is DONE. A dangling prerequisite
     (edge whose from_id has no unit row) counts as NOT done — it must block, and

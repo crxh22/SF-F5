@@ -14,6 +14,7 @@ projects:
     worktrees_dir: /home/artur/projects/erp-workspace/.worktrees
     test_command: null                # OPEN-2: must be set before the first real ERP BUILD stage
     proving_phases: [foundation, inventory-procurement]
+    project_md: docs/projects/erp/PROJECT.md   # Phase-Architect project context (factory-repo-relative; phase-seeding design §4)
 
 models:
   # role -> CLI + model alias (resolved by the respective CLI). Cross-model pairs per D-0003.

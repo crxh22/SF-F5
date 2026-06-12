@@ -54,3 +54,66 @@ sudo systemctl enable --now sf-factory-watchdog.timer   # ARM only while an orch
 `process_registry` row `role='decision_session'` (or any claude route) with `exit_code=1` and the
 ndjson result line carrying `"api_error_status": 403 ... "disabled Claude subscription access"` →
 subscription payment lapse; fix is on the Anthropic billing page, nothing in the factory.
+
+## Workspace bootstrap + phase seeding (Etapa 5 — phase-seeding design §3, D-0024)
+
+One-time per project, operator-driven (Main Architect session — a DoD-sanctioned interactive role
+outside the orchestrator, OPEN-4; DoD §12.A1's "zero manual file shuffling by the founder" binds
+the conveyor, not one-time setup). `sf-factory seed-phases` verifies the result mechanically
+(design §2.3.3) before any DB write — that is what Doctrine §20 actually demands; coding the
+bootstrap itself would be a preventive mechanism without incident (Doctrine §8).
+
+### One-time workspace bootstrap (per project)
+
+```bash
+git init -b main /home/artur/projects/erp-workspace
+cd /home/artur/projects/erp-workspace
+# .gitignore: .worktrees/, __pycache__/, *.pyc, .pytest_cache/, .ruff_cache/, node_modules/, .venv/
+# scripts/test.sh — the stable Tier-1 indirection (config: projects.erp.test_command = "bash scripts/test.sh")
+# _factory/contracts/ — the ratified cross-phase contracts: MOVED here from docs/projects/erp/contracts/
+#   (this directory becomes the CANONICAL home from this commit on — Doctrine §9; the factory-repo dir
+#    is replaced by a one-line pointer in the same ratification commit; gates read ONLY the workspace)
+git add -A && git commit -m "erp workspace bootstrap: contracts v0 + test indirection"
+```
+
+`scripts/test.sh` initial content (proposed, OPEN-2 input): `uv run pytest -q`, with the no-tests
+bootstrap window handled **self-retiringly**: on pytest exit code 5 ("no tests collected") the
+script greens ONLY if the workspace has no committed test files
+(`git ls-files -- 'tests/**/*.py' '**/test_*.py'` empty); once any test file exists, exit 5 =
+FAILURE (it then means collection/deselection misconfig — e.g. a bad `testpaths`/`-k` — and must
+never silently green the Tier-1 gate; Doctrine §20). Explicit in the script body, never hidden in
+config.
+
+### Seeding the macro plan (THE sanctioned path)
+
+```bash
+# orchestrator MUST be stopped — seed-phases refuses while the run/resume flock is held
+# (and a claim-free seeder never touches the pidfile bytes/mtime, so the watchdog stays honest)
+.venv/bin/sf-factory init                                                  # idempotent
+.venv/bin/sf-factory seed-phases docs/projects/erp/macro-plan.json --dry-run   # validate first
+.venv/bin/sf-factory seed-phases docs/projects/erp/macro-plan.json
+.venv/bin/sf-factory run
+```
+
+The plan file must be **committed and clean** in the factory repo (tracked — a gitignored file
+false-passes a porcelain-only check); the summary prints the **anchor commit sha** the
+`macro_plan` ref is pinned to.
+
+### Append-only anchors
+
+Factory-repo commits that registered refs point at (seed anchors, decision answers) are history —
+never amend/rebase the factory repo while seeded phases are non-terminal, or `verify_integrity`'s
+recorded-commit check aborts every start once gc prunes the sha.
+
+### Proving-ground PLANNING checkpoint (one-time)
+
+For the first real phase (foundation), stop the orchestrator after PLANNING commits the phase
+plan, review `phase-plan.json` + the intra-phase contracts (`_factory/contracts/phase-<id>/`),
+then resume (the A2-validated path). Bounded validation of an untrusted first-use mechanism
+(Doctrine §10) — not standing operator attention.
+
+### OPEN-2 ratification note
+
+Setting `projects.erp.test_command` deliberately amends the pinned config test —
+`tests/unit/test_config.py` asserts it `None` today; the ratification commit that sets the
+command amends that assertion in the same change. Do NOT amend the test before then.
