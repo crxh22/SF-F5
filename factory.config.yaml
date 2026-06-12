@@ -101,7 +101,10 @@ founder_channel:
   # Lowercase substrings matched case-insensitively against agent result text + the
   # stderr tail (scheduler usage-limit detector). Provenance: the D-0021 billing-403
   # incident class; founder asked to be paged on capacity events (12-06-2026).
-  usage_limit_signatures: ["subscription access", "usage limit", "rate limit", "limit reached"]
+  # "spend limit" added 12-06-2026: the first real capacity event ("You've hit your
+  # monthly spend limit") matched NO prior signature — detector silent, founder
+  # self-discovered the outage (D-0034).
+  usage_limit_signatures: ["subscription access", "usage limit", "rate limit", "limit reached", "spend limit"]
 
 process:
   agent_timeout_s: 3600

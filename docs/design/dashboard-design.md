@@ -1,6 +1,6 @@
 # Founder Dashboard Design — SF-F5
 
-**Status:** design, v1.2 — 2026-06-12, §10 added (founder-channel UX slice — founder directive 12-06-2026 + the two D-0026 gaps), revised after adversarial review (R-A UX lens: 13 findings, R-B technical lens: 9 findings — all applied, 0 rejected; see Review log); v1.1 — 2026-06-11 (two reviewers, 18 findings, all applied); **v1.1 architect-ratified by D-0017**; v1.2 ratified by D-0027. Binding sources: `_FRAMEWORK_MVP_DoD.md` §9/§12.A4/§14, `docs/design/control-plane-design.md` §1 (dashboard boundary)/§2 (read-write rules, `decision_requests` DDL)/§4 (frozen interfaces)/§7 (concurrency invariants), decision log D-0015 (answer-path order)/D-0009 (canon)/D-0016 (OPEN-4 scope), `factory.config.yaml` `founder_channel.*`, `work-protocols/protocol_interactiune_founder.md` (BINDING for every founder-visible string), `work-protocols/conventions.md` (dates). Implements nothing; config keys here are PROPOSED (architect logs them).
+**Status:** design, v1.3 — 2026-06-12, §11 added (per-stage agent cost breakdown — founder directive 12-06-2026, second of the day), adversarially reviewed (see Review log); v1.2 — 2026-06-12, §10 added (founder-channel UX slice — founder directive 12-06-2026 + the two D-0026 gaps), revised after adversarial review (R-A UX lens: 13 findings, R-B technical lens: 9 findings — all applied, 0 rejected; see Review log); v1.1 — 2026-06-11 (two reviewers, 18 findings, all applied); **v1.1 architect-ratified by D-0017**; v1.2 ratified by D-0027; v1.3 ratified by D-0034. Binding sources: `_FRAMEWORK_MVP_DoD.md` §9/§12.A4/§14, `docs/design/control-plane-design.md` §1 (dashboard boundary)/§2 (read-write rules, `decision_requests` DDL)/§4 (frozen interfaces)/§7 (concurrency invariants), decision log D-0015 (answer-path order)/D-0009 (canon)/D-0016 (OPEN-4 scope), `factory.config.yaml` `founder_channel.*`, `work-protocols/protocol_interactiune_founder.md` (BINDING for every founder-visible string), `work-protocols/conventions.md` (dates). Implements nothing; config keys here are PROPOSED (architect logs them).
 
 ---
 
@@ -283,6 +283,45 @@ New element **Escaladări deschise** (anchor `id="escaladari"`, rows `id="escala
 1. **CCR-7** (control-plane design §4 additive amendments, v1.6→v1.7 annotation per Doctrine §19): `models.STAGE_ESCALATION_RESOLUTIONS` / `models.PHASE_ESCALATION_RESOLUTIONS` (vocabulary moved from scheduler privates, GATE_ANSWERS precedent) **+ cli subcommand `resolve-escalation`** (operator surface).
 2. **D-0015 exception extension**: the second-OS-process single-short-tx write pattern, ratified for `cli decide`, extends to `cli resolve-escalation` under identical bounds (one tx, `WHERE status='open'` guard, busy-timeout fail-explicit, zero partial state) — recorded as sanctioned, not inherited by analogy.
 3. The §10.1-S3 in-card-textarea rejection (meta-refresh form destruction) is a design constraint on future card work: no free-text input on auto-refreshing pages.
+
+---
+
+## 11. v1.3 — Per-stage agent cost breakdown (founder directive 12-06-2026)
+
+**Founder directive (verbatim intent):** for every stage running or finished, show the token cost per involved agent — "Agent N — (model) tokens in | tokens out / total USD for this agent, per the prices set in config" — both live ("la moment") and final ("la finalizare").
+
+### 11.1 Sources of truth & the honesty rule
+
+- **`token_ledger`** already records one row per agent run: `process_id, role, model, tokens_in, tokens_out, cost_usd, estimated, recorded_at`, keyed by `unit_id` — the per-stage, per-agent data EXISTS; this slice is read-path + config only. No schema change, no write-path change.
+- **`cost_usd` precedence (Doctrine §21 — never show the founder false money):** claude routes report `total_cost_usd` from the CLI's own ndjson — exact and cache-aware (cache reads bill ~0.1×, writes ~1.25×; `tokens_in` is raw context flow, so a naive `tokens_in × price` would overstate real cost ~2-3×). Where `cost_usd` is non-NULL it renders as-is (exact). Where NULL (codex routes — model recorded as `default` — and stub), the dashboard ESTIMATES from config prices and renders with a `~` prefix.
+- **NEW config section `pricing` (Doctrine §14):** `pricing.usd_per_mtok.<ledger-model>: {input: <usd>, output: <usd>}` — keys are LEDGER model strings (`fable`, `sonnet`, `haiku`, `default`, …), founder-tunable. Estimation: `tokens_in/1e6×input + tokens_out/1e6×output`. A NULL-cost row whose model has no pricing key renders `— (preț lipsă în config)` — fail-visible, never a silent zero (Doctrine §7). Rows with `estimated=1` token counts (bytes/4 fallback) keep the `~` regardless of cost source.
+- Starter values (founder-tunable; API list prices 06-2026): fable 10/50, sonnet 3/15, haiku 1/5, opus-4-8 5/25; `default` (codex) 1.25/10 with a YAML comment marking it operator-estimated, to be verified against the OpenAI account — codex sums are `~` estimates either way. Costs are API-equivalent value (subscriptions pay differently); the legend says so.
+
+### 11.2 UI (per the §10.2/§10.3 conventions — tables, phone-first, zero JS)
+
+- **Plan section, per stage** (groups Finalizate + În lucru; Planificate have no ledger rows → nothing): under the phase table, one `<details>` per stage with ledger rows — summary line `«<etapă> — agenți: N · cost: <total>»` (running stages append „· în lucru — parțial"), body = one `<table>`: `agent (rol glossed R2) · model · tokeni intrare · tokeni ieșire · cost`. One row per ledger entry in `recorded_at` order (a re-run role appears twice — that is the truth of what was spent); total row last. The in-flight agent's run lands at its exit (ledger writes on finalize) — bounded staleness, stated in the legend.
+- **„Etape în lucru" table (§10.3)** gains a right-aligned `cost` column after `tokeni` (same accrued-total semantics).
+- **Phase header line** in the plan section gains the phase's total cost.
+- **Totals with mixed precision** render exact and estimated SEPARATELY — `«12,40 $ + ~0,85 $»` — never silently summed into one figure.
+- **Formatting:** new `_fmt_usd` — two decimals, Romanian decimal comma, `$` suffix with thin space; `<0,01 $` for sub-cent non-zero. New RO strings enter the `RO`/`GLOSS` tables (R1/R2; closure tests extend). Legend (small print, once per page, only when any cost cell rendered): „costurile = raportate exact de CLI (includ reducerile de cache); ~ = estimare din prețurile din config; sumele sunt echivalent-API (abonamentul se facturează separat); agentul în lucru apare la finalul rulării sale".
+- No new inputs, no JS, no new write path — pure read-path rendering on the auto-refreshing page (the §10.9 no-free-text-input constraint is untouched).
+
+### 11.3 Code deltas (CCR-10, control-plane v1.9→v1.10 annotation)
+
+1. `config.py`: `ModelPrice{input: float >0, output: float >0}` + `PricingCfg{usd_per_mtok: dict[str, ModelPrice]}` (extra=forbid), top-level optional `pricing` (default empty — golden config carries the real table).
+2. `db.py`: repository read helper `list_token_ledger(conn, unit_level, unit_id) -> list[Row]` (pure SQL, recorded_at order) + `sum_token_cost(conn, unit_level, unit_ids) -> Mapping[unit_id, (exact_usd, est_in, est_out tokens per model)]` or equivalent aggregate — builder picks the minimal shape the renderer needs; phase totals derive from stage rows, never a second source.
+3. `dashboard.py`: dataclasses extended (stage cost summary + per-agent rows assembled into `DashboardView`), `_fmt_usd`, the `<details>` blocks, the column, the legend. Read path stays mode=ro.
+4. `factory.config.yaml`: the `pricing` section with starter values.
+
+### 11.4 Tests
+
+Golden config loads the pricing table (structure asserted, values founder-tunable); `_fmt_usd` (RO comma, sub-cent, thin space); estimation math incl. missing-key marker and exact-passthrough precedence; mixed exact+`~` total never merged; per-agent table renders one row per ledger row with glossed role and right-aligned numerics; PENDING stage → no details block; legend renders iff any cost cell does; RO/GLOSS closure tests extended to the new strings.
+
+### 11.5 Ratification rider (D-0034 must record)
+
+1. **CCR-10** (control-plane §4 additive: `config.ModelPrice`/`PricingCfg` + `db.list_token_ledger`/aggregate helper; dashboard consumes — v1.9→v1.10 annotation per Doctrine §19).
+2. Cost-display honesty rule (exact-where-reported, `~`-estimate-where-not, never merged) is a standing design constraint for any future cost surface.
+3. Codex `default` pricing values are operator-estimated pending founder verification against the OpenAI account; the model-attribution gap (codex ledger rows say `default`, not the actual codex model) is a registered watch item — trigger: founder needs per-codex-model costs.
 
 ---
 
