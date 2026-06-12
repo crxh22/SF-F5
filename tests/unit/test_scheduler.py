@@ -208,11 +208,15 @@ class FakeRunner:
     """Role-scripted stand-in for AgentRunner: behaviors[role] gets (cwd,
     unit_id, resume_session) and writes whatever files the step expects.
     With ``db`` set it also writes the §5.1 'spawn' event like the real
-    runner (the context-reset consumption rule reads it)."""
+    runner (the context-reset consumption rule reads it). ``outcomes[role]``
+    is a FIFO of AgentResult field overrides (e.g. {"exit_code": 1} or
+    {"exit_code": None, "timed_out": True, "killed": True}) consumed one per
+    call — exhausted or absent means the default clean exit-0 result."""
 
     def __init__(self, db: Any = None) -> None:
         self.db = db
         self.behaviors: dict[str, Any] = {}
+        self.outcomes: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[SimpleNamespace] = []
 
     async def run_agent(
@@ -250,22 +254,26 @@ class FakeRunner:
         behavior = self.behaviors.get(role)
         if behavior is not None:
             behavior(Path(cwd), unit_id, resume_session)
-        return AgentResult(
-            process_id=0,
-            exit_code=0,
-            timed_out=False,
-            killed=False,
-            declared_failure=False,
-            result_text="",
-            session_id=None,
-            tokens_in=1,
-            tokens_out=1,
-            cost_usd=None,
-            garbage_lines=0,
-            ndjson_log_path="(fake)",
-            stderr_path="(fake)",
-            duration_ms=1,
-        )
+        fields: dict[str, Any] = {
+            "process_id": 0,
+            "exit_code": 0,
+            "timed_out": False,
+            "killed": False,
+            "declared_failure": False,
+            "result_text": "",
+            "session_id": None,
+            "tokens_in": 1,
+            "tokens_out": 1,
+            "cost_usd": None,
+            "garbage_lines": 0,
+            "ndjson_log_path": "(fake)",
+            "stderr_path": "(fake)",
+            "duration_ms": 1,
+        }
+        queue = self.outcomes.get(role)
+        if queue:
+            fields |= queue.pop(0)
+        return AgentResult(**fields)
 
 
 class FakeWorktrees:
@@ -3177,6 +3185,187 @@ async def test_build_declared_failure_path_unchanged_escalates(
     triggers = [r["trigger"] for r in open_escalations(db, "ph.s1")]
     assert triggers == ["agent_declared_failure"]
     assert events_of(db, "ph.s1", "build_noop_accepted") == []
+
+
+# ------------------------------------ incident 7 (D-0035): agent-run success gate
+
+
+def _head(worktree: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+async def test_agent_run_failed_build_exit1_escalates_no_noop_no_commit(
+    db, config_dict, tmp_path
+) -> None:
+    """Incident 7 (D-0035): an exit-1 builder with no changes and no sentinel
+    is a DEAD run, never a 'build_noop_accepted' — the gate escalates (literal
+    trigger 'agent_run_failed', target phase_architect, evidence payload),
+    transitions to ESCALATED, commits nothing, and pages the founder channel."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    env.runner.behaviors["builder_routine"] = lambda cwd, unit_id, resume: None
+    env.runner.outcomes["builder_routine"] = [{"exit_code": 1}]
+    head_before = _head(env.worktree)
+
+    await env.executor.execute("ph.s1")  # _AgentRunFailed contained in execute()
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_run_failed"
+    assert esc["target"] == "phase_architect"
+    (event,) = events_of(db, "ph.s1", "agent_run_failed")
+    assert esc["event_seq"] == event["seq"]
+    payload = json.loads(event["payload_json"])
+    assert payload["role"] == "builder_routine"
+    assert payload["exit_code"] == 1
+    assert payload["killed"] is False
+    assert {"process_id", "duration_ms", "stderr_path"} <= set(payload)
+    # Zero post-gate consumption: no noop acceptance, no commit-all, no
+    # validator spawn — and the founder page went out (§8 B7).
+    assert events_of(db, "ph.s1", "build_noop_accepted") == []
+    assert _head(env.worktree) == head_before
+    assert [c.role for c in env.runner.calls] == ["builder_routine"]
+    assert any(
+        "agent_run_failed" in title and priority == "max"
+        for title, _link, priority in env.notify.published
+    )
+
+
+async def test_agent_run_failed_validator_stale_report_not_recounted(
+    db, config_dict, tmp_path
+) -> None:
+    """Incident 7 manifestation (b)/(c): a dead validator (exit 1, wrote
+    nothing) over a scratch that still CONTAINS an old passing report must not
+    re-count it as a fresh fix_iteration (the zombie cycle) — the gate
+    escalates instead, nothing crosses the isolation boundary, and the scratch
+    is disposed (§5.4)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    # The stale committed report materializes in the recreated scratch (real
+    # worktrees re-sync tracked content; FakeWorktrees.create keeps the dir).
+    stale_dir = tmp_path / "scratch" / "ph.s1-validate" / "_factory" / "stages" / "ph.s1"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "validation-report.md").write_text("stale PASS\n", encoding="utf-8")
+    (stale_dir / "validation-report.json").write_text(
+        json.dumps({"failing": 0, "passing": 3, "total": 3}), encoding="utf-8"
+    )
+    env.runner.outcomes["validator"] = [{"exit_code": 1}]
+
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_run_failed"
+    rows = db.read().execute(
+        "SELECT COUNT(*) FROM fix_iterations WHERE stage_id='ph.s1'"
+    ).fetchone()
+    assert rows[0] == 0  # the stale report was never counted as an iteration
+    unit_dir = env.worktree / "_factory" / "stages" / "ph.s1"
+    assert not (unit_dir / "validation-report.json").exists()  # nothing crossed
+    assert env.consultor.calls == []  # CP-1 never consulted on a corpse
+    scratch = env.wt.scratch_root / "ph.s1-validate"
+    assert env.wt.removed == [scratch]  # §5.4 disposal still ran (finally)
+
+
+async def test_agent_run_failed_sentinel_precedence_no_double_escalation(
+    db, config_dict, tmp_path
+) -> None:
+    """Gate precedence: an agent that writes _DECLARED_FAILURE.md and THEN
+    exits 1 declared itself — only the existing 'agent_declared_failure'
+    always-fire path escalates; no 'agent_run_failed' row or event lands."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+
+    def declaring_builder(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "_DECLARED_FAILURE.md").write_text("cannot proceed", encoding="utf-8")
+
+    env.runner.behaviors["builder_routine"] = declaring_builder
+    env.runner.outcomes["builder_routine"] = [{"exit_code": 1}]
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    triggers = [r["trigger"] for r in open_escalations(db, "ph.s1")]
+    assert triggers == ["agent_declared_failure"]
+    assert events_of(db, "ph.s1", "agent_run_failed") == []
+
+
+async def test_agent_run_failed_timeout_killed_same_gate(
+    db, config_dict, tmp_path
+) -> None:
+    """A timeout-killed run (killed=True, returncode None — the runner's
+    terminate→kill ladder) is every bit as dead as exit 1: same gate, same
+    literal trigger, evidence carries the kill shape."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    env.runner.behaviors["builder_routine"] = lambda cwd, unit_id, resume: None
+    env.runner.outcomes["builder_routine"] = [
+        {"exit_code": None, "timed_out": True, "killed": True}
+    ]
+
+    await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_run_failed"
+    payload = json.loads(events_of(db, "ph.s1", "agent_run_failed")[0]["payload_json"])
+    assert payload["exit_code"] is None
+    assert payload["timed_out"] is True
+    assert payload["killed"] is True
+
+
+async def test_agent_run_failed_rework_build_reenters_cleanly(
+    db, config_dict, tmp_path
+) -> None:
+    """§5.5d at-least-once: after an 'agent_run_failed' escalation the standard
+    'rework:BUILD' resolution re-enters BUILD cleanly — the dead builder's
+    uncommitted partial writes were discarded at the gate (recorded as
+    evidence), so the §3.1 isolation assertion passes and a healthy exit-0
+    agent completes the stage through VALIDATE."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+    env.runner.behaviors["validator"] = validator_writing(0)
+    env.runner.outcomes["builder_routine"] = [{"exit_code": 1}]
+
+    await env.executor.execute("ph.s1")  # dead builder wrote impl-1.py, then died
+
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "agent_run_failed"
+    payload = json.loads(events_of(db, "ph.s1", "agent_run_failed")[0]["payload_json"])
+    assert any("impl-1.py" in entry for entry in payload["discarded"])
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=env.worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert porcelain == ""  # corpse leftovers discarded — re-entry stays legal
+
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc["id"], "rework:BUILD")
+    # Healthy re-run: BUILD commits, VALIDATE passes (failing=0, routine has no
+    # audits) and the conveyor reaches MERGE_GATE, where the unset Tier-1 suite
+    # raises the explicit OPEN-2 ConfigError (never a skip).
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await env.executor.execute("ph.s1")
+
+    assert stage_state(db, "ph.s1") is StageState.MERGE_GATE
+    assert open_escalations(db, "ph.s1") == []
+    builder_calls = [c for c in env.runner.calls if c.role == "builder_routine"]
+    assert len(builder_calls) == 2  # the failed spawn + the healthy completion
 
 
 def test_build_prompt_forbids_self_commit(db, config_dict, tmp_path) -> None:

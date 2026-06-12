@@ -118,6 +118,17 @@ _SENTINEL_EVENTS: Mapping[str, tuple[str, str]] = {
     ),
 }
 
+
+class _AgentRunFailed(Exception):
+    """Incident 7 (D-0035) control-flow signal: ``_run_step_agent`` detected a
+    failed agent run (nonzero/None exit or killed, with NO sentinel declared),
+    already inserted the 'agent_run_failed' escalation and transitioned the
+    stage to ESCALATED — the raising step must unwind WITHOUT consuming any
+    artifact (freshness of the RUN, not presence of artifacts, is the
+    contract). Caught in ``StageExecutor.execute`` so it never reaches the
+    ``Scheduler._drive`` §6 boundary, which would double-escalate it as
+    'internal_error'; sibling units keep running either way."""
+
 #: ESCALATED-exit resolution vocabulary: models.STAGE_ESCALATION_RESOLUTIONS /
 #: models.PHASE_ESCALATION_RESOLUTIONS (CCR-7 / D-0027 — moved out of the
 #: former module privates; one source consumed by _step_escalated AND
@@ -986,7 +997,15 @@ class StageExecutor:
             step = steps.get(stage.state)
             if step is None:  # DONE / FAILED / CANCELLED
                 return
-            if not await step(stage):
+            try:
+                progressed = await step(stage)
+            except _AgentRunFailed:
+                # Incident 7 (D-0035): the gate already escalated (trigger
+                # 'agent_run_failed') + transitioned to ESCALATED; stop driving
+                # THIS unit only — containment here keeps the §6 boundary from
+                # re-escalating it as 'internal_error'.
+                return
+            if not progressed:
                 return
 
     # ------------------------------------------------------------ shared bits
@@ -1057,7 +1076,126 @@ class StageExecutor:
                             "process_id": result.process_id,
                         },
                     )
+        # Incident 7 (D-0035) success gate: a step may consume agent output
+        # only when the run succeeded (exit 0) or the agent explicitly declared
+        # itself (sentinel present — the §5.4 always-fire path wins, even on a
+        # nonzero exit, so a declare-then-exit-1 agent never double-escalates).
+        # Everything not cleanly zero (nonzero, killed, timed out, or a None
+        # returncode) is a DEAD run: whatever sits in the worktree is a stale
+        # artifact of an EARLIER run, never this run's output — escalate and
+        # stop the step before any consuming code touches it. The runner has
+        # already ledgered the run's tokens (runner.run_agent finalize tx).
+        if not sentinels and (
+            result.exit_code != 0 or result.timed_out or result.killed
+        ):
+            await self._escalate_agent_run_failed(stage, role, result, cwd)
+            raise _AgentRunFailed(
+                f"stage {stage.id}: {role} run failed (exit_code={result.exit_code},"
+                f" timed_out={result.timed_out}, killed={result.killed})"
+                " — escalated, step stopped before consuming artifacts"
+            )
         return result
+
+    async def _escalate_agent_run_failed(
+        self, stage: Stage, role: str, result: AgentResult, cwd: Path
+    ) -> None:
+        """Incident 7 (D-0035) gate bookkeeping: discard the dead run's
+        uncommitted leftovers (stage worktree only — a scratch cwd is disposed
+        by its step's ``finally``), then escalation row with the
+        scheduler-literal trigger 'agent_run_failed' (the 'cp1_verdict' /
+        'usage_missing' pattern — no Trigger enum member, no DDL change) +
+        one transition to ESCALATED + the §8 B7 founder page. §5.5d replay is
+        untouched: committed prior work survives — only the corpse's
+        uncommitted writes are dropped, so a 'rework:<STEP>' resolution
+        re-enters cleanly (the §3.1 BUILD isolation assertion would otherwise
+        wedge on the leftovers)."""
+        evidence: dict[str, object] = {
+            "role": role,
+            "process_id": result.process_id,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "killed": result.killed,
+            "duration_ms": result.duration_ms,
+            "stderr_path": result.stderr_path,
+        }
+        if (
+            stage.worktree_path
+            and cwd.resolve() == Path(stage.worktree_path).resolve()
+        ):
+            evidence["discarded"] = await self._discard_uncommitted(cwd)
+
+        def coupled(conn: sqlite3.Connection) -> None:
+            seq = fdb.insert_event(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                event_type="agent_run_failed",
+                actor=_ACTOR,
+                payload=evidence,
+            )
+            if not fdb.open_escalation(
+                conn, Level.STAGE.value, stage.id, "agent_run_failed"
+            ):  # uq_open_escalation: one open row per trigger
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        trigger="agent_run_failed",
+                        target="phase_architect",
+                        payload_artifact_id=None,
+                        event_seq=seq,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        try:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.ESCALATED.value,
+                actor=_ACTOR,
+                reason="agent run failed: not-cleanly-zero exit, no sentinel declared",
+                payload=evidence | {"triggers": ["agent_run_failed"]},
+                coupled=coupled,
+            )
+        except TransitionError:
+            # A concurrent sibling (the AUDIT gather) already escalated this
+            # stage: the event + (deduped) escalation row still land —
+            # visible, never silent (the _contain_failure precedent).
+            with self._db.transaction() as conn:
+                coupled(conn)
+        await self._publish_alert(
+            f"Escaladare: etapa {stage.name} — agent_run_failed",
+            "escaladari",
+            context={"unit_id": stage.id, "triggers": ["agent_run_failed"]},
+        )
+
+    async def _discard_uncommitted(self, worktree: Path) -> list[str]:
+        """Drop a failed run's uncommitted writes (evidence first): a dead
+        agent's partial files are corpse output nobody may consume, and left
+        in place they wedge the §5.5d rework re-entry on the §3.1 isolation
+        assertion. Returns the discarded porcelain entries; the run's ndjson +
+        stderr logs persist for forensics (§5.5b dirty-reset precedent)."""
+        code, out, err = await run_git("status", "--porcelain", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git status failed in {worktree}: {(err or out).strip()}")
+        discarded = [line for line in out.splitlines() if line.strip()]
+        if not discarded:
+            return []
+        code, out, err = await run_git("reset", "--hard", cwd=worktree)
+        if code != 0:
+            raise GitError(
+                f"git reset --hard failed in {worktree}: {(err or out).strip()}"
+            )
+        code, out, err = await run_git("clean", "-fd", cwd=worktree)
+        if code != 0:
+            raise GitError(f"git clean -fd failed in {worktree}: {(err or out).strip()}")
+        return discarded[:200]  # bounded evidence, like the stderr tail scans
 
     async def _commit_unit_paths(
         self, stage: Stage, worktree: Path, paths: Sequence[Path], message: str

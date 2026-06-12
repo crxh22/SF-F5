@@ -51,12 +51,28 @@ def _playbook_with(env: FactoryEnv, role_calls: dict) -> None:
 
 
 def _running_pid(env: FactoryEnv, role: str) -> dict | None:
+    """Registry row of the role's running stub — only once its NDJSON log has
+    content. The 'running' flip happens right after exec (runner §5.1), BEFORE
+    the driver pops its playbook spec; a SIGKILL landing in that window leaks
+    the hang spec to the post-resume re-run, which then times out — and the
+    D-0035 agent-run gate (correctly) refuses a timed-out run's output. The
+    init line is emitted only after the pop, so requiring it keeps the kill
+    inside the documented deterministic window (the hung sleep)."""
     rows = [
         p
         for p in env.processes(role=role)
         if p["state"] == "running" and p["pid"] is not None
     ]
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    log = row.get("ndjson_log_path")
+    try:
+        if not log or Path(log).stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+    return row
 
 
 def _merge_shas(env: FactoryEnv) -> list[str]:
