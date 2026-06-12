@@ -1604,7 +1604,16 @@ class StageExecutor:
                     StageState.BUILD.value,
                     actor=_ACTOR,
                     reason="CP-1 continue_session downgraded to rebuild",
-                    payload=base_payload | {"executed_as": "rebuild"},
+                    payload=base_payload
+                    | {
+                        "executed_as": "rebuild",
+                        # CCR-9: rework re-entry — the downgrade rationale
+                        # reaches the re-spawned Builder's prompt.
+                        "rework_context": (
+                            "CP-1 continue_session downgraded to rebuild: "
+                            f"{downgrade_reason}"
+                        ),
+                    },
                     coupled=downgrade,
                 )
                 return True
@@ -1624,7 +1633,8 @@ class StageExecutor:
                 StageState.BUILD.value,
                 actor=_ACTOR,
                 reason="CP-1 verdict rebuild",
-                payload=base_payload,
+                # CCR-9: rework re-entry — dedicated prompt-context key.
+                payload=base_payload | {"rework_context": "CP-1 verdict rebuild"},
             )
             return True
         if value == "respec":
@@ -1634,7 +1644,8 @@ class StageExecutor:
                 StageState.SPEC.value,
                 actor=_ACTOR,
                 reason="CP-1 verdict respec",
-                payload=base_payload,
+                # CCR-9: rework re-entry — dedicated prompt-context key.
+                payload=base_payload | {"rework_context": "CP-1 verdict respec"},
             )
             return True
         if value == "escalate":
@@ -1837,13 +1848,19 @@ class StageExecutor:
             )
             return False
         if complied:
+            rework = "executor complies with audit finding(s) — rework"
             self._sm.transition(
                 Level.STAGE,
                 stage.id,
                 StageState.BUILD.value,
                 actor=_ACTOR,
-                reason="executor complies with audit finding(s) — rework",
-                payload={"complied": [f.finding_ref for f in complied]},
+                reason=rework,
+                payload={
+                    "complied": [f.finding_ref for f in complied],
+                    # CCR-9: genuine rework re-entry — same sentence as the
+                    # transition reason, on the dedicated prompt-context key.
+                    "rework_context": rework,
+                },
                 coupled=couple_statuses,
             )
             return True
@@ -2171,10 +2188,14 @@ class StageExecutor:
 
         assert last.id is not None  # a resolved DB row always carries its id
         # CCR-9: the re-entered role's prompt context is the entry payload's
-        # 'reason' — and StateMachine.transition merges the explicit ``reason``
-        # argument over any payload key, so the operator's --reason rationale
-        # (escalation_resolved event) must BE the transition reason; the prior
-        # 'escalation resolved: <resolution>' string stays as the fallback.
+        # DEDICATED 'rework_context' key — set explicitly at genuine rework
+        # re-entries only, never inferred from the generic transition reason
+        # (StateMachine.transition merges ``reason`` into EVERY stored payload,
+        # so consuming it would caption fresh entries too). The operator's
+        # --reason rationale (escalation_resolved event) is preferred; the
+        # deterministic 'escalation resolved: <resolution>' string stays as the
+        # fallback. The same string doubles as the transition reason, so the
+        # event log and dashboard tell the same story.
         reason = _resolution_reason(conn, Level.STAGE.value, stage.id, last.id) or (
             f"escalation resolved: {last.resolution}"
         )
@@ -2187,7 +2208,7 @@ class StageExecutor:
             payload={
                 "escalation_id": last.id,
                 "resolution": last.resolution,
-                "reason": reason,
+                "rework_context": reason,
             },
             coupled=coupled,
         )
@@ -2645,9 +2666,12 @@ class StageExecutor:
     ) -> str:
         unit_rel = f"_factory/stages/{stage.id}"
         context = ""
-        reason = entry_payload.get("reason")
-        if reason:
-            context = f"\nRework context: {reason}."
+        # CCR-9: prompts consume ONLY the dedicated 'rework_context' key —
+        # never the generic 'reason' the state machine merges into every
+        # stored payload (fresh entries must stay context-free).
+        rework_context = entry_payload.get("rework_context")
+        if rework_context:
+            context = f"\nRework context: {rework_context}."
         extras = []
         if (Path(worktree) / unit_rel / "validation-report.md").is_file():
             extras.append(f"{unit_rel}/validation-report.md")
@@ -2669,9 +2693,10 @@ class StageExecutor:
     def _build_prompt(self, stage: Stage, worktree: Path, entry_payload: dict) -> str:
         unit_rel = f"_factory/stages/{stage.id}"
         context = ""
-        reason = entry_payload.get("reason")
-        if reason:
-            context = f"\nRework context: {reason}."
+        # CCR-9: dedicated 'rework_context' key only — see _spec_prompt.
+        rework_context = entry_payload.get("rework_context")
+        if rework_context:
+            context = f"\nRework context: {rework_context}."
         extras = []
         if (Path(worktree) / unit_rel / "validation-report.md").is_file():
             extras.append(f"{unit_rel}/validation-report.md")
