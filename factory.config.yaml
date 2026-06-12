@@ -49,7 +49,7 @@ budgets:
 
 escalation:
   max_fix_iterations: 3        # BUILD->VALIDATE loops without failing-test count decreasing
-  churn_threshold: 4           # edits to the same file region within one stage
+  churn_threshold: 12          # diff hunks landing in one file region across a stage's builds; measured healthy life (creation + one rework) = 4 — recalibrated ~3x (D-0032)
   churn_region_lines: 40       # hunk-bucket size for the churn detector
   max_context_resets: 1        # context_budget firings executed as reset before escalating
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
