@@ -1644,6 +1644,124 @@ async def test_escalation_resolution_routes_and_archives_sentinel(
     assert not (unit_dir / "_DECLARED_FAILURE.md").exists()
     archived = unit_dir / f"_DECLARED_FAILURE.resolved-{esc_id}.md"
     assert archived.is_file()  # §5.4 archive: stale sentinel can never re-fire
+    # CCR-9: the resolution transition payload carries a reason — with no
+    # escalation_resolved event rationale the deterministic fallback applies.
+    entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "FAILED"
+    ]
+    payload = json.loads(entry[-1]["payload_json"])
+    assert payload["escalation_id"] == esc_id
+    assert payload["resolution"] == "failed"
+    assert payload["reason"] == "escalation resolved: failed"
+
+
+async def test_escalation_resolution_payload_carries_operator_reason(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-9: the operator's `resolve-escalation --reason` rationale — recorded
+    only in the escalation_resolved event payload — travels in the resolution
+    transition payload into the rework target, where the re-entered role's
+    prompt builder reads it as 'Rework context'."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="cp1_verdict",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:  # the CLI's short tx: resolve + event
+        fdb.resolve_escalation(conn, esc_id, "rework:SPEC")
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="escalation_resolved",
+            actor="main_architect",
+            payload={
+                "escalation_id": esc_id,
+                "resolution": "rework:SPEC",
+                "reason": "spec is internally contradictory",
+                "via": "cli",
+            },
+        )
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    progressed = await env.executor._step_escalated(stage)
+
+    assert progressed is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC
+    entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "SPEC"
+    ]
+    payload = json.loads(entry[-1]["payload_json"])
+    assert payload["escalation_id"] == esc_id
+    assert payload["resolution"] == "rework:SPEC"
+    assert payload["reason"] == "spec is internally contradictory"
+
+
+async def test_escalation_rework_build_reason_reaches_builder_prompt(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-9 emergent benefit: a rework:BUILD resolution with an operator
+    reason re-enters BUILD whose entry payload now carries that reason, so the
+    re-spawned Builder's prompt renders it as 'Rework context'."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="cp1_verdict",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, "rework:BUILD")
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="escalation_resolved",
+            actor="main_architect",
+            payload={
+                "escalation_id": esc_id,
+                "resolution": "rework:BUILD",
+                "reason": "builder skipped the edge cases",
+                "via": "cli",
+            },
+        )
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    assert await env.executor._step_escalated(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.BUILD
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    assert await env.executor._step_build(stage) is True
+
+    (builder_call,) = [c for c in env.runner.calls if c.role == "builder_routine"]
+    assert "Rework context: builder skipped the edge cases." in builder_call.prompt
 
 
 async def test_validator_declared_failure_scratch_disposed_next_pass_completes(
@@ -3079,3 +3197,44 @@ def test_build_prompt_forbids_factory_artifact_mutation(db, config_dict, tmp_pat
     assert stage is not None
     prompt = env.executor._build_prompt(stage, env.worktree, {})
     assert "Never modify spec.md or any other _factory/ artifact" in prompt
+
+
+def test_spec_prompt_rework_context_and_read_first_extras(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-9: a SPEC re-entry payload reason renders as 'Rework context' and
+    the prompt lists exactly the existing re-entry artifacts as 'Read first'
+    extras (the CCR-8 _build_prompt pattern, mirrored)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    phase = fdb.get_phase(db.read(), "ph")
+    assert phase is not None
+    unit_dir = env.worktree / "_factory" / "stages" / "ph.s1"
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "validation-report.md").write_text("findings", encoding="utf-8")
+    (unit_dir / "build-notes.md").write_text("notes", encoding="utf-8")
+    prompt = env.executor._spec_prompt(
+        stage, phase, env.worktree, {"reason": "spec contradiction X"}
+    )
+    assert "Rework context: spec contradiction X." in prompt
+    assert (
+        "Read first: _factory/stages/ph.s1/validation-report.md, "
+        "_factory/stages/ph.s1/build-notes.md." in prompt
+    )
+    assert "escalation-payload.md" not in prompt  # absent file is never listed
+
+
+def test_spec_prompt_fresh_entry_has_no_rework_context(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-9 fresh-dispatch regression pin: an empty entry payload and a unit
+    dir without re-entry artifacts keep the Spec Agent prompt context-free."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    phase = fdb.get_phase(db.read(), "ph")
+    assert phase is not None
+    prompt = env.executor._spec_prompt(stage, phase, env.worktree, {})
+    assert "Rework context" not in prompt
+    assert "Read first" not in prompt

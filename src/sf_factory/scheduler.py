@@ -307,6 +307,31 @@ def _last_transition_payload(
     return payload if isinstance(payload, dict) else {}
 
 
+def _resolution_reason(
+    conn: sqlite3.Connection, level: str, unit_id: str, escalation_id: int
+) -> str | None:
+    """Operator rationale of the escalation_resolved event for this escalation
+    (cli --reason); None when absent — the caller supplies its fallback."""
+    rows = conn.execute(
+        "SELECT payload_json FROM events WHERE unit_level = ? AND unit_id = ?"
+        " AND event_type = 'escalation_resolved' ORDER BY seq DESC",
+        (level, unit_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("escalation_id") != escalation_id:
+            continue
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
 def _unit_artifact_rows(
     conn: sqlite3.Connection, level: str, unit_id: str, repo: str
 ) -> list[tuple[int, str, str]]:
@@ -1211,8 +1236,15 @@ class StageExecutor:
         phase, _project, _repo_root, _target = self._context(stage)
         worktree = self._worktree(stage)
         unit_dir = self._unit_dir(worktree, stage)
+        conn = self._db.read()
+        entry = _last_transition_payload(
+            conn, Level.STAGE.value, stage.id, StageState.SPEC.value
+        )
         await self._run_step_agent(
-            stage, "spec_agent", self._spec_prompt(stage, phase, worktree), cwd=worktree
+            stage,
+            "spec_agent",
+            self._spec_prompt(stage, phase, worktree, entry),
+            cwd=worktree,
         )
         if await self._apply_thresholds(stage, worktree):
             return False
@@ -2137,13 +2169,26 @@ class StageExecutor:
                     ),
                 )
 
+        assert last.id is not None  # a resolved DB row always carries its id
+        # CCR-9: the re-entered role's prompt context is the entry payload's
+        # 'reason' — and StateMachine.transition merges the explicit ``reason``
+        # argument over any payload key, so the operator's --reason rationale
+        # (escalation_resolved event) must BE the transition reason; the prior
+        # 'escalation resolved: <resolution>' string stays as the fallback.
+        reason = _resolution_reason(conn, Level.STAGE.value, stage.id, last.id) or (
+            f"escalation resolved: {last.resolution}"
+        )
         self._sm.transition(
             Level.STAGE,
             stage.id,
             target.value,
             actor="phase_architect",
-            reason=f"escalation resolved: {last.resolution}",
-            payload={"escalation_id": last.id, "resolution": last.resolution},
+            reason=reason,
+            payload={
+                "escalation_id": last.id,
+                "resolution": last.resolution,
+                "reason": reason,
+            },
             coupled=coupled,
         )
         if request_id is not None:
@@ -2595,14 +2640,30 @@ class StageExecutor:
                     return ps.acceptance
         return "(acceptance criteria: see the phase plan under _factory/phases/)"
 
-    def _spec_prompt(self, stage: Stage, phase: Phase, worktree: Path) -> str:
+    def _spec_prompt(
+        self, stage: Stage, phase: Phase, worktree: Path, entry_payload: dict
+    ) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        context = ""
+        reason = entry_payload.get("reason")
+        if reason:
+            context = f"\nRework context: {reason}."
+        extras = []
+        if (Path(worktree) / unit_rel / "validation-report.md").is_file():
+            extras.append(f"{unit_rel}/validation-report.md")
+        if (Path(worktree) / unit_rel / "escalation-payload.md").is_file():
+            extras.append(f"{unit_rel}/escalation-payload.md")
+        if (Path(worktree) / unit_rel / "build-notes.md").is_file():
+            extras.append(f"{unit_rel}/build-notes.md")
+        if extras:
+            context += "\nRead first: " + ", ".join(extras) + "."
         return (
             f"You are the Spec Agent for stage '{stage.id}' ({stage.name}), risk class "
             f"{stage.risk_class}, of phase '{phase.id}'.\n"
             f"Acceptance criteria: {self._acceptance_text(stage, phase, worktree)}\n"
             "Contracts in force are read-only under _factory/contracts/.\n"
             f"Write the spec to _factory/stages/{stage.id}/spec.md — depth scaled to the "
-            "risk class, test-first.\n" + self._layout_note(stage)
+            f"risk class, test-first.{context}\n" + self._layout_note(stage)
         )
 
     def _build_prompt(self, stage: Stage, worktree: Path, entry_payload: dict) -> str:
