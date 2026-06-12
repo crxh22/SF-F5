@@ -32,7 +32,7 @@ models:
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
   # CCR-11 (D-0037): the capacity governor's hold-exit canary — cheapest claude
   # print run; an ordinary registered agent run (process registry + ledger).
-  capacity_probe:        {cli: claude, model: haiku,   mode: print}
+  capacity_probe:        {cli: claude, model: haiku,   mode: print, tools: none}   # canary: zero-write (verifier finding 3)
   # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
   # enforcement); founder-facing trade-off reasoning warrants the strongest model
   # (D-0017, OPEN-D3 resolved).
