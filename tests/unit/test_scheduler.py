@@ -3068,3 +3068,14 @@ def test_build_prompt_forbids_self_commit(db, config_dict, tmp_path) -> None:
     assert stage is not None
     prompt = env.executor._build_prompt(stage, env.worktree, {})
     assert "Never run `git commit` yourself — the control plane commits your work." in prompt
+
+
+def test_build_prompt_forbids_factory_artifact_mutation(db, config_dict, tmp_path) -> None:
+    """D-0030: the Builder prompt carries the spec-boundary line — a rework
+    builder mutating the registered spec.md broke the Spec Agent's role
+    boundary and tripped the start-time integrity abort at the next start."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    prompt = env.executor._build_prompt(stage, env.worktree, {})
+    assert "Never modify spec.md or any other _factory/ artifact" in prompt

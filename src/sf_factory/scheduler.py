@@ -2623,10 +2623,13 @@ class StageExecutor:
         return (
             f"You are the Builder for stage '{stage.id}' ({stage.name}).\n"
             f"Implement EXACTLY the spec at {unit_rel}/spec.md; verify your own work "
-            "before finishing (run what you can). Do NOT modify _factory/contracts/ "
-            "(a needed change = _CONTRACT_CHANGE_REQUEST.md + stop). You may write "
-            f"{unit_rel}/build-notes.md. Never run `git commit` yourself — the "
-            f"control plane commits your work.{context}\n" + self._layout_note(stage)
+            "before finishing (run what you can). Never modify spec.md or any other "
+            "_factory/ artifact — the only _factory/ file you may write is "
+            f"{unit_rel}/build-notes.md (plus _DECLARED_FAILURE.md / "
+            "_CONTRACT_CHANGE_REQUEST.md when you must stop; a needed contract "
+            "change = _CONTRACT_CHANGE_REQUEST.md + stop). Never run `git commit` "
+            f"yourself — the control plane commits your work.{context}\n"
+            + self._layout_note(stage)
         )
 
     def _validate_prompt(self, stage: Stage, scratch: Path) -> str:
