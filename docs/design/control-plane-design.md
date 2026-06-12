@@ -1,6 +1,6 @@
 # Control-Plane Design — SF-F5
 
-**Status:** design, v1.5 — 2026-06-12, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3, CCR-5 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
+**Status:** design, v1.6 — 2026-06-12, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3, CCR-5, CCR-6 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
 **Harvest note (D-0002):** point mechanics consulted read-only in `~/projects/SF/factory-source/` — NDJSON line-tolerant parsing + terminate/kill grace pattern (`agents/transport.py`), idempotent worktree create + worktree-root/branch guards (`orchestrator/git_manager.py`), `VALID_TRANSITIONS: dict[State, set[State]]` table shape (`orchestrator/models.py`). All rewritten to this design; no architecture, stage sizing, or audit density inherited.
 **Stack (D-0007):** Python 3.12, uv project (package `sf_factory`, src layout), pydantic v2, pytest, ruff. All tunables read from `factory.config.yaml` by key — zero hardcoded values (Doctrine §14). Timestamps: ISO 8601 UTC strings (`conventions.md`).
 
@@ -674,6 +674,8 @@ All referenced by key in §2/§4/§5; none exist yet in `factory.config.yaml`. P
 ---
 
 ## Review log
+
+**CCR-6 (contract change request #6), 2026-06-12 — approved at the intake interview (D-0025), v1.5→v1.6.** Additive amendments closing two intake findings: `config.ModelRoute.effort: Literal['low','medium','high','xhigh','max'] | None` (per-role effort routing — Doctrine §14: the knob was living implicitly in CLI defaults; cross-check: effort ⇒ cli='claude'), ClaudeAdapter argv `--effort <v>` after `--verbose` when set (§5.1 literal updated); `config.FounderChannelCfg.usage_limit_signatures` + scheduler `_UsageLimitDetector` (capacity events page the founder mechanically — event `usage_limit_suspected` + RO ntfy at alert priority, per-streak dedup; wired at StageExecutor step-agent and PhaseExecutor planning; provenance: D-0021 billing-403 class + founder request 12-06-2026); `projects.erp.test_command` set to `bash scripts/test.sh` (OPEN-2 closed, D-ERP-0001). Built single-builder + non-executor verified (727 tests, ruff clean).
 
 **CCR-5 (contract change request #5), 2026-06-12 — approved with the phase-seeding design (D-0024), v1.4→v1.5.** Additive amendments for the Etapa-5 readiness slice: `artifacts.MacroPhase`/`MacroPlan`/`read_macro_plan` (macro-plan file contract, mirroring `read_phase_plan`), `db.list_dag_edges(conn, level)`, cli subcommand `seed-phases` (flock-guarded claim-free via `_InstanceLock.acquire(claim=False)`, single-tx seed of phases + phase DAG + one factory-level `macro_plan` ref + `phase_seeded` events), `config.ProjectCfg.project_md`, ClaudeAdapter `--permission-mode bypassPermissions` when tools enabled (§5.1 argv literal updated; paired with the mechanical out-of-bounds detector at merge gates + recover), scheduler `proving_phases` dispatch hold. Full contract + rationale: `docs/design/phase-seeding-design.md` §§2–6.
 

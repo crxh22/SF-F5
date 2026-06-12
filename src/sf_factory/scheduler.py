@@ -774,6 +774,115 @@ class _OutOfBoundsDetector:
                             )
 
 
+#: How much of the agent's stderr file tail the usage-limit detector scans —
+#: the CLIs print capacity errors last; a full read of a huge stderr is waste.
+_USAGE_LIMIT_STDERR_TAIL_BYTES = 2048
+
+
+class _UsageLimitDetector:
+    """CCR-6 usage-limit detector (mechanical, Doctrine §20): scan each agent
+    result's ``result_text`` plus the LAST ~2KB of its stderr file for the
+    configured ``founder_channel.usage_limit_signatures`` (lowercase substrings,
+    matched case-insensitively). Provenance: the D-0021 billing-403 incident
+    class — a capacity/usage-limit event starves every later spawn, and the
+    founder asked to be paged on the first suspicion (12-06-2026), not after a
+    stage wedges.
+
+    Run after every StageExecutor conveyor spawn and after the PhaseExecutor
+    planning spawn. Alerts are deduplicated per consecutive-match streak (the
+    _OutOfBoundsDetector latch pattern): one 'usage_limit_suspected' event +
+    one ntfy page per streak; a clean check clears the latch. ntfy delivery
+    failure = 'alert_delivery_failed' event, never an exception into the step.
+    """
+
+    def __init__(self, db: Database, cfg: FactoryConfig, notify: NtfyPublisher) -> None:
+        self._db = db
+        self._cfg = cfg
+        self._notify = notify
+        #: One 'usage_limit_suspected' event per consecutive-match streak.
+        self._event_logged = False
+        #: One successful ntfy publish per streak (retried until delivered).
+        self._published = False
+        #: One alert_delivery_failed event per delivery-failure streak.
+        self._delivery_failed_logged = False
+
+    def _stderr_tail(self, stderr_path: str) -> str:
+        """Last ~2KB of the agent's stderr file; missing/unreadable = '' — a
+        tail read must never fail a step (the file may not exist for fakes)."""
+        try:
+            with open(stderr_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(size - _USAGE_LIMIT_STDERR_TAIL_BYTES, 0))
+                return fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _match(self, result: AgentResult) -> str | None:
+        """First configured signature found in result_text + the stderr tail
+        (config validates signatures lowercase; lowercasing the haystack makes
+        the match case-insensitive)."""
+        haystack = (
+            result.result_text + "\n" + self._stderr_tail(result.stderr_path)
+        ).lower()
+        for signature in self._cfg.founder_channel.usage_limit_signatures:
+            if signature in haystack:
+                return signature
+        return None
+
+    async def check(
+        self, result: AgentResult, *, unit_level: str, unit_id: str, role: str
+    ) -> None:
+        """Scan one agent result; page on a match (streak-deduplicated)."""
+        signature = self._match(result)
+        if signature is None:
+            # Clean observation ends the streak: a future match re-pages.
+            self._event_logged = False
+            self._published = False
+            self._delivery_failed_logged = False
+            return
+        if not self._event_logged:
+            self._event_logged = True
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=unit_level,
+                    unit_id=unit_id,
+                    event_type="usage_limit_suspected",
+                    actor=_ACTOR,
+                    payload={
+                        "role": role,
+                        "signature": signature,
+                        "process_id": result.process_id,
+                    },
+                )
+        if not self._published:
+            try:
+                await self._notify.publish(
+                    "Limită de utilizare suspectată — fabrica poate avea nevoie de pauză",
+                    link=dashboard_link(self._cfg, "health"),
+                    priority=self._notify.priority_alert,
+                )
+                self._published = True
+                self._delivery_failed_logged = False
+            except NotifyError as exc:
+                if not self._delivery_failed_logged:
+                    self._delivery_failed_logged = True
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="alert_delivery_failed",
+                            actor=_ACTOR,
+                            payload={
+                                "kind": "usage_limit_suspected",
+                                "role": role,
+                                "error": str(exc),
+                            },
+                        )
+
+
 # ------------------------------------------------------------- frozen interfaces
 
 
@@ -842,6 +951,8 @@ class StageExecutor:
         self._notify = notify
         #: Phase-seeding design §5: out-of-bounds check at every MERGE_GATE entry.
         self._oob = _OutOfBoundsDetector(db, cfg, notify)
+        #: CCR-6: usage-limit scan after every conveyor agent run.
+        self._usage_limit = _UsageLimitDetector(db, cfg, notify)
 
     # ---------------------------------------------------------------- protocol
 
@@ -911,6 +1022,12 @@ class StageExecutor:
             unit_id=stage.id,
             cwd=cwd,
             resume_session=resume_session,
+        )
+        # CCR-6: capacity-event scan before anything consumes the result — a
+        # usage-limited CLI exits "successfully" with a refusal text, and the
+        # founder asked to be paged on the first suspicion (D-0021 class).
+        await self._usage_limit.check(
+            result, unit_level=Level.STAGE.value, unit_id=stage.id, role=role
         )
         sentinels = detect_sentinels(self._unit_dir(cwd, stage))
         if sentinels:
@@ -2609,6 +2726,8 @@ class PhaseExecutor:
         self._runner = runner
         self._wt = wt
         self._notify = notify
+        #: CCR-6: usage-limit scan after the planning spawn.
+        self._usage_limit = _UsageLimitDetector(db, cfg, notify)
 
     # ---------------------------------------------------------------- protocol
 
@@ -2778,12 +2897,17 @@ class PhaseExecutor:
         the plan is validated BEFORE freezing (a defective plan escalates from
         PLANNING — CONTRACTS_FROZEN has no ESCALATED edge in §3.2)."""
         worktree = self._worktree(phase)
-        await self._runner.run_agent(
+        result = await self._runner.run_agent(
             "phase_architect",
             self._planning_prompt(phase),
             unit_level=Level.PHASE.value,
             unit_id=phase.id,
             cwd=worktree,
+        )
+        # CCR-6: capacity-event scan right after the spawn (same contract as
+        # the stage conveyor's _run_step_agent).
+        await self._usage_limit.check(
+            result, unit_level=Level.PHASE.value, unit_id=phase.id, role="phase_architect"
         )
         if await self._detect_phase_sentinels(phase, worktree):
             return False

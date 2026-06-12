@@ -86,8 +86,41 @@ class TestGoldenRealConfig:
         assert watchdog.staleness_threshold_s >= 10 * cfg.process.loop_tick_s
 
     def test_known_open_parameter_test_command_is_nullable(self, cfg: FactoryConfig):
-        # OPEN-2: erp test_command is null until founder sets it; must not fail validation.
-        assert cfg.projects["erp"].test_command is None
+        # OPEN-2 closed (intake interview 12-06-2026, D-ERP-0001): the canonical
+        # suite command is set. Amendment pre-authorized at ratification (R1-8,
+        # phase-seeding design §3); the SCHEMA stays nullable for new projects.
+        assert cfg.projects["erp"].test_command == "bash scripts/test.sh"
+
+    def test_effort_routing_ratified(self, cfg: FactoryConfig):
+        # CCR-6 (12-06-2026): per-role claude reasoning effort. Omissions are
+        # deliberate: main_architect (interactive — the launcher owns --effort),
+        # cp1_triage (haiku), integration_validator + auditor_cross_model (codex).
+        for role in (
+            "phase_architect",
+            "spec_agent",
+            "builder_heavy",
+            "validator_structural",
+            "auditor_same_model",
+        ):
+            assert cfg.models[role].effort == "xhigh", role
+        for role in ("builder_routine", "validator", "decision_session"):
+            assert cfg.models[role].effort == "high", role
+        for role in (
+            "main_architect",
+            "cp1_triage",
+            "integration_validator",
+            "auditor_cross_model",
+        ):
+            assert cfg.models[role].effort is None, role
+
+    def test_usage_limit_signatures_shape(self, cfg: FactoryConfig):
+        # CCR-6: non-empty lowercase substrings (the detector lowercases the
+        # scanned text, never the signatures); entries are founder-tunable but
+        # the D-0021 incident-class anchor must stay covered.
+        signatures = cfg.founder_channel.usage_limit_signatures
+        assert signatures
+        assert all(s and s == s.lower() for s in signatures)
+        assert "usage limit" in signatures
 
 
 # --------------------------------------------------------- minimal fixture config
@@ -189,6 +222,21 @@ class TestSchemaRejection:
         config_dict["escalation"]["churn_region_lines"] = 0
         _expect_config_error(tmp_path, config_dict)
 
+    def test_bad_effort_literal(self, tmp_path, config_dict):
+        # CCR-6: effort is a closed Literal set — an unknown level is rejected.
+        config_dict["models"]["builder_routine"]["effort"] = "ultra"
+        _expect_config_error(tmp_path, config_dict, match="effort")
+
+    def test_empty_usage_limit_signatures_rejected(self, tmp_path, config_dict):
+        config_dict["founder_channel"]["usage_limit_signatures"] = []
+        _expect_config_error(tmp_path, config_dict, match="usage_limit_signatures")
+
+    def test_non_lowercase_usage_limit_signature_rejected(self, tmp_path, config_dict):
+        # The detector lowercases the scanned text, never the signatures — an
+        # uppercase signature would silently never match (fail-explicit at load).
+        config_dict["founder_channel"]["usage_limit_signatures"] = ["Rate Limit"]
+        _expect_config_error(tmp_path, config_dict, match="lowercase")
+
 
 # ----------------------------------------------------------- §4 cross-checks
 
@@ -240,6 +288,22 @@ class TestCrossChecks:
         config_dict["founder_channel"]["watchdog"]["staleness_threshold_s"] = 9
         config_dict["process"]["loop_tick_s"] = 1
         _expect_config_error(tmp_path, config_dict, match="staleness")
+
+    def test_effort_on_codex_route_rejected(self, tmp_path, config_dict):
+        # CCR-6: codex has no effort knob — a route declaring one would
+        # silently no-op; the error names the offending role.
+        config_dict["models"]["auditor_cross_model"] = {
+            "cli": "codex",
+            "model": "default",
+            "mode": "print",
+            "effort": "high",
+        }
+        _expect_config_error(tmp_path, config_dict, match="auditor_cross_model")
+
+    def test_effort_on_stub_route_rejected(self, tmp_path, config_dict):
+        # Same cross-check for the stub CLI (the conftest test routes).
+        config_dict["models"]["builder_routine"]["effort"] = "high"
+        _expect_config_error(tmp_path, config_dict, match="builder_routine")
 
     def test_cp_model_standalone_fallback_check(self):
         with pytest.raises(Exception, match="fallback"):

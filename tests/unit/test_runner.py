@@ -855,3 +855,60 @@ def test_stub_adapter_argv_carries_no_bypass_flag(tmp_path: Path) -> None:
     route = ModelRoute(cli="stub", model="stub-model", mode="print")
     cmd = StubAdapter(tmp_path / "stub.py").build_cmd(route, "x")
     assert "--permission-mode" not in cmd
+
+
+# --------------------------- claude reasoning effort (CCR-6, §5.1 argv literal)
+
+
+def test_claude_effort_flag_in_documented_position() -> None:
+    """CCR-6: `--effort <e>` sits immediately after --verbose, before the
+    tools/permission handling — the amended §5.1 argv-order literal."""
+    route = ModelRoute(cli="claude", model="fable", mode="print", effort="xhigh")
+    cmd = ClaudeAdapter().build_cmd(
+        route, "do it", system_append="CANON", resume_session="sid-1"
+    )
+    assert cmd == [
+        "claude",
+        "--model",
+        "fable",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--effort",
+        "xhigh",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "CANON",
+        "--resume",
+        "sid-1",
+        "-p",
+        "do it",
+    ]
+
+
+def test_claude_effort_none_leaves_argv_unchanged() -> None:
+    """effort=None (the default) adds no flag — every pre-CCR-6 route's argv
+    stays byte-identical."""
+    route = ModelRoute(cli="claude", model="sonnet", mode="print")
+    assert route.effort is None
+    cmd = ClaudeAdapter().build_cmd(route, "hi")
+    assert "--effort" not in cmd
+    assert cmd == [
+        "claude", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
+        "--permission-mode", "bypassPermissions",
+        "-p", "hi",
+    ]
+
+
+def test_claude_tools_off_with_effort_decision_session_shape() -> None:
+    """The ratified decision_session route shape: tools-off AND effort=high —
+    `--effort` precedes `--tools ""`; no permission bypass on a tools-off spawn."""
+    route = ModelRoute(cli="claude", model="fable", mode="print", tools="none", effort="high")
+    cmd = ClaudeAdapter().build_cmd(route, "discuss")
+    assert cmd == [
+        "claude", "--model", "fable", "--output-format", "stream-json", "--verbose",
+        "--effort", "high",
+        "--tools", "",
+        "-p", "discuss",
+    ]

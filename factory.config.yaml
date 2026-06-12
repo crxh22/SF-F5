@@ -12,27 +12,28 @@ projects:
     workspace: /home/artur/projects/erp-workspace   # created at Etapa 5 kickoff
     integration_branch: main
     worktrees_dir: /home/artur/projects/erp-workspace/.worktrees
-    test_command: null                # OPEN-2: must be set before the first real ERP BUILD stage
+    test_command: "bash scripts/test.sh"   # OPEN-2 closed: ratified at the intake interview 12-06-2026 (D-ERP-0001)
     proving_phases: [foundation, inventory-procurement]
     project_md: docs/projects/erp/PROJECT.md   # Phase-Architect project context (factory-repo-relative; phase-seeding design §4)
 
 models:
   # role -> CLI + model alias (resolved by the respective CLI). Cross-model pairs per D-0003.
+  # effort (CCR-6) omitted on purpose where the knob does not apply: main_architect (interactive — the founder launcher owns --effort), cp1_triage (haiku does not support effort), integration_validator + auditor_cross_model (codex has no effort knob).
   main_architect:        {cli: claude, model: fable,   mode: interactive}
-  phase_architect:       {cli: claude, model: fable,   mode: print}
-  spec_agent:            {cli: claude, model: fable,   mode: print}
-  builder_routine:       {cli: claude, model: sonnet,  mode: print}
-  builder_heavy:         {cli: claude, model: fable,   mode: print}
-  validator:             {cli: claude, model: sonnet,  mode: print}
-  validator_structural:  {cli: claude, model: fable,   mode: print}
+  phase_architect:       {cli: claude, model: fable,   mode: print, effort: xhigh}
+  spec_agent:            {cli: claude, model: fable,   mode: print, effort: xhigh}
+  builder_routine:       {cli: claude, model: sonnet,  mode: print, effort: high}
+  builder_heavy:         {cli: claude, model: fable,   mode: print, effort: xhigh}
+  validator:             {cli: claude, model: sonnet,  mode: print, effort: high}
+  validator_structural:  {cli: claude, model: fable,   mode: print, effort: xhigh}
   integration_validator: {cli: codex,  model: default, mode: print}   # cross-model preferred (DoD §5.2)
-  auditor_same_model:    {cli: claude, model: fable,   mode: print}
+  auditor_same_model:    {cli: claude, model: fable,   mode: print, effort: xhigh}
   auditor_cross_model:   {cli: codex,  model: default, mode: print}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
   # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
   # enforcement); founder-facing trade-off reasoning warrants the strongest model
   # (D-0017, OPEN-D3 resolved).
-  decision_session:      {cli: claude, model: fable,   mode: print, tools: none}
+  decision_session:      {cli: claude, model: fable,   mode: print, tools: none, effort: high}
 
 budgets:
   per_stage:                          # tokens per stage by risk class (D-0005); keys mirror risk_classes
@@ -93,6 +94,10 @@ founder_channel:
     turn_timeout_s: 300
     budget_tokens: 200000
     poll_s: 3
+  # Lowercase substrings matched case-insensitively against agent result text + the
+  # stderr tail (scheduler usage-limit detector). Provenance: the D-0021 billing-403
+  # incident class; founder asked to be paged on capacity events (12-06-2026).
+  usage_limit_signatures: ["subscription access", "usage limit", "rate limit", "limit reached"]
 
 process:
   agent_timeout_s: 3600

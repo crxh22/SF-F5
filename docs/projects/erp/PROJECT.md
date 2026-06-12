@@ -1,6 +1,6 @@
 # PROJECT — ERP Elita-9 (autoservice management accounting)
 
-**Status: DRAFT v0.1 — 2026-06-12, prepared for the intake interview; binding only after founder ratification (entry in `decision-log.md` here).**
+**Status: v1.0 — RATIFIED by the founder at the intake interview, 12-06-2026 (D-ERP-0001 in `decision-log.md` here).**
 **Owner:** Main Architect. **Governed by:** `00 - DOCTRINA.md`; pipeline per `_FRAMEWORK_MVP_DoD.md`.
 
 ## 1. Mission and source of truth

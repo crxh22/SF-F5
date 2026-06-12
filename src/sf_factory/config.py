@@ -29,12 +29,16 @@ class _StrictModel(BaseModel):
 class ModelRoute(_StrictModel):
     """cli: Literal['claude','codex','stub']; model: str; mode: Literal['print','interactive'];
     tools: Literal['all','none'] = 'all' (CCR-3/D-0017: tools-off Decision Sessions —
-    structural no-write enforcement; honored by the runner adapters)."""
+    structural no-write enforcement; honored by the runner adapters);
+    effort: Literal['low','medium','high','xhigh','max'] | None = None (CCR-6:
+    per-role claude `--effort` reasoning knob, §5.1 argv literal — cross-checked
+    claude-only in FactoryConfig; codex/stub have no effort knob)."""
 
     cli: Literal["claude", "codex", "stub"]
     model: str
     mode: Literal["print", "interactive"]
     tools: Literal["all", "none"] = "all"
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class ConsultationPointCfg(_StrictModel):
@@ -165,6 +169,32 @@ class FounderChannelCfg(_StrictModel):
     dashboard: DashboardCfg
     watchdog: WatchdogCfg
     decision_session: DecisionSessionCfg
+    #: CCR-6: lowercase substrings the scheduler's usage-limit detector matches
+    #: case-insensitively against agent result text + the stderr tail
+    #: (provenance: the D-0021 billing-403 incident class — founder asked to be
+    #: paged on capacity events, 12-06-2026). Default = the ratified list
+    #: (DashboardCfg precedent: defaults are the ratified values).
+    usage_limit_signatures: list[str] = [
+        "subscription access",
+        "usage limit",
+        "rate limit",
+        "limit reached",
+    ]
+
+    @model_validator(mode="after")
+    def _check_signatures(self) -> FounderChannelCfg:
+        if not self.usage_limit_signatures:
+            raise ValueError(
+                "founder_channel.usage_limit_signatures must be a non-empty list"
+            )
+        for signature in self.usage_limit_signatures:
+            if not signature or signature != signature.lower():
+                raise ValueError(
+                    "founder_channel.usage_limit_signatures entries must be non-empty"
+                    f" lowercase substrings, got {signature!r} (the detector lowercases"
+                    " the scanned text, never the signatures)"
+                )
+        return self
 
 
 class ProcessCfg(_StrictModel):
@@ -257,6 +287,15 @@ class FactoryConfig(_StrictModel):
                     raise ValueError(
                         f"risk_classes.{rc_name}.audits: {auditor!r} is not a models.* key"
                     )
+        # CCR-6: models.<role>.effort is the claude `--effort` flag (§5.1 argv
+        # literal) — codex/stub have no effort knob, so a route declaring one
+        # would silently no-op (Doctrine §7: fail-explicit at load).
+        for role_name, route in self.models.items():
+            if route.effort is not None and route.cli != "claude":
+                raise ValueError(
+                    f"models.{role_name}: effort={route.effort!r} requires cli='claude',"
+                    f" got cli={route.cli!r} — codex/stub have no effort knob"
+                )
         # Consultation registry: unique ids; each role resolvable to a model route
         # (the runner spawns CP calls via config.models[role], design §4/§5.1).
         seen_ids: set[str] = set()

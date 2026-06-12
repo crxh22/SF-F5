@@ -157,9 +157,13 @@ class ClaudeAdapter:
         resume_session: str | None = None,
     ) -> list[str]:
         # §5.1 literal argv order: claude --model <m> --output-format stream-json
-        # --verbose [--tools "" | --permission-mode bypassPermissions]
+        # --verbose [--effort <e>] [--tools "" | --permission-mode bypassPermissions]
         # --append-system-prompt <canon> [--resume <id>] -p <prompt>.
         cmd = ["claude", "--model", route.model, "--output-format", "stream-json", "--verbose"]
+        if route.effort is not None:
+            # CCR-6: per-role reasoning-effort knob (config models.<role>.effort;
+            # claude-only — the config cross-check rejects it on codex/stub routes).
+            cmd += ["--effort", route.effort]
         if route.tools == "none":
             # CCR-3/D-0017 tools-off spawn (Decision Sessions): structural
             # no-write enforcement. Exact flagset verified against the installed

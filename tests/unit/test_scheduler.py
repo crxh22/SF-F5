@@ -2729,3 +2729,243 @@ def test_out_of_bounds_worktrees_dir_is_sanctioned(db, config_dict) -> None:
     scheduler.recover()
     assert _oob_alerts(db) == []
     assert notify.published == []
+
+
+# ----------------------------------------------- CCR-6 usage-limit detector
+
+
+def _usage_result(
+    result_text: str, *, stderr_path: str = "(absent)", process_id: int = 7
+) -> AgentResult:
+    """AgentResult shell for detector tests — only the scanned fields vary."""
+    return AgentResult(
+        process_id=process_id,
+        exit_code=0,
+        timed_out=False,
+        killed=False,
+        declared_failure=False,
+        result_text=result_text,
+        session_id=None,
+        tokens_in=1,
+        tokens_out=1,
+        cost_usd=None,
+        garbage_lines=0,
+        ndjson_log_path="(fake)",
+        stderr_path=stderr_path,
+        duration_ms=1,
+    )
+
+
+def _usage_detector(db, config_dict, notify=None):
+    """Detector on the conftest config (usage_limit_signatures = the ratified
+    default list — the frozen conftest predates the key)."""
+    notify = notify or FakeNotify()
+    return sched_mod._UsageLimitDetector(db, make_config(config_dict), notify), notify
+
+
+async def test_usage_limit_signature_in_result_text_pages_once(db, config_dict) -> None:
+    """CCR-6: a configured signature in result_text → ONE unit-scoped
+    'usage_limit_suspected' event (role, signature, process_id) + ONE ntfy page
+    at alert priority with a Romanian title + dashboard deep link."""
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("error: usage limit reached, retry after the window resets"),
+        unit_level="stage",
+        unit_id="stg-1",
+        role="builder_routine",
+    )
+    (event,) = events_of(db, "stg-1", "usage_limit_suspected")
+    assert event["unit_level"] == "stage" and event["actor"] == "control_plane"
+    payload = json.loads(event["payload_json"])
+    assert payload == {"role": "builder_routine", "signature": "usage limit", "process_id": 7}
+    ((title, link, priority),) = notify.published
+    assert title.startswith("Limită de utilizare suspectată")
+    assert link is not None and link.startswith("http")
+    assert priority == "max"
+
+
+async def test_usage_limit_second_consecutive_match_no_second_page(db, config_dict) -> None:
+    """Streak dedup: a second consecutive match inserts no second event and
+    sends no second page."""
+    detector, notify = _usage_detector(db, config_dict)
+    hit = _usage_result("HTTP 429: rate limit exceeded")
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    assert len(events_of(db, "stg-1", "usage_limit_suspected")) == 1
+    assert len(notify.published) == 1
+
+
+async def test_usage_limit_clean_check_clears_latch_then_repages(db, config_dict) -> None:
+    """A clean check ends the streak: the next match is a NEW streak — event +
+    page land again (never a one-shot alarm, never a page-per-spawn)."""
+    detector, notify = _usage_detector(db, config_dict)
+    hit = _usage_result("HTTP 429: rate limit exceeded")
+    clean = _usage_result("all tests green; stage complete")
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    await detector.check(clean, unit_level="stage", unit_id="stg-1", role="validator")
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    assert len(events_of(db, "stg-1", "usage_limit_suspected")) == 2
+    assert len(notify.published) == 2
+
+
+async def test_usage_limit_detected_in_stderr_tail_only(db, config_dict, tmp_path) -> None:
+    """Signature absent from result_text but present in the LAST ~2KB of the
+    stderr file → detected (the CLIs print capacity errors to stderr last)."""
+    stderr = tmp_path / "proc.stderr"
+    stderr.write_text(("x" * 4096) + "\nHTTP 403: usage limit hit\n", encoding="utf-8")
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("", stderr_path=str(stderr)),
+        unit_level="stage",
+        unit_id="stg-1",
+        role="builder_heavy",
+    )
+    (event,) = events_of(db, "stg-1", "usage_limit_suspected")
+    assert json.loads(event["payload_json"])["signature"] == "usage limit"
+    assert len(notify.published) == 1
+
+
+async def test_usage_limit_stderr_scan_is_tail_bounded(db, config_dict, tmp_path) -> None:
+    """Only the stderr TAIL is scanned: a signature buried >2KB before EOF is
+    out of scope (bounded read, never a full-file scan)."""
+    stderr = tmp_path / "proc.stderr"
+    stderr.write_text("usage limit\n" + ("x" * 4096) + "\n", encoding="utf-8")
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("", stderr_path=str(stderr)),
+        unit_level="stage",
+        unit_id="stg-1",
+        role="builder_heavy",
+    )
+    assert events_of(db, "stg-1", "usage_limit_suspected") == []
+    assert notify.published == []
+
+
+async def test_usage_limit_match_is_case_insensitive(db, config_dict) -> None:
+    """Signatures are lowercase by config contract; the scanned text is
+    lowercased, so any casing in the agent output matches."""
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("ERROR: Subscription Access required to continue"),
+        unit_level="phase",
+        unit_id="ph-1",
+        role="phase_architect",
+    )
+    (event,) = events_of(db, "ph-1", "usage_limit_suspected")
+    assert json.loads(event["payload_json"])["signature"] == "subscription access"
+    assert len(notify.published) == 1
+
+
+async def test_usage_limit_missing_stderr_file_tolerated(db, config_dict, tmp_path) -> None:
+    """A missing/unreadable stderr file never fails the check — the scan simply
+    covers result_text alone."""
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("clean run", stderr_path=str(tmp_path / "absent.stderr")),
+        unit_level="stage",
+        unit_id="stg-1",
+        role="validator",
+    )
+    assert events_of(db, "stg-1", "usage_limit_suspected") == []
+    assert notify.published == []
+
+
+async def test_usage_limit_no_match_inserts_nothing(db, config_dict) -> None:
+    detector, notify = _usage_detector(db, config_dict)
+    await detector.check(
+        _usage_result("build finished; 42 tests passed"),
+        unit_level="stage",
+        unit_id="stg-1",
+        role="builder_routine",
+    )
+    assert events_of(db, "stg-1", "usage_limit_suspected") == []
+    assert notify.published == []
+
+
+async def test_usage_limit_delivery_failure_contained_and_retried(db, config_dict) -> None:
+    """NotifyError containment (the existing patterns): one
+    'alert_delivery_failed' event (kind=usage_limit_suspected), no exception
+    into the step; the publish retries on the next match of the SAME streak
+    while the event latch holds."""
+    detector, notify = _usage_detector(db, config_dict, notify=FakeNotify(fail=True))
+    hit = _usage_result("upstream says rate limit")
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    assert len(events_of(db, "stg-1", "usage_limit_suspected")) == 1
+    failures = [
+        dict(row)
+        for row in db.read()
+        .execute("SELECT * FROM events WHERE event_type = 'alert_delivery_failed'")
+        .fetchall()
+        if json.loads(row["payload_json"]).get("kind") == "usage_limit_suspected"
+    ]
+    assert len(failures) == 1
+    notify.fail = False
+    await detector.check(hit, unit_level="stage", unit_id="stg-1", role="validator")
+    assert len(notify.published) == 1  # publish retried until delivered
+    assert len(events_of(db, "stg-1", "usage_limit_suspected")) == 1  # event latch held
+
+
+class _SignatureRunner(FakeRunner):
+    """FakeRunner whose returned result carries a fixed result_text — the
+    wiring tests drive the REAL executor-owned detector with it."""
+
+    def __init__(self, db, result_text: str) -> None:
+        super().__init__(db)
+        self._result_text = result_text
+
+    async def run_agent(self, role: str, prompt: str, **kwargs: Any) -> AgentResult:
+        await super().run_agent(role, prompt, **kwargs)
+        return _usage_result(self._result_text)
+
+
+async def test_planning_run_with_signature_inserts_usage_limit_event(
+    db, config_dict
+) -> None:
+    """CCR-6 wiring (PhaseExecutor._step_planning): a planning agent result
+    carrying a signature lands a phase-scoped 'usage_limit_suspected' event +
+    page via the executor-owned detector — even though the (absent) plan then
+    fails strict validation and the phase escalates."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph-u", PhaseState.PLANNING)
+    notify = FakeNotify()
+    runner = _SignatureRunner(db, "claude: usage limit reached for this 5h window")
+    executor = make_phase_executor(db, cfg, runner=runner, notify=notify)
+    await executor.execute("ph-u")
+    (event,) = events_of(db, "ph-u", "usage_limit_suspected")
+    payload = json.loads(event["payload_json"])
+    assert payload["role"] == "phase_architect"
+    assert payload["signature"] == "usage limit"
+    assert any(t.startswith("Limită de utilizare suspectată") for t, _, _ in notify.published)
+
+
+async def test_stage_agent_run_with_signature_inserts_usage_limit_event(
+    db, config_dict, tmp_path
+) -> None:
+    """CCR-6 wiring (StageExecutor._run_step_agent): a conveyor agent result
+    carrying a signature lands a stage-scoped event right after the runner
+    returns (here: the VALIDATE step's validator spawn)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.RUNNING)
+    worktree = tmp_path / "stage-wt"
+    init_repo(worktree)
+    insert_stage(db, "ph.s1", "ph", StageState.VALIDATE, worktree=worktree)
+    runner = _SignatureRunner(db, "codex: subscription access expired")
+    runner.behaviors["validator"] = validator_writing(failing=0)
+    notify = FakeNotify()
+    executor = StageExecutor(
+        db,
+        StateMachine(db),
+        cfg,
+        runner,
+        FakeWorktrees(tmp_path / "scratch"),
+        ThresholdEvaluator(db, cfg),
+        FakeConsultor([]),
+        notify,
+    )
+    with pytest.raises(Exception):  # noqa: B017 — MERGE_GATE hits OPEN-2 (ConfigError)
+        await executor.execute("ph.s1")
+    (event,) = events_of(db, "ph.s1", "usage_limit_suspected")
+    payload = json.loads(event["payload_json"])
+    assert payload["role"] == "validator"
+    assert payload["signature"] == "subscription access"
+    assert any(t.startswith("Limită de utilizare suspectată") for t, _, _ in notify.published)
