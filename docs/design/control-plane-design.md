@@ -1,6 +1,6 @@
 # Control-Plane Design — SF-F5
 
-**Status:** design, v1.7 — 2026-06-12, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3, CCR-5, CCR-6, CCR-7 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
+**Status:** design, v1.8 — 2026-06-12, revised after adversarial review + contract amendments CCR-1, CCR-2, CCR-3, CCR-5, CCR-6, CCR-7, CCR-8 (see Review log). Binding spec: `_FRAMEWORK_MVP_DoD.md` (DoD v3); governed by `00 - DOCTRINA.md`; parameters: `factory.config.yaml`; constraints from decision log D-0002/D-0003/D-0007/D-0009.
 **Harvest note (D-0002):** point mechanics consulted read-only in `~/projects/SF/factory-source/` — NDJSON line-tolerant parsing + terminate/kill grace pattern (`agents/transport.py`), idempotent worktree create + worktree-root/branch guards (`orchestrator/git_manager.py`), `VALID_TRANSITIONS: dict[State, set[State]]` table shape (`orchestrator/models.py`). All rewritten to this design; no architecture, stage sizing, or audit density inherited.
 **Stack (D-0007):** Python 3.12, uv project (package `sf_factory`, src layout), pydantic v2, pytest, ruff. All tunables read from `factory.config.yaml` by key — zero hardcoded values (Doctrine §14). Timestamps: ISO 8601 UTC strings (`conventions.md`).
 
@@ -674,6 +674,8 @@ All referenced by key in §2/§4/§5; none exist yet in `factory.config.yaml`. P
 ---
 
 ## Review log
+
+**CCR-8 (contract change request #8), 2026-06-12 — approved post-incident (D-0028), v1.7→v1.8.** §5.1 argv-literal semantic amendment: agent prompts travel via **stdin**, never argv (claude argv ends bare `-p`; codex `exec`/`exec resume` end `-`; stub symmetric; `CliAdapter.build_cmd` signature unchanged) — a single argv element is kernel-capped at MAX_ARG_STRLEN ≈128KB, and the §3.1 Tier-2 input (bounded 300KB/unit) plus CP-1 (200KB) both exceed it: `[Errno 7] Argument list too long` killed the first real Tier-2 spawn (D-0028 incident 1). `run_agent` spawns stdin=PIPE with a concurrent bounded feeder (write+drain+close; BrokenPipe contained as the early-exit path; OPEN-3's "codex reads piped stdin" is now the deliberate channel). Also under this CCR: the §3.1 BUILD step accepts a no-changes/no-sentinel agent exit as `build_noop_accepted` → VALIDATE (validation is the arbiter; the committed-changes contract broke §5.5d idempotent re-entry — D-0028 incident 2); builder prompts forbid agent self-commits. CLI-verified invocations + a 204KB live-stdin probe recorded in the verification log.
 
 **CCR-7 (contract change request #7), 2026-06-12 — approved with dashboard-design v1.2 (D-0027), v1.6→v1.7.** Additive: `models.STAGE_ESCALATION_RESOLUTIONS` / `models.PHASE_ESCALATION_RESOLUTIONS` (the §_step_escalated routing vocabulary moved from scheduler privates to the models vocabulary home — GATE_ANSWERS precedent; invariant test: values ⊆ the ESCALATED row of the respective transition tables); cli subcommand `resolve-escalation <id> <resolution> [--reason]` (operator surface for the D-0026 gap; D-0015 second-process single-short-tx exception extended to it under identical bounds). Full contract: dashboard-design §10.6/§10.9.
 
