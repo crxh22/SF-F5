@@ -70,6 +70,10 @@ class CapacityGovernorCfg(_StrictModel):
 
     enabled: bool = False
     probe_interval_s: float = Field(default=300, gt=0)
+    #: On hold LIFT also page the architect ("reia lucrul") so it resumes
+    #: autonomously (D-0042, robustness UNIT 3). Default-on preserves the
+    #: durable resume signal; the founder (noise-sensitive) can suppress it.
+    notify_architect_on_resume: bool = True
 
 
 class ConsultationPointCfg(_StrictModel):

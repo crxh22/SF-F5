@@ -4360,10 +4360,16 @@ class _RefusalRunner(FakeRunner):
         return result
 
 
-def _enable_governor(config_dict, *, probe_interval_s: float = 0.01) -> None:
+def _enable_governor(
+    config_dict,
+    *,
+    probe_interval_s: float = 0.01,
+    notify_architect_on_resume: bool = True,
+) -> None:
     config_dict["capacity_governor"] = {
         "enabled": True,
         "probe_interval_s": probe_interval_s,
+        "notify_architect_on_resume": notify_architect_on_resume,
     }
     config_dict["models"]["capacity_probe"] = {
         "cli": "claude",
@@ -4373,11 +4379,19 @@ def _enable_governor(config_dict, *, probe_interval_s: float = 0.01) -> None:
 
 
 def make_governor_env(
-    db, config_dict, tmp_path: Path, *, risk: str = "routine", runner=None
+    db,
+    config_dict,
+    tmp_path: Path,
+    *,
+    risk: str = "routine",
+    runner=None,
+    notify_architect_on_resume: bool = True,
 ):
     """make_stage_env shape with the governor ENABLED and SHARED (the cli
     wiring contract): one CapacityGovernor instance across executor + tests."""
-    _enable_governor(config_dict)
+    _enable_governor(
+        config_dict, notify_architect_on_resume=notify_architect_on_resume
+    )
     cfg = make_config(config_dict)
     insert_phase(db, "ph", PhaseState.RUNNING)
     worktree = tmp_path / "stage-wt"
@@ -4611,6 +4625,107 @@ async def test_capacity_probe_success_lifts_hold_pages_and_auto_resolves_strictl
     with pytest.raises(ConfigError, match="OPEN-2"):
         await env.executor.execute("ph.s1")
     assert ("ESCALATED", "VALIDATE") in transitions_of(db, "ph.s1")
+
+
+_FOUNDER_RESUME = "Capacitate revenită — fabrica a reluat singură"
+_ARCHITECT_RESUME = "[arhitect] capacitate revenită — reia lucrul"
+
+
+class _ArchitectFailNotify(FakeNotify):
+    """FakeNotify that delivers every push EXCEPT the architect resume page —
+    isolates UNIT 3's containment (founder page lands, architect page fails)."""
+
+    async def publish(self, title: str, *, link: str | None = None, priority: str = "default"):
+        if title.startswith("[arhitect]"):
+            raise NotifyError("ntfy down for the architect push (fake)")
+        await super().publish(title, link=link, priority=priority)
+
+
+async def _drain_to_hold(db, env) -> None:
+    """Drive ph.s1's limit-killed validator through the incident-7 gate so the
+    governor enters the hold (the proven drain dance), leaving exactly one open
+    limit-marked agent_run_failed escalation to auto-resolve on lift."""
+    env.runner.outcomes["validator"] = [{"exit_code": 1}]
+    await env.executor.execute("ph.s1")
+    assert env.governor.held is True
+
+
+async def test_capacity_resume_pages_architect(db, config_dict, tmp_path) -> None:
+    """UNIT 3 (D-0042): on hold LIFT the governor now emits TWO pushes — the
+    unchanged founder "Capacitate revenită…" AND the distinct '[arhitect]'
+    resume page so the architect resumes alone. MUTATION: without UNIT 3 only
+    the founder push exists."""
+    runner = _RefusalRunner(db, "error: usage limit reached", {"validator"})
+    env = make_governor_env(db, config_dict, tmp_path, runner=runner)
+    await _drain_to_hold(db, env)
+
+    await asyncio.sleep(0.02)
+    await env.governor.tick()
+
+    assert env.governor.held is False
+    titles = [p[0] for p in env.notify.published]
+    assert _FOUNDER_RESUME in titles  # founder page UNCHANGED
+    (architect,) = [p for p in env.notify.published if p[0] == _ARCHITECT_RESUME]
+    assert architect[2] == "max"  # priority_alert
+    assert architect[1] is not None and architect[1].startswith("http")
+    # The lift fact is intact.
+    assert len(_factory_events(db, "capacity_hold_ended")) == 1
+
+
+async def test_capacity_resume_architect_page_suppressed_when_disabled(
+    db, config_dict, tmp_path
+) -> None:
+    """notify_architect_on_resume:false suppresses ONLY the architect page — the
+    founder resume page still fires and the hold STILL lifts with its
+    'capacity_hold_ended' event (the suppress toggle never touches the lift)."""
+    runner = _RefusalRunner(db, "error: usage limit reached", {"validator"})
+    env = make_governor_env(
+        db, config_dict, tmp_path, runner=runner, notify_architect_on_resume=False
+    )
+    await _drain_to_hold(db, env)
+
+    await asyncio.sleep(0.02)
+    await env.governor.tick()
+
+    assert env.governor.held is False
+    titles = [p[0] for p in env.notify.published]
+    assert _FOUNDER_RESUME in titles  # founder page still present
+    assert _ARCHITECT_RESUME not in titles  # architect page suppressed
+    assert len(_factory_events(db, "capacity_hold_ended")) == 1
+
+
+async def test_capacity_resume_architect_page_failure_is_contained(
+    db, config_dict, tmp_path
+) -> None:
+    """CONTAINMENT (Doctrine §7): a failed architect push logs ONE
+    'alert_delivery_failed' (kind capacity_hold_ended_architect), the founder
+    page still lands, the hold STILL lifts and 'capacity_hold_ended' is STILL
+    written, and NOTHING raises out of _lift_hold."""
+    runner = _RefusalRunner(db, "error: usage limit reached", {"validator"})
+    env = make_governor_env(db, config_dict, tmp_path, runner=runner)
+    # Swap in the architect-only-failing publisher AFTER the drain so the hold
+    # entry's clean pages aren't disturbed; the governor holds this instance.
+    failing = _ArchitectFailNotify()
+    await _drain_to_hold(db, env)
+    env.governor._notify = failing
+
+    await asyncio.sleep(0.02)
+    await env.governor.tick()  # must NOT raise
+
+    assert env.governor.held is False  # lift committed despite the failed page
+    assert len(_factory_events(db, "capacity_hold_ended")) == 1  # event written
+    # The founder page on THIS publisher landed; the architect page did not.
+    titles = [p[0] for p in failing.published]
+    assert _FOUNDER_RESUME in titles
+    assert _ARCHITECT_RESUME not in titles
+    # Exactly one contained delivery-failure record, with the architect kind.
+    failures = [
+        json.loads(e["payload_json"])
+        for e in _factory_events(db, "alert_delivery_failed")
+    ]
+    arch_failures = [f for f in failures if f["kind"] == "capacity_hold_ended_architect"]
+    assert len(arch_failures) == 1
+    assert "error" in arch_failures[0]
 
 
 async def test_capacity_resolution_map_audit_maps_to_rework_validate(

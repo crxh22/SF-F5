@@ -88,6 +88,9 @@ capacity_governor:
   # enabled: false = behavior identical to pre-CCR-11 (pinned by test).
   enabled: true
   probe_interval_s: 300
+  # On hold lift, also page the architect ("reia lucrul") so it resumes alone
+  # (D-0042, robustness UNIT 3). Default-on; set false to suppress the second buzz.
+  notify_architect_on_resume: true
 
 pricing:
   # USD per 1M tokens, keyed by LEDGER model strings (design §11.1, CCR-10). Founder-tunable;

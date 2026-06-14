@@ -972,8 +972,10 @@ class CapacityGovernor:
         self._held = False
         #: Loop-clock deadline of the next probe while held.
         self._next_probe_at = 0.0
-        #: One alert_delivery_failed event per delivery-failure streak.
+        #: One alert_delivery_failed event per founder-page delivery-failure streak.
         self._delivery_failed_logged = False
+        #: Same dedup, separate streak, for the UNIT 3 architect resume page.
+        self._architect_resume_failed_logged = False
 
     @property
     def enabled(self) -> bool:
@@ -1151,6 +1153,38 @@ class CapacityGovernor:
                             "error": str(exc),
                         },
                     )
+        # Robustness UNIT 3 (D-0042): EXIT-ONLY architect resume page so the
+        # architect resumes alone (the founder no longer has to relay the reset).
+        # Same '[arhitect]' prefix + one-shared-topic transport as the Scheduler's
+        # _notify_architect, inlined here because the governor holds no Scheduler
+        # reference; gated on notify_architect_on_resume (founder suppress toggle,
+        # default-on). Its OWN never-raise guard + separate streak latch: a failed
+        # architect page can NEVER block the lift (already committed above) or lose
+        # the capacity_hold_ended event (already written in the tx above).
+        if self._cfg.capacity_governor.notify_architect_on_resume:
+            try:
+                await self._notify.publish(
+                    "[arhitect] capacitate revenită — reia lucrul",
+                    link=dashboard_link(self._cfg, "acum"),
+                    priority=self._notify.priority_alert,
+                )
+                self._architect_resume_failed_logged = False
+            except NotifyError as exc:
+                if not self._architect_resume_failed_logged:
+                    self._architect_resume_failed_logged = True
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="alert_delivery_failed",
+                            actor=_ACTOR,
+                            payload={
+                                "kind": "capacity_hold_ended_architect",
+                                "resolved": resolved,
+                                "error": str(exc),
+                            },
+                        )
 
     def _auto_resolve(self, conn: sqlite3.Connection) -> list[int]:
         """STRICT auto-resolve scope (D-0037, pinned by test): open escalations
