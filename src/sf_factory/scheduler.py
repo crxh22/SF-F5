@@ -5464,7 +5464,7 @@ class Scheduler:
                 continue
             streak_key = ("escalation_opened_notice", esc.id)
             delivered = await self._notify_architect(
-                f"escaladare nouă către {esc.target}: {esc.unit_level} {esc.unit_id}",
+                f"escaladare nesemnalată către {esc.target}: {esc.unit_level} {esc.unit_id}",
                 link=dashboard_link(self._cfg, "acum"),
                 streak_key=streak_key,
                 context={"kind": "escalation_opened_notice", "escalation_id": esc.id},

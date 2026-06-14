@@ -332,18 +332,6 @@ ESCALATION_TARGET_LADDER: tuple[str, ...] = (
 )
 
 
-def next_escalation_target(current: str) -> str:
-    """The next rung UP the ESCALATION_TARGET_LADDER, clamped at ``founder``
-    (no infinite climb — the top rung bumps to itself). An unknown ``current``
-    (not on the ladder) is treated as already at the top and returned unchanged
-    (never guessed forward — Doctrine §7); the detector still pages it."""
-    try:
-        idx = ESCALATION_TARGET_LADDER.index(current)
-    except ValueError:
-        return current
-    return ESCALATION_TARGET_LADDER[min(idx + 1, len(ESCALATION_TARGET_LADDER) - 1)]
-
-
 # ------------------------------------------------------------------------ helpers
 
 

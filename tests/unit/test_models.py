@@ -457,26 +457,6 @@ class TestEscalationTargetLadder:
         for rung in ESCALATION_TARGET_LADDER:
             assert rung in GLOSS, rung
 
-    def test_next_target_climbs_one_rung(self):
-        from sf_factory.models import next_escalation_target
-
-        assert next_escalation_target("phase_architect") == "main_architect"
-        assert next_escalation_target("main_architect") == "founder"
-
-    def test_next_target_clamps_at_founder(self):
-        """No infinite climb: the top rung bumps to itself (the detector still
-        re-pages founder, but never invents a rung above it)."""
-        from sf_factory.models import next_escalation_target
-
-        assert next_escalation_target("founder") == "founder"
-
-    def test_next_target_unknown_is_returned_unchanged(self):
-        """An off-ladder value is never guessed forward (Doctrine §7) — returned
-        as-is (treated as already at the top); the detector still pages it."""
-        from sf_factory.models import next_escalation_target
-
-        assert next_escalation_target("nonsense") == "nonsense"
-
     def test_ladder_is_a_tuple_immutable(self):
         from sf_factory.models import ESCALATION_TARGET_LADDER
 

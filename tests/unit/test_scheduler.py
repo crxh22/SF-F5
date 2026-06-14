@@ -1070,10 +1070,14 @@ async def test_stuck_open_escalation_climbs_to_founder_spaced(db, config_dict) -
     scheduler, notify = make_scheduler(
         db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
     )
+    state_before = stage_state(db, "s1")
     await run_blocked(scheduler)
 
     assert _escalation_row(db, esc_id)["target"] == "main_architect"  # one rung, not founder
     assert _escalation_row(db, esc_id)["status"] == "open"  # status untouched
+    # NO-TRANSITION MANDATE: the climb relabels the target but NEVER advances the
+    # unit (a stray transition injected into the (2a) branch must fail this).
+    assert stage_state(db, "s1") == state_before == StageState.ESCALATED
     bumped = events_of(db, "s1", "escalation_bumped")
     assert len(bumped) == 1  # exactly ONE bump this tick (no cascade to founder)
     payload = json.loads(bumped[0]["payload_json"])
@@ -1135,6 +1139,9 @@ async def test_stuck_resolved_not_advanced_pages(db, config_dict) -> None:
     assert len(stuck) == 1
     stuck_pushes = [p for p in _arhitect_pushes(notify) if "neavansată" in p[0]]
     assert len(stuck_pushes) == 1 and stuck_pushes[0][2] == "max"
+    # NO-TRANSITION MANDATE: the detector pages but NEVER advances the unit — it is
+    # still ESCALATED (a stray transition injected here must fail this).
+    assert stage_state(db, "s1") == StageState.ESCALATED
     # MUTATION GUARD: row identical (no re-resolve), and exactly ONE escalation row.
     assert _escalation_row(db, esc_id) == before
     n_rows = db.read().execute(
@@ -1184,18 +1191,21 @@ async def test_architect_learns_on_open(db, config_dict) -> None:
     scheduler, notify = make_scheduler(
         db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
     )
+    state_before = stage_state(db, "s1")
     await run_blocked(scheduler)
 
     notices = events_of(db, "s1", "escalation_opened_notice")
     assert len(notices) == 1
-    open_pushes = [p for p in _arhitect_pushes(notify) if "escaladare nouă" in p[0]]
+    open_pushes = [p for p in _arhitect_pushes(notify) if "escaladare nesemnalată" in p[0]]
     assert len(open_pushes) == 1 and open_pushes[0][2] == "max"
+    # NO-TRANSITION MANDATE: first-notice pages but NEVER advances the unit.
+    assert stage_state(db, "s1") == state_before == StageState.ESCALATED
     # No bump (under threshold), no stuck-resolved.
     assert events_of(db, "s1", "escalation_bumped") == []
 
     await run_blocked(scheduler)  # latch: one notice only
     assert len(events_of(db, "s1", "escalation_opened_notice")) == 1
-    assert len([p for p in _arhitect_pushes(notify) if "escaladare nouă" in p[0]]) == 1
+    assert len([p for p in _arhitect_pushes(notify) if "escaladare nesemnalată" in p[0]]) == 1
 
 
 async def test_open_notice_skips_founder_target(db, config_dict) -> None:
