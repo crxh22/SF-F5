@@ -50,7 +50,11 @@ budgets:
     # routine build run measured ~6M raw. Caps ≈ 5x healthy single-pass so the detector catches
     # runaways, not honest work. D-0005 starter values (300k/1M/2M) predate any real run.
     routine: 30000000
-    structural: 75000000
+    structural: 120000000   # D-0039: 75M→120M calibration bump. document-engine genuinely burned ~82M
+                            # (a real spec contradiction + 2 infra outages forced abnormal re-derivation;
+                            # validation PASSES) and re-tripped the old cap. Caps catch RUNAWAYS, not honest
+                            # rework on an over-large stage; the real fix is finer stage decomposition
+                            # (registered, Opus-era). Revisit downward once structural stages are split.
     critical: 150000000
   usage_missing_policy: estimate      # estimate = logged-stream-bytes/4 into ledger (estimated=1) | escalate_after
   usage_missing_max_per_stage: 3      # used by escalate_after policy
