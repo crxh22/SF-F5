@@ -64,6 +64,7 @@ from sf_factory.models import (
     GATE_ANSWERS,
     PHASE_ESCALATION_RESOLUTIONS,
     STAGE_ESCALATION_RESOLUTIONS,
+    STAGE_NOACTION_RESOLUTION,
     ArtifactContractError,
     ConfigError,
     DecisionRequest,
@@ -2621,6 +2622,27 @@ class StageExecutor:
         last = _latest_resolved_escalation(conn, Level.STAGE.value, stage.id)
         if last is None:
             return False  # escalated without a row = operator surgery; stay put
+        # No-action (`settled`) disposition (architect-operations.md §1): the
+        # finding is accurate but the behavior is accepted. SPECIAL-CASED here,
+        # BEFORE the static STAGE_ESCALATION_RESOLUTIONS lookup, because settling
+        # routes forward by RISK (MERGE_GATE non-critical / AWAITING_HUMAN
+        # critical) — a token->ONE-state map cannot express that, so `settled` is
+        # deliberately kept OUT of the map (mirrors the rework:MERGE_GATE special
+        # handling, D-0042). Mark the open escalation's contested findings
+        # `settled`, then delegate the forward transition to _leave_clean_audit
+        # (the same risk-routed close the audit step uses when findings clear).
+        if last.resolution == STAGE_NOACTION_RESOLUTION:
+            if stage.worktree_path:
+                await self._archive_sentinels(stage, Path(stage.worktree_path), last)
+            with self._db.transaction() as tx:
+                for finding in fdb.findings(tx, stage.id, ("contested",)):
+                    assert finding.id is not None
+                    fdb.set_finding_status(
+                        tx, finding.id, "settled", resolved_by="phase_architect"
+                    )
+            # Settle write committed above; route forward and return EARLY,
+            # skipping the target-based static-map block below.
+            return await self._leave_clean_audit(stage, self._worktree(stage))
         target = STAGE_ESCALATION_RESOLUTIONS.get(last.resolution or "")
         if target is None:
             with self._db.transaction() as tx:
@@ -3275,7 +3297,36 @@ class StageExecutor:
             "and the contracts under _factory/contracts/. Cite concrete locations.\n"
             f"Write {unit_rel}/audit-{role}.md (prose) and {unit_rel}/audit-{role}.json — "
             'EXACTLY {"findings": [{"ref": "<id>", "severity": "...", "summary": "...", '
-            '"location": "..."}]} (empty list = clean).\n' + self._layout_note(stage)
+            '"location": "..."}]} (empty list = clean).\n'
+            + self._prior_adjudications_note(stage)
+            + self._layout_note(stage)
+        )
+
+    def _prior_adjudications_note(self, stage: Stage) -> str:
+        """Do-not-re-raise memory for the clean-context auditor: findings already
+        permanently closed in a prior round (architect-operations.md §1). SAFETY
+        PIN — select ONLY `settled` and `overruled`. NEVER include `sustained`,
+        `complied`, or `duplicate`: those may be genuinely unfixed and MUST stay
+        re-raisable; suppressing them would silently mask real bugs. A dedicated
+        test fails if this set ever widens. Refs only — Finding has no summary
+        field (no schema change). Bounded to the 30 most recent by id."""
+        rows = self._db.read().execute(
+            "SELECT finding_ref, severity, auditor_role FROM audit_findings"
+            " WHERE stage_id = ? AND status IN ('settled', 'overruled')"
+            " ORDER BY id DESC LIMIT 30",
+            (stage.id,),
+        ).fetchall()
+        if not rows:
+            return ""
+        listing = "\n".join(
+            f"- {r['finding_ref']} (severity {r['severity'] or 'n/a'},"
+            f" by {r['auditor_role']})"
+            for r in rows
+        )
+        return (
+            "== PREVIOUSLY ADJUDICATED — do NOT re-raise unless the implementation"
+            " MATERIALLY CHANGED into a genuinely new defect ==\n"
+            f"{listing}\n"
         )
 
     def _respond_prompt(self, stage: Stage, findings: Sequence[Finding], worktree: Path) -> str:
@@ -3292,6 +3343,8 @@ class StageExecutor:
             '{"responses": [{"ref": "...", "action": "comply|contest|duplicate", '
             '"rationale": "..."}]}. comply = you will rework; contest = reasoned '
             "disagreement (logged, escalates); duplicate = covered by another finding.\n"
+            "If a finding restates an observation already permanently closed in a "
+            "prior round, answer `duplicate`.\n"
             + self._layout_note(stage)
         )
 

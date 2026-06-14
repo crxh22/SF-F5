@@ -1536,6 +1536,69 @@ def test_resolve_escalation_rejects_invalid_resolution_listing_vocabulary(
     assert "empty resolution" in capsys.readouterr().err
 
 
+def test_resolve_escalation_accepts_settled_for_stage_rejects_for_phase(
+    cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Slice-2 Unit A: `settled` (the no-action disposition) is a valid STAGE
+    resolution (special-cased in the scheduler, not a static map key) — accepted
+    and stored for the stage level, listed in the stage vocabulary error, and
+    REJECTED for a phase escalation (phase escalations have no contested
+    findings; architect-operations.md §1)."""
+    from sf_factory.models import STAGE_NOACTION_RESOLUTION
+
+    assert _cli(cli_env, "init") == 0
+    # Seed the units + the first STAGE escalation once; add the extra rows
+    # directly (the unit PKs are fixed, so re-seeding would collide).
+    stage_esc = _seed_escalation(cli_env, unit_level="stage")
+
+    def _add_escalation(*, unit_level: str, trigger: str) -> int:
+        db = _open_factory_db(cli_env)
+        try:
+            with db.transaction() as conn:
+                return insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=unit_level,
+                        unit_id="st-demo" if unit_level == "stage" else "ph-demo",
+                        trigger=trigger,
+                        target="phase_architect"
+                        if unit_level == "stage"
+                        else "main_architect",
+                        payload_artifact_id=None,
+                        event_seq=None,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+        finally:
+            db.close()
+
+    # Stage level accepts `settled` and stores the raw token (no CHECK on
+    # escalations.resolution — no escalation-table migration needed).
+    assert _cli(cli_env, "resolve-escalation", str(stage_esc), "settled") == 0
+    row, resolved_events = _escalation_state(cli_env, stage_esc)
+    assert row["status"] == "resolved"
+    assert row["resolution"] == STAGE_NOACTION_RESOLUTION == "settled"
+    assert resolved_events == 1
+
+    # The stage vocabulary error lists `settled` among the valid tokens.
+    other_stage = _add_escalation(unit_level="stage", trigger="unresolved_contest")
+    assert _cli(cli_env, "resolve-escalation", str(other_stage), "nope") == 1
+    assert "settled" in capsys.readouterr().err
+
+    # Phase level REJECTS `settled` (not in the phase vocabulary), zero writes.
+    phase_esc = _add_escalation(unit_level="phase", trigger="child_failed")
+    assert _cli(cli_env, "resolve-escalation", str(phase_esc), "settled") == 1
+    err = capsys.readouterr().err
+    assert "unknown resolution 'settled'" in err
+    assert "phase escalation" in err
+    row, _ = _escalation_state(cli_env, phase_esc)
+    assert row["status"] == "open"  # rejected -> still open
+
+
 def test_resolve_escalation_busy_database_fails_explicitly(
     cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
 ) -> None:

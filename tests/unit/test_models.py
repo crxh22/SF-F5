@@ -387,6 +387,21 @@ class TestEscalationResolutionVocabulary:
             STAGE_ESCALATION_RESOLUTIONS["rework:MERGE_GATE"] is StageState.MERGE_GATE
         )
 
+    def test_noaction_resolution_is_not_a_map_key(self):
+        """Slice-2 Unit A pin: `settled` (the no-action disposition) is a
+        first-class STAGE resolution token but deliberately NOT a key in
+        STAGE_ESCALATION_RESOLUTIONS — settling routes by risk (MERGE_GATE /
+        AWAITING_HUMAN), which the token->ONE-state map cannot encode, so the
+        scheduler special-cases it. Keeping it out preserves the one-token->
+        one-state invariant the other tests pin."""
+        from sf_factory.models import (
+            STAGE_ESCALATION_RESOLUTIONS,
+            STAGE_NOACTION_RESOLUTION,
+        )
+
+        assert STAGE_NOACTION_RESOLUTION == "settled"
+        assert STAGE_NOACTION_RESOLUTION not in STAGE_ESCALATION_RESOLUTIONS
+
     def test_phase_values_are_legal_escalated_exits(self):
         from sf_factory.models import PHASE_ESCALATION_RESOLUTIONS
 

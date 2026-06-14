@@ -12,6 +12,7 @@ Fixtures beyond the frozen conftest are defined locally (design §9).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
@@ -1785,6 +1786,193 @@ async def test_escalation_rework_merge_gate_routes_back_to_merge_gate(
     assert payload["resolution"] == "rework:MERGE_GATE"
     assert payload["rework_context"] == "Tier-2 overflow fixed; re-run the gate only"
     assert open_escalations(db, "ph.s1") == []
+
+
+def _seed_finding(
+    db,
+    *,
+    ref: str,
+    status: str,
+    severity: str = "major",
+    auditor_role: str = "auditor_cross_model",
+    stage_id: str = "ph.s1",
+) -> int:
+    """Insert one audit_finding (with its required report_artifact_id) and return
+    its id — the slice-2 settled/audit-memory fixtures build findings this way.
+    The report ref's (path, sha) is varied by `ref` so multiple seeds never
+    collide on the artifact_refs UNIQUE (repo, path, sha256)."""
+    from sf_factory.models import ArtifactRef, Finding
+
+    with db.transaction() as conn:
+        report = fdb.insert_artifact_ref(
+            conn,
+            ArtifactRef(
+                id=None,
+                unit_level="stage",
+                unit_id=stage_id,
+                kind="audit_report",
+                repo="workspace",
+                path=f"_factory/stages/{stage_id}/audit-{ref}.json",
+                sha256=hashlib.sha256(ref.encode()).hexdigest(),
+                git_commit=None,
+                created_at=utc_now(),
+            ),
+        )
+        return fdb.insert_finding(
+            conn,
+            Finding(
+                id=None,
+                stage_id=stage_id,
+                auditor_role=auditor_role,
+                finding_ref=ref,
+                severity=severity,
+                report_artifact_id=report,
+                status=status,
+                contest_artifact_id=None,
+                resolved_by=None,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            ),
+        )
+
+
+async def test_escalation_settled_routine_routes_merge_gate_and_settles_findings(
+    db, config_dict, tmp_path
+) -> None:
+    """Slice-2 Unit A: the no-action `settled` disposition on a ROUTINE stage
+    flips the open escalation's contested findings to `settled`
+    (resolved_by=phase_architect) and routes ESCALATED -> MERGE_GATE via
+    _leave_clean_audit (no human gate). `settled` is special-cased BEFORE the
+    static map, so it does NOT trip the unknown-resolution alert."""
+    env = make_stage_env(db, config_dict, tmp_path, risk="routine")
+    fid = _seed_finding(db, ref="F-1", status="contested")
+    fid_other = _seed_finding(db, ref="F-2", status="complied")  # untouched control
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="unresolved_contest",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, "settled")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+
+    progressed = await env.executor._step_escalated(stage)
+
+    assert progressed is True
+    assert stage_state(db, "ph.s1") is StageState.MERGE_GATE
+    rows = {f.id: f for f in fdb.findings(db.read(), "ph.s1")}
+    assert rows[fid].status == "settled"
+    assert rows[fid].resolved_by == "phase_architect"
+    assert rows[fid_other].status == "complied"  # non-contested untouched
+    # No unknown-resolution alert was emitted (settled is recognized).
+    assert events_of(db, "ph.s1", "alert") == []
+
+
+async def test_escalation_settled_critical_routes_awaiting_human(
+    db, config_dict, tmp_path
+) -> None:
+    """Slice-2 Unit A: `settled` on a CRITICAL stage settles the contested
+    findings and routes ESCALATED -> AWAITING_HUMAN with a pending
+    critical_stage decision request (the §9 human gate), via _leave_clean_audit
+    (risk-dependent forward state — the reason `settled` is NOT a static map key
+    can encode)."""
+    env = make_stage_env(db, config_dict, tmp_path, risk="critical")
+    _seed_finding(db, ref="F-1", status="contested")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="unresolved_contest",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, "settled")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+
+    progressed = await env.executor._step_escalated(stage)
+
+    # _leave_clean_audit returns False for the human-gate path (it parks the
+    # stage at AWAITING_HUMAN rather than progressing further).
+    assert progressed is False
+    assert stage_state(db, "ph.s1") is StageState.AWAITING_HUMAN
+    assert fdb.findings(db.read(), "ph.s1")[0].status == "settled"
+    assert fdb.findings(db.read(), "ph.s1")[0].resolved_by == "phase_architect"
+    pending = fdb.pending_decisions(db.read())
+    assert [d.gate_kind for d in pending] == ["critical_stage"]
+    assert events_of(db, "ph.s1", "alert") == []
+
+
+def test_audit_prompt_lists_settled_and_overruled_only_safety_pin(
+    db, config_dict, tmp_path
+) -> None:
+    """SAFETY PIN (the single most safety-critical assertion in slice-2 Unit A):
+    the _audit_prompt do-not-re-raise memory lists ONLY findings whose status is
+    `settled` or `overruled`. `sustained`, `complied`, and `duplicate` may be
+    genuinely unfixed and MUST stay re-raisable — they must NEVER appear. This
+    test FAILS if the suppress set ever widens."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    _seed_finding(db, ref="SET-1", status="settled", severity="minor",
+                  auditor_role="auditor_same_model")
+    _seed_finding(db, ref="OVR-1", status="overruled", severity="major")
+    # The MUST-NOT-appear set — each is potentially a still-live bug.
+    _seed_finding(db, ref="SUS-1", status="sustained")
+    _seed_finding(db, ref="CMP-1", status="complied")
+    _seed_finding(db, ref="DUP-1", status="duplicate")
+    _seed_finding(db, ref="OPN-1", status="open")
+
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    prompt = env.executor._audit_prompt(stage, "auditor_cross_model", env.worktree)
+
+    assert "PREVIOUSLY ADJUDICATED" in prompt
+    assert "SET-1" in prompt  # settled -> listed
+    assert "OVR-1" in prompt  # overruled -> listed
+    # The safety pin: none of these statuses may be suppressed.
+    for must_not in ("SUS-1", "CMP-1", "DUP-1", "OPN-1"):
+        assert must_not not in prompt, f"{must_not} must remain re-raisable"
+    # Refs carry severity + auditor_role (no summary field — no schema change).
+    assert "auditor_same_model" in prompt
+    assert "minor" in prompt
+
+
+def test_audit_prompt_no_block_when_no_prior_adjudications(
+    db, config_dict, tmp_path
+) -> None:
+    """No settled/overruled history -> the prompt carries no adjudication block
+    (it stays byte-for-byte the original audit instruction plus layout note)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    _seed_finding(db, ref="OPN-1", status="open")  # not adjudicated
+    _seed_finding(db, ref="SUS-1", status="sustained")  # not in the suppress set
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    prompt = env.executor._audit_prompt(stage, "auditor_cross_model", env.worktree)
+    assert "PREVIOUSLY ADJUDICATED" not in prompt
 
 
 async def test_escalation_rework_build_reason_reaches_builder_prompt(

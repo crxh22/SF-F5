@@ -145,11 +145,13 @@ def seeded_stage(db: Database):
 
 
 class TestMigrations:
-    def test_fresh_migrate_applies_0001(self, db_path: Path):
+    def test_fresh_migrate_applies_all_packaged(self, db_path: Path):
+        # The packaged dir now ships 0001 (init) + 0002 (settled disposition); a
+        # fresh migrate applies every pending version in order.
         database = Database(db_path, busy_timeout_ms=5000)
         database.open()
         try:
-            assert database.migrate(MIGRATIONS_DIR) == [1]
+            assert database.migrate(MIGRATIONS_DIR) == [1, 2]
         finally:
             database.close()
 
@@ -174,12 +176,14 @@ class TestMigrations:
         }
 
     def test_schema_migrations_row_recorded(self, db: Database):
-        row = db.read().execute(
+        rows = db.read().execute(
             "SELECT version, description, applied_at FROM schema_migrations"
-        ).fetchone()
-        assert row["version"] == 1
-        assert row["description"] == "init"
-        assert row["applied_at"]  # ISO timestamp written
+            " ORDER BY version"
+        ).fetchall()
+        assert [r["version"] for r in rows] == [1, 2]
+        assert rows[0]["description"] == "init"
+        assert rows[1]["description"] == "settled_finding_disposition"
+        assert all(r["applied_at"] for r in rows)  # ISO timestamp written
 
     def test_failed_migration_rolls_back_whole_file(self, db_path: Path, tmp_path: Path):
         bad_dir = tmp_path / "migs"
@@ -233,21 +237,23 @@ class TestMigrations:
             db.migrate(stale_dir)
 
     def test_followup_migration_applies_in_order(self, db: Database, tmp_path: Path):
+        # The `db` fixture already applied every packaged migration (1 + 2); an
+        # additional dir adds the next free version on top, in order.
         two_dir = tmp_path / "migs"
         two_dir.mkdir()
         for f in MIGRATIONS_DIR.glob("*.sql"):
             (two_dir / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
-        (two_dir / "0002_extra.sql").write_text(
+        (two_dir / "0003_extra.sql").write_text(
             "CREATE TABLE extra (id INTEGER PRIMARY KEY);", encoding="utf-8"
         )
-        assert db.migrate(two_dir) == [2]
+        assert db.migrate(two_dir) == [3]
         versions = [
             r[0]
             for r in db.read().execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        assert versions == [1, 2]
+        assert versions == [1, 2, 3]
 
     def test_migrate_read_only_rejected(self, db: Database, db_path: Path):
         ro = Database(db_path, busy_timeout_ms=5000)
@@ -257,6 +263,113 @@ class TestMigrations:
                 ro.migrate(MIGRATIONS_DIR)
         finally:
             ro.close()
+
+
+class TestSettledFindingMigration:
+    """0002_settled_finding_disposition.sql: widen audit_findings.status to admit
+    'settled' via the SQLite table-rebuild idiom (rows + index preserved, whole-
+    file rollback on failure)."""
+
+    def _insert_finding(self, conn, status: str) -> None:
+        report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))
+        insert_finding(conn, make_finding(report_artifact_id=report, status=status))
+
+    def test_settled_status_accepted_after_migration(self, seeded_stage: Database):
+        # `seeded_stage` -> `db` has applied the packaged 0001 + 0002.
+        with seeded_stage.transaction() as conn:
+            self._insert_finding(conn, "settled")
+        rows = findings(seeded_stage.read(), "st-1", statuses=("settled",))
+        assert len(rows) == 1 and rows[0].status == "settled"
+
+    def test_invalid_status_still_rejected_after_migration(self, seeded_stage: Database):
+        # The widened CHECK admits exactly 'settled' — no other new value.
+        with pytest.raises(sqlite3.IntegrityError):
+            with seeded_stage.transaction() as conn:
+                self._insert_finding(conn, "withdrawn")
+
+    def test_existing_rows_and_index_preserved(self, db_path: Path):
+        # Apply ONLY 0001, write a pre-existing finding, THEN apply 0002 and
+        # confirm the row survived the table rebuild and the index is back.
+        init_only = Path(db_path).parent / "init-only"
+        init_only.mkdir()
+        src = MIGRATIONS_DIR / "0001_init.sql"
+        (init_only / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        database = Database(db_path, busy_timeout_ms=5000)
+        database.open()
+        try:
+            assert database.migrate(init_only) == [1]
+            with database.transaction() as conn:
+                insert_phase(conn, make_phase())
+                insert_stage(conn, make_stage())
+                report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))
+                fid = insert_finding(
+                    conn, make_finding(report_artifact_id=report, status="overruled")
+                )
+            assert database.migrate(MIGRATIONS_DIR) == [2]  # 0002 now applies
+            # Pre-existing row carried across the rebuild unchanged.
+            rows = findings(database.read(), "st-1")
+            assert [f.id for f in rows] == [fid]
+            assert rows[0].status == "overruled"
+            # The index was recreated by the migration's final statement.
+            idx = {
+                r[0]
+                for r in database.read()
+                .execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                    " AND tbl_name='audit_findings'"
+                )
+                .fetchall()
+            }
+            assert "idx_findings_stage" in idx
+            # And the widening took: 'settled' is now insertable.
+            with database.transaction() as conn:
+                r2 = insert_artifact_ref(conn, make_artifact(kind="audit_report",
+                                                             sha="b" * 64))
+                insert_finding(conn, make_finding(report_artifact_id=r2,
+                                                  status="settled"))
+        finally:
+            database.close()
+
+    def test_whole_file_rollback_on_forced_failure(self, db_path: Path):
+        # A 0002 whose table-rebuild SUCCEEDS but a trailing statement FAILS must
+        # roll the entire file back — 'settled' must NOT have leaked in and the
+        # original table/index must be intact (the runner wraps the file in one tx).
+        bad_dir = Path(db_path).parent / "bad-migs"
+        bad_dir.mkdir()
+        src = MIGRATIONS_DIR / "0001_init.sql"
+        (bad_dir / src.name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        good_0002 = (MIGRATIONS_DIR / "0002_settled_finding_disposition.sql").read_text(
+            encoding="utf-8"
+        )
+        (bad_dir / "0002_settled_finding_disposition.sql").write_text(
+            good_0002 + "\nSELECT raise_after_rebuild_undefined_fn();\n",
+            encoding="utf-8",
+        )
+        database = Database(db_path, busy_timeout_ms=5000)
+        database.open()
+        try:
+            with pytest.raises(MigrationError):
+                database.migrate(bad_dir)
+            # 0002 rolled back wholesale: schema still at v1, and the rebuilt
+            # table never replaced the original — 'settled' is rejected again.
+            versions = [
+                r[0]
+                for r in database.read().execute(
+                    "SELECT version FROM schema_migrations"
+                )
+            ]
+            assert versions == [1]
+            with database.transaction() as conn:
+                insert_phase(conn, make_phase())
+                insert_stage(conn, make_stage())
+            with pytest.raises(sqlite3.IntegrityError):
+                with database.transaction() as conn:
+                    report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))
+                    insert_finding(
+                        conn, make_finding(report_artifact_id=report, status="settled")
+                    )
+        finally:
+            database.close()
 
 
 # ------------------------------------------------------------ connection settings

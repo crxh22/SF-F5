@@ -297,6 +297,15 @@ STAGE_ESCALATION_RESOLUTIONS: Mapping[str, StageState] = MappingProxyType(
         "cancelled": StageState.CANCELLED,
     }
 )
+#: The no-action (`settled`) disposition for an accurate-but-no-action contest
+#: (architect-operations.md §1): the phase_architect marks the contested findings
+#: `settled` and the stage routes forward by risk. Deliberately NOT a key in
+#: STAGE_ESCALATION_RESOLUTIONS — that map pins one token -> one forward state,
+#: but settling routes MERGE_GATE (non-critical) OR AWAITING_HUMAN (critical),
+#: so the scheduler SPECIAL-CASES this token in _step_escalated BEFORE the static
+#: map lookup (mirrors how rework:MERGE_GATE needed its own handling). The CLI
+#: accepts it for the STAGE level only.
+STAGE_NOACTION_RESOLUTION = "settled"
 PHASE_ESCALATION_RESOLUTIONS: Mapping[str, PhaseState] = MappingProxyType(
     {
         "replan": PhaseState.PLANNING,
