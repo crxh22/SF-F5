@@ -61,7 +61,12 @@ budgets:
                             # validation PASSES) and re-tripped the old cap. Caps catch RUNAWAYS, not honest
                             # rework on an over-large stage; the real fix is finer stage decomposition
                             # (registered, Opus-era). Revisit downward once structural stages are split.
-    critical: 150000000
+    critical: 220000000   # D-0044: 150M→220M (founder-approved 14-06-2026). auth-access genuinely burned
+                          # ~156M on the [23] broad device-test-integration scope (ALL API-client fixtures +
+                          # permanent conformance guard — honest work, converging: high+medium findings fixed,
+                          # 1 medium left) and tripped the 150M cap. Caps catch RUNAWAYS, not honest work on a
+                          # deliberately-broad critical stage. BOUNDED: if a critical stage exceeds 220M, SPLIT
+                          # (finer decomposition), do NOT extend again. Revisit downward post-foundation.
   usage_missing_policy: estimate      # estimate = logged-stream-bytes/4 into ledger (estimated=1) | escalate_after
   usage_missing_max_per_stage: 3      # used by escalate_after policy
 
