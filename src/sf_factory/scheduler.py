@@ -2321,6 +2321,14 @@ class StageExecutor:
         sha = await self._commit_unit_paths(
             stage, worktree, [response_path], f"stage {stage.id}: audit response"
         )
+        # [20] write-isolation (D-0042): the triage executor may COMPLY yet also
+        # scribble stray source edits during the response step; the response
+        # sidecar is already committed above, so unconditionally drop any leftover
+        # uncommitted writes here — corpse output in every triage outcome — before
+        # the comply->BUILD transition's §3.1 isolation assertion would wedge on
+        # them. Forensics: record the discarded entries on the payload (mirror the
+        # FAILED path ~1524). Stage worktree only (destructive; D-0035 inc-7).
+        discarded = await self._discard_uncommitted(worktree)
         contested = [f for f in existing_open if responses[f.finding_ref]["action"] == "contest"]
         complied = [f for f in existing_open if responses[f.finding_ref]["action"] == "comply"]
 
@@ -2380,7 +2388,11 @@ class StageExecutor:
                 StageState.ESCALATED.value,
                 actor=_ACTOR,
                 reason="contested audit finding(s) escalate to the phase architect",
-                payload={"contested": [f.finding_ref for f in contested]},
+                payload={
+                    "contested": [f.finding_ref for f in contested],
+                    # [20] forensics: stray triage-step writes dropped post-commit.
+                    "discarded": discarded,
+                },
                 coupled=couple_statuses,
             )
             return False
@@ -2397,6 +2409,8 @@ class StageExecutor:
                     # CCR-9: genuine rework re-entry — same sentence as the
                     # transition reason, on the dedicated prompt-context key.
                     "rework_context": rework,
+                    # [20] forensics: stray triage-step writes dropped post-commit.
+                    "discarded": discarded,
                 },
                 coupled=couple_statuses,
             )
@@ -3345,6 +3359,9 @@ class StageExecutor:
             "disagreement (logged, escalates); duplicate = covered by another finding.\n"
             "If a finding restates an observation already permanently closed in a "
             "prior round, answer `duplicate`.\n"
+            "Respond ONLY by writing findings-response.json. Do NOT edit code or any "
+            "other file — rework happens in the BUILD step after a comply. Never git "
+            "commit.\n"
             + self._layout_note(stage)
         )
 

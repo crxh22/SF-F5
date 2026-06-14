@@ -2613,6 +2613,131 @@ async def test_audit_contest_logs_and_escalates(db, config_dict, tmp_path) -> No
     assert findings["auditor_cross_model:F2"].resolved_by == "executor"
 
 
+def _audit_comply_with_stray_env(db, config_dict, tmp_path, *, stray: bool):
+    """Shared harness for the slice-2 Unit B [20] write-isolation pair: a
+    structural stage in AUDIT whose two auditors each raise one finding (round 1
+    only), and whose executor COMPLIES with both while ALSO scribbling a stray
+    uncommitted SOURCE edit during the response step (the D-0042 incident-20
+    shape). ``stray=False`` runs the identical flow without the scribble (the
+    clean control). Returns the env; the caller drives env.executor.execute."""
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "AUDIT")
+    # The stage worktree must carry a committed source file the stray "edits".
+    src = env.worktree / "module.py"
+    src.write_text("ORIGINAL = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=env.worktree, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed source"],
+        cwd=env.worktree, check=True, capture_output=True,
+    )
+
+    raised = {"done": False}  # round-1-only: re-audit after the clean build is empty
+
+    def auditor(ref: str):
+        def behavior(cwd: Path, unit_id: str, resume) -> None:
+            d = cwd / "_factory" / "stages" / unit_id
+            d.mkdir(parents=True, exist_ok=True)
+            role = ref.split(":")[0]
+            (d / f"audit-{role}.md").write_text(f"finding {ref}", encoding="utf-8")
+            payload = (
+                {"findings": [{"ref": ref, "severity": "major", "summary": "s"}]}
+                if not raised["done"]
+                else {"findings": []}
+            )
+            (d / f"audit-{role}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        return behavior
+
+    env.runner.behaviors["auditor_same_model"] = auditor("auditor_same_model:F1")
+    env.runner.behaviors["auditor_cross_model"] = auditor("auditor_cross_model:F2")
+
+    calls = {"builder": 0}
+
+    def builder(cwd: Path, unit_id: str, resume) -> None:
+        calls["builder"] += 1
+        d = cwd / "_factory" / "stages" / unit_id
+        if calls["builder"] == 1:
+            # The triage RESPONSE step: comply with both findings...
+            (d / "findings-response.json").write_text(
+                json.dumps(
+                    {
+                        "responses": [
+                            {"ref": "auditor_same_model:F1", "action": "comply",
+                             "rationale": "will fix"},
+                            {"ref": "auditor_cross_model:F2", "action": "comply",
+                             "rationale": "will fix"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if stray:
+                # ...and ALSO scribble a stray uncommitted source edit ([20]).
+                src.write_text("ORIGINAL = 1\nSCRIBBLED = 2\n", encoding="utf-8")
+                (cwd / "stray_new.py").write_text("LEAK = 1\n", encoding="utf-8")
+        else:
+            # The BUILD rework step: re-audit will find nothing -> close out.
+            raised["done"] = True
+
+    env.runner.behaviors["builder_heavy"] = builder
+    env.runner.behaviors["validator_structural"] = validator_writing(failing=0)
+    return env, src
+
+
+async def test_audit_comply_discards_stray_triage_writes_unit_b(
+    db, config_dict, tmp_path
+) -> None:
+    """slice-2 Unit B [20] (D-0042): a triage executor that COMPLIES yet also
+    edits source in-place during the RESPONSE step no longer wedges comply->BUILD.
+    The response sidecar is committed first, then _discard_uncommitted drops the
+    stray; the comply->BUILD transition proceeds past the §3.1 isolation gate, the
+    stray is gone, and the discarded entries land on the transition payload for
+    forensics. The conveyor reaches MERGE_GATE -> OPEN-2 (suite unset)."""
+    env, src = _audit_comply_with_stray_env(db, config_dict, tmp_path, stray=True)
+    # Natural stop point (proven precedent): MERGE_GATE with no suite command.
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await env.executor.execute("ph.s1")
+
+    # Both findings complied; comply routed BUILD (never an IntegrityError).
+    findings = {f.finding_ref: f for f in fdb.findings(db.read(), "ph.s1")}
+    assert findings["auditor_same_model:F1"].status == "complied"
+    assert findings["auditor_cross_model:F2"].status == "complied"
+    assert ("AUDIT", "BUILD") in transitions_of(db, "ph.s1")
+
+    # The stray is GONE (reset --hard) — the §3.1 gate before BUILD saw a clean
+    # tree, so it never raised; the in-place edit reverted to the committed line.
+    assert not (env.worktree / "stray_new.py").exists()
+    assert src.read_text(encoding="utf-8") == "ORIGINAL = 1\n"
+
+    # Forensics: the discarded porcelain entries ride the comply->BUILD payload.
+    build_entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "BUILD"
+    ]
+    assert build_entry, "expected a comply->BUILD transition"
+    discarded = json.loads(build_entry[0]["payload_json"]).get("discarded")
+    assert discarded is not None
+    joined = "\n".join(discarded)
+    assert "stray_new.py" in joined and "module.py" in joined
+
+
+async def test_audit_comply_without_stray_still_clean_unit_b(
+    db, config_dict, tmp_path
+) -> None:
+    """Control for the [20] fix: the identical comply flow WITHOUT a stray edit
+    still routes comply->BUILD cleanly, with an empty `discarded` list on the
+    payload (the unconditional discard is a safe no-op when the tree is clean)."""
+    env, _src = _audit_comply_with_stray_env(db, config_dict, tmp_path, stray=False)
+    with pytest.raises(ConfigError, match="OPEN-2"):
+        await env.executor.execute("ph.s1")
+    assert ("AUDIT", "BUILD") in transitions_of(db, "ph.s1")
+    build_entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "BUILD"
+    ]
+    assert build_entry
+    assert json.loads(build_entry[0]["payload_json"]).get("discarded") == []
+
+
 # ------------------------------------------------------------- recover() §5.5
 
 
