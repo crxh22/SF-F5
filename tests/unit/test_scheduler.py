@@ -1722,6 +1722,71 @@ async def test_escalation_resolution_payload_carries_operator_reason(
     assert payload["rework_context"] == "spec is internally contradictory"
 
 
+async def test_escalation_rework_merge_gate_routes_back_to_merge_gate(
+    db, config_dict, tmp_path
+) -> None:
+    """D-0041 merge-gate re-entry: a 'rework:MERGE_GATE' resolution on an open
+    stage escalation re-enters ONLY the merge gate (Tier-1 rebase+suite + Tier-2
+    integration_validator) — no re-validate, no re-audit. Mirrors the
+    rework:SPEC/BUILD routing tests: _step_escalated transitions ESCALATED ->
+    MERGE_GATE (now a legal exit), skips the contested-findings settlement (the
+    target is not in BUILD/SPEC/VALIDATE — a stage at the gate closed its
+    findings at audit) and the AWAITING_HUMAN wrapper, and carries the operator
+    reason on the dedicated 'rework_context' key."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="agent_run_failed",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:  # the CLI's short tx: resolve + event
+        fdb.resolve_escalation(conn, esc_id, "rework:MERGE_GATE")
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="escalation_resolved",
+            actor="main_architect",
+            payload={
+                "escalation_id": esc_id,
+                "resolution": "rework:MERGE_GATE",
+                "reason": "Tier-2 overflow fixed; re-run the gate only",
+                "via": "cli",
+            },
+        )
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    # No contested findings exist at the gate; settlement must be a no-op (the
+    # transition still succeeds and routes straight to MERGE_GATE).
+    progressed = await env.executor._step_escalated(stage)
+
+    assert progressed is True
+    assert stage_state(db, "ph.s1") is StageState.MERGE_GATE
+    entry = [
+        e
+        for e in events_of(db, "ph.s1", "transition")
+        if e["to_state"] == "MERGE_GATE"
+    ]
+    payload = json.loads(entry[-1]["payload_json"])
+    assert payload["escalation_id"] == esc_id
+    assert payload["resolution"] == "rework:MERGE_GATE"
+    assert payload["rework_context"] == "Tier-2 overflow fixed; re-run the gate only"
+    assert open_escalations(db, "ph.s1") == []
+
+
 async def test_escalation_rework_build_reason_reaches_builder_prompt(
     db, config_dict, tmp_path
 ) -> None:
@@ -3661,6 +3726,13 @@ async def test_capacity_resolution_map_audit_maps_to_rework_validate(
     assert set(sched_mod._CAPACITY_RESOLUTIONS.values()) <= set(
         STAGE_ESCALATION_RESOLUTIONS
     )
+    # DELIBERATE absence (scheduler.py:_CAPACITY_RESOLUTIONS comment): a
+    # limit-killed Tier-2 (MERGE_GATE) has NO auto-resolve mapping — it stays
+    # open for the architect. The 'rework:MERGE_GATE' token exists ONLY for the
+    # manual `resolve-escalation` path, never for the capacity governor, so
+    # neither the from_state key nor the resolution token may appear here.
+    assert "MERGE_GATE" not in sched_mod._CAPACITY_RESOLUTIONS
+    assert "rework:MERGE_GATE" not in sched_mod._CAPACITY_RESOLUTIONS.values()
 
     env = make_governor_env(db, config_dict, tmp_path, risk="structural")
     with db.transaction() as conn:

@@ -51,7 +51,15 @@ class TestTransitionTables:
             s.AUDIT: {s.MERGE_GATE, s.AWAITING_HUMAN, s.BUILD, s.ESCALATED, s.CANCELLED},
             s.AWAITING_HUMAN: {s.MERGE_GATE, s.BUILD, s.SPEC, s.ESCALATED, s.CANCELLED},
             s.MERGE_GATE: {s.DONE, s.BUILD, s.ESCALATED, s.CANCELLED},
-            s.ESCALATED: {s.SPEC, s.BUILD, s.VALIDATE, s.AWAITING_HUMAN, s.FAILED, s.CANCELLED},
+            s.ESCALATED: {
+                s.SPEC,
+                s.BUILD,
+                s.VALIDATE,
+                s.MERGE_GATE,
+                s.AWAITING_HUMAN,
+                s.FAILED,
+                s.CANCELLED,
+            },
             s.DONE: set(),
             s.FAILED: set(),
             s.CANCELLED: set(),
@@ -367,6 +375,17 @@ class TestEscalationResolutionVocabulary:
         for token, target in STAGE_ESCALATION_RESOLUTIONS.items():
             assert isinstance(target, StageState), token
             assert target in VALID_STAGE_TRANSITIONS[StageState.ESCALATED], token
+
+    def test_merge_gate_reentry_token_and_transition(self):
+        """D-0041: the manual 'rework:MERGE_GATE' resolution maps to MERGE_GATE,
+        which is a legal ESCALATED exit (re-enters ONLY the merge gate — Tier-1
+        rebase+suite + Tier-2 integration_validator — no re-validate/re-audit)."""
+        from sf_factory.models import STAGE_ESCALATION_RESOLUTIONS
+
+        assert StageState.MERGE_GATE in VALID_STAGE_TRANSITIONS[StageState.ESCALATED]
+        assert (
+            STAGE_ESCALATION_RESOLUTIONS["rework:MERGE_GATE"] is StageState.MERGE_GATE
+        )
 
     def test_phase_values_are_legal_escalated_exits(self):
         from sf_factory.models import PHASE_ESCALATION_RESOLUTIONS

@@ -335,6 +335,7 @@ GLOSS: Mapping[str, str] = {
     # escalation resolutions (models.*_ESCALATION_RESOLUTIONS vocabulary, CCR-7 —
     # rendered by the „ultima escaladare rezolvată” line)
     "rework:VALIDATE": "reia validarea",
+    "rework:MERGE_GATE": "reia poarta de integrare",
     "respec": "refă specificația",
     "awaiting_human": "trimisă la decizia fondatorului",
     "failed": "eșuată definitiv",
