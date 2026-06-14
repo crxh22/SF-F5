@@ -5182,10 +5182,20 @@ class Scheduler:
             and each spawn past the cap on its next step).
         Genuinely no-spawn drives — a BLOCKED unit still open/awaiting, or whose
         resolution routes to a terminal/blocked state — return False and are
-        exempt. A BLOCKED drive that routes to a rework SPAWNING state is the one
-        residual: it spawns once within this task past the cap, then its slot is
-        reclassified on the next tick; bounded to one agent per routing escalation
-        per tick (Risk #1 / Falsifiability — surfaced to the architect)."""
+        exempt. A BLOCKED drive whose resolution routes to a rework SPAWNING state
+        is the one residual: `execute()` walks straight from the exempt no-spawn
+        pickup INTO that rework spawn in the SAME task, spawning once past the cap
+        within its walk (it is never added to `self._spawning`). The PER-UNIT
+        overshoot is one agent, but the AGGREGATE is cap + K: with K such drives
+        resolved in one tick, fresh spawners still fill the cap on top, so peak
+        concurrent SPAWNING drives = cap + K. K is bounded by simultaneously-
+        resolved rework escalations (≤ cap; the capacity governor's batch
+        auto-resolve at a budget reset is the K≈cap case). ACCEPTED as an
+        economic-cap residual: the cap protects the §7 process budget, not a hard
+        safety limit (§8 — no heavier mechanism without an observed incident).
+        Steady-state cap holds; the spike is transient (one tick) and the capacity
+        governor re-holds if it re-trips the wall. Pinned by
+        test_rework_routing_overshoots_cap_by_bounded_k_accepted_residual."""
         if category is SchedCategory.RUNNABLE:
             return True
         return bool(self._executors[level].spawn_roles(unit))

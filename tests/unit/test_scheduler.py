@@ -656,6 +656,101 @@ async def test_no_spawn_does_not_starve_later_no_spawn(db, config_dict) -> None:
     assert stage_state(db, "z_esc2") is StageState.AWAITING_HUMAN
 
 
+async def test_rework_routing_overshoots_cap_by_bounded_k_accepted_residual(
+    db, config_dict
+) -> None:
+    """DOCUMENTS the consciously-accepted UNIT-1 rework-routing residual (see the
+    design doc UNIT 1 Falsifiability note). `execute()` walks every legal step in
+    ONE task, so an EXEMPT BLOCKED drive whose resolution routes to a SPAWNING
+    rework state (ESCALATED -> rework:BUILD) walks from the no-spawn pickup INTO
+    that spawn in the same task — spawning once past the cap, and (because exempt
+    drives never enter `self._spawning`) fresh spawners fill the full cap on top.
+    Net peak concurrent drives in a SPAWNING state = cap + K, where K = the number
+    of rework-routing ESCALATED drives resolved in one tick (K bounded by
+    simultaneously-resolved rework escalations <= cap; the capacity governor's
+    batch auto-resolve at a budget reset is the K~cap case). This is accepted as a
+    bounded economic-cap residual (the cap protects the §7 process budget, not a
+    hard safety limit — §8). Steady-state cap still holds (the spawning-SET stays
+    <= cap); the cap+K spike is transient (one tick).
+
+    This test PINS the bound: a future change that makes the overshoot WORSE than
+    cap+K (drift toward unbounded) trips `peak <= cap + K`, and the `peak > cap`
+    assertion keeps the accepted residual a visible, tested fact. If a future
+    change ELIMINATES the residual (peak == cap), update the `peak > cap`
+    assertion AND the design note's amendment together.
+    """
+    cap = 2
+    K = 3
+    cfg = make_config(config_dict, max_parallel_agents=cap)  # N = 2
+    insert_phase(db, "ph")
+    # K rework-routing ESCALATED drives: each has a resolved-but-not-routed
+    # escalation, and its `_step_escalated` pickup routes it to BUILD (a SPAWNING
+    # state). They are cap-EXEMPT at pickup (ESCALATED spawns nothing) yet walk
+    # into the BUILD spawn in the same task. Their ids sort AFTER the spawners.
+    for i in range(K):
+        sid = f"z_esc{i}"
+        insert_stage(db, sid, "ph", StageState.ESCALATED)
+        _resolve_escalation_for(db, Level.STAGE, sid, "rework:BUILD")
+    # `cap` fresh BUILD spawners that sort FIRST and fill every capped slot; held
+    # 10s so the cap stays full for the whole observation window.
+    for i in range(cap):
+        insert_stage(db, f"a_spawner{i}", "ph", StageState.BUILD)
+    sm = StateMachine(db)
+    stage_exec = ScriptedExecutor(
+        Level.STAGE,
+        db,
+        sm,
+        hold_unit_s={f"a_spawner{i}": 10.0 for i in range(cap)},
+        respect_blocked=True,
+        escalation_resolves_to="BUILD",  # resolution routes into a SPAWNING state
+    )
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+
+    spawning_states = _SPAWNING_STATES[Level.STAGE]
+
+    def peak_spawning_drives() -> int:
+        # Real agents in production = units in a SPAWNING state with a live drive
+        # task. The held spawners (in `_spawning`) plus the K rework-routers that
+        # walked into BUILD in their still-pending drive coexist for one tick.
+        conn = db.read()
+        live = set(scheduler._tasks)
+        return sum(
+            1
+            for u in fdb.list_units(conn, Level.STAGE)
+            if u.state.value in spawning_states and (Level.STAGE, u.id) in live
+        )
+
+    peak = 0
+    task = asyncio.create_task(scheduler.run_forever())
+    try:
+        # Dense per-loop-turn sampling (sleep(0)) over the cap-full window catches
+        # the one-tick cap+K spike deterministically; the spawners hold the cap.
+        for _ in range(2000):
+            peak = max(peak, peak_spawning_drives())
+            if peak >= cap + K:
+                break
+            await asyncio.sleep(0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The REGRESSION GUARD: the overshoot stays bounded by cap + K. If a future
+    # change lets it grow past this, the residual is no longer self-limiting —
+    # fail loudly so it gets re-ruled (the deferred Semaphore fix, design note).
+    assert peak <= cap + K
+    # DOCUMENTS that the residual is REAL: real concurrent spawning drives exceed
+    # the cap on the rework-routing tick (the consciously-accepted UNIT-1 residual,
+    # design UNIT 1 Falsifiability note). If a future change makes peak == cap,
+    # update THIS assertion and the design note's amendment together.
+    assert peak > cap
+    # Steady-state still holds: the cap denominator (the spawning SET) never
+    # exceeds the cap — only the transient in-task walk overshoots.
+    assert len(scheduler._spawning) <= cap
+
+
 async def test_level_agnostic_same_loop_drives_phase_and_stages(db, config_dict) -> None:
     """§8: level-agnosticism proven by driving a fake phase + fake stages
     through the SAME loop with the SAME executor class."""
