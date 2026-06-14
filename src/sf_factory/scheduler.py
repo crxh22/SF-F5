@@ -1253,6 +1253,15 @@ class UnitExecutor(Protocol):
         thresholds do not decide, transition."""
         ...
 
+    def spawn_roles(self, unit: object) -> tuple[str, ...]:
+        """Roles the unit's CURRENT step may spawn — `()` when the step runs no
+        agent (dispatch bookkeeping, gates, ESCALATED pickup). The scheduler-
+        fairness predicate (robustness UNIT 1): no-spawn control-plane work is
+        exempt from the agent-slot cap, so a resolved escalation's pickup is not
+        starved behind routine agents. The same per-step contract the capacity
+        governor consumes (CCR-11/D-0037)."""
+        ...
+
 
 @dataclass(frozen=True)
 class RecoveryReport:
@@ -1403,6 +1412,15 @@ class StageExecutor:
         if stage.state is StageState.MERGE_GATE:
             return ("integration_validator",)
         return ()
+
+    def spawn_roles(self, unit: object) -> tuple[str, ...]:
+        """Public UnitExecutor surface over `_step_spawn_roles` (robustness UNIT
+        1): the scheduler asks 'does this stage's current step spawn an agent?'
+        to keep no-spawn control-plane work (ESCALATED pickup, gates, dispatch)
+        out of the agent-slot cap. Single source — never re-derive the no-spawn
+        set (Doctrine §0/§9)."""
+        assert isinstance(unit, Stage), f"StageExecutor.spawn_roles got {type(unit)!r}"
+        return self._step_spawn_roles(unit)
 
     async def _run_step_agent(
         self,
@@ -3499,6 +3517,13 @@ class PhaseExecutor:
             return ("integration_validator",)
         return ()
 
+    def spawn_roles(self, unit: object) -> tuple[str, ...]:
+        """Public UnitExecutor surface over `_step_spawn_roles` (robustness UNIT
+        1): identical contract to the StageExecutor — a phase in ESCALATED has
+        the same no-spawn starvation, so it is exempt from the cap too."""
+        assert isinstance(unit, Phase), f"PhaseExecutor.spawn_roles got {type(unit)!r}"
+        return self._step_spawn_roles(unit)
+
     def _stage_id(self, phase: Phase, plan_stage_id: str) -> str:
         """Plan-local stage ids are namespaced by phase (stages.id is a global PK)."""
         return f"{phase.id}.{plan_stage_id}"
@@ -4636,6 +4661,11 @@ class Scheduler:
         #: Phase-seeding design §5: out-of-bounds check during recover().
         self._oob = _OutOfBoundsDetector(db, cfg, notify)
         self._tasks: dict[tuple[Level, str], asyncio.Task] = {}
+        #: Keys of live drives that spawn an agent (robustness UNIT 1) — the cap
+        #: denominator. No-spawn control-plane drives (ESCALATED pickup, gates)
+        #: are excluded so they are never starved by a full cap; reconciled to
+        #: `_tasks` in `_spawning_count` and cleared in `_reap`/`_drive.finally`.
+        self._spawning: set[tuple[Level, str]] = set()
         #: max events.seq at the end of a unit's last drive — the re-dispatch
         #: edge trigger (a no-progress unit is not respun until facts change).
         self._last_seq: dict[tuple[Level, str], int] = {}
@@ -5043,16 +5073,22 @@ class Scheduler:
     def _reap(self) -> None:
         for key in [k for k, task in self._tasks.items() if task.done()]:
             del self._tasks[key]
+            self._spawning.discard(key)  # a finished spawning drive frees its slot
 
-    def _scan_units(self) -> list[tuple[Level, str, SchedCategory]]:
+    def _scan_units(self) -> list[tuple[Level, str, SchedCategory, Phase | Stage]]:
         """One categorized pass over all units (feeds dispatch + stall detector).
+
+        The unit OBJECT is carried alongside its category (robustness UNIT 1):
+        `_dispatch` needs it to ask the executor `spawn_roles(unit)` without a
+        second per-candidate read — one `list_units` pass, both consumers
+        (`_dispatch`, `_stall_detector`) share the snapshot.
 
         Phase-seeding design §5b: the RUNNABLE selection applies the
         proving-phases dispatch hold at PHASE level — a held phase is
         categorized WAITING (state stays PENDING, never transitioned), so it is
         neither dispatched nor mistaken for progress by the stall detector."""
         conn = self._db.read()
-        scan: list[tuple[Level, str, SchedCategory]] = []
+        scan: list[tuple[Level, str, SchedCategory, Phase | Stage]] = []
         for level in self._levels():
             units = fdb.list_units(conn, level)
             held: frozenset[str] = frozenset()
@@ -5068,22 +5104,32 @@ class Scheduler:
                 category = sched_category(level, state, deps)
                 if category is SchedCategory.RUNNABLE and unit.id in held:
                     category = SchedCategory.WAITING  # §5b hold: not dispatched
-                scan.append((level, unit.id, category))
+                scan.append((level, unit.id, category, unit))
         return scan
 
     def _dispatch(
-        self, tg: asyncio.TaskGroup, scan: list[tuple[Level, str, SchedCategory]]
+        self, tg: asyncio.TaskGroup, scan: list[tuple[Level, str, SchedCategory, Phase | Stage]]
     ) -> int:
         """Dispatch eligible units up to the max_parallel_agents cap. RUNNABLE
         always dispatches; category-RUNNING re-dispatches when events advanced
         since its last drive (or it was never driven — crash resume, §5.5d);
         BLOCKED re-dispatches additionally when its open-escalation/pending-
-        decision counts changed (answers may arrive without events)."""
+        decision counts changed (answers may arrive without events).
+
+        Scheduler fairness (robustness UNIT 1): the cap bounds only SPAWNING
+        drives — a drive whose execute() will run an agent subprocess. No-spawn
+        control-plane work (the ESCALATED resolution pickup, AWAITING gates)
+        proceeds past a full cap so a resolved-but-not-routed escalation on a
+        critical stage is not starved behind routine agents. The cap still
+        bounds real concurrent agents because spawns are sequential within one
+        execute() task and every spawning drive holds a `_spawning` slot for its
+        whole walk. `continue`, not `break`: a later no-spawn unit in the scan
+        must stay reachable behind a capped spawning one."""
         conn = self._db.read()
         cap = self._cfg.process.max_parallel_agents
         seq = _max_event_seq(conn)
         dispatched = 0
-        for level, unit_id, category in scan:
+        for level, unit_id, category, unit in scan:
             key = (level, unit_id)
             if key in self._tasks:
                 continue
@@ -5109,11 +5155,46 @@ class Scheduler:
                 )
             if not eligible:
                 continue
-            if len(self._tasks) >= cap:
-                break  # economics cap (§7) — the rest waits for a free slot
+            spawns = self._drive_spawns(level, category, unit)
+            if spawns and self._spawning_count() >= cap:
+                continue  # economics cap (§7): a SPAWNING drive waits for a free
+                # slot; keep scanning so no-spawn control-plane work still runs.
             self._tasks[key] = tg.create_task(self._drive(level, unit_id))
+            if spawns:
+                self._spawning.add(key)
             dispatched += 1
         return dispatched
+
+    def _drive_spawns(
+        self, level: Level, category: SchedCategory, unit: Phase | Stage
+    ) -> bool:
+        """Will dispatching this unit's drive run an agent subprocess? — the cap
+        predicate (robustness UNIT 1). `execute()` walks every legal step in ONE
+        task without re-entering the scheduler, so a drive is SPAWNING if ANY
+        step it will reach this drive spawns, not only its entry step. Two
+        sources, OR-ed:
+          - the executor's `spawn_roles(unit)` for the CURRENT step (the single
+            source the capacity governor uses — never re-derived);
+          - RUNNABLE: a PENDING unit's entry step (dispatch bookkeeping) spawns
+            nothing, but the SAME task immediately walks into SPEC/PLANNING which
+            DOES spawn — so a RUNNABLE drive is always cap-bounded (without this
+            the existing cap invariant breaks: N PENDING units would all dispatch
+            and each spawn past the cap on its next step).
+        Genuinely no-spawn drives — a BLOCKED unit still open/awaiting, or whose
+        resolution routes to a terminal/blocked state — return False and are
+        exempt. A BLOCKED drive that routes to a rework SPAWNING state is the one
+        residual: it spawns once within this task past the cap, then its slot is
+        reclassified on the next tick; bounded to one agent per routing escalation
+        per tick (Risk #1 / Falsifiability — surfaced to the architect)."""
+        if category is SchedCategory.RUNNABLE:
+            return True
+        return bool(self._executors[level].spawn_roles(unit))
+
+    def _spawning_count(self) -> int:
+        """Live SPAWNING drives (the cap denominator). Snapshot-at-dispatch set,
+        reconciled to `_tasks` so a reaped/finished drive frees its slot."""
+        self._spawning &= set(self._tasks)
+        return len(self._spawning)
 
     async def _drive(self, level: Level, unit_id: str) -> None:
         """Run one executor; unit-scoped failures are contained here (§6) so
@@ -5127,6 +5208,11 @@ class Scheduler:
         finally:
             conn = self._db.read()
             key = (level, unit_id)
+            # Robustness UNIT 1: release the agent-slot the moment this spawning
+            # drive ends (it spawns sequentially within this one task, so no
+            # agent of THIS unit is live past here) — `_reap` only runs at the
+            # next tick top, so discard here too to free the slot promptly.
+            self._spawning.discard(key)
             self._last_seq[key] = _max_event_seq(conn)
             self._blocked_snapshot[key] = (
                 _open_escalation_count(conn, level.value, unit_id),
@@ -5251,7 +5337,7 @@ class Scheduler:
                 )
 
     async def _stall_detector(
-        self, scan: list[tuple[Level, str, SchedCategory]]
+        self, scan: list[tuple[Level, str, SchedCategory, Phase | Stage]]
     ) -> None:
         """§4 STALL DETECTOR: non-terminal units exist, nothing RUNNABLE/RUNNING,
         and no open decision_request/escalation -> 'alert' event + ntfy. Fires
@@ -5264,7 +5350,7 @@ class Scheduler:
         ]
         stalled = bool(non_terminal) and not any(
             category in (SchedCategory.RUNNABLE, SchedCategory.RUNNING)
-            for _, _, category in non_terminal
+            for _, _, category, _ in non_terminal
         )
         if stalled:
             conn = self._db.read()
@@ -5275,7 +5361,7 @@ class Scheduler:
             self._stall_published = False
             self._delivery_failed_logged.discard("stall")
             return
-        wedged = [f"{level.value}:{unit_id}" for level, unit_id, _ in non_terminal]
+        wedged = [f"{level.value}:{unit_id}" for level, unit_id, _, _ in non_terminal]
         if not self._stall_event_logged:
             self._stall_event_logged = True
             with self._db.transaction() as conn:

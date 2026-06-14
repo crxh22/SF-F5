@@ -341,6 +341,16 @@ _NEXT: dict[Level, dict[str, str]] = {
 }
 
 
+#: States whose ScriptedExecutor drive models an agent spawn — the test double's
+#: mirror of the real `_step_spawn_roles` contract (scheduler.py:1384/3489): the
+#: conveyor/work states spawn; dispatch-entry (PENDING), gates, and the BLOCKED
+#: states (ESCALATED/AWAITING_*) spawn nothing. Keyed by level + concrete state.
+_SPAWNING_STATES: dict[Level, frozenset[str]] = {
+    Level.STAGE: frozenset({"SPEC", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE"}),
+    Level.PHASE: frozenset({"PLANNING", "INTEGRATING"}),
+}
+
+
 @dataclass
 class ScriptedExecutor:
     """One class for BOTH levels — driven through the same Scheduler loop, this
@@ -350,12 +360,32 @@ class ScriptedExecutor:
     db: Any
     sm: StateMachine
     hold_s: float = 0.0
+    #: Per-unit hold override (robustness UNIT 1 pin): a unit_id here holds its
+    #: slot for the given seconds instead of `hold_s` — lets ONE spawner pin the
+    #: cap for the whole test window while no-spawn escalation pickups (hold 0)
+    #: run promptly through the SAME level-keyed executor.
+    hold_unit_s: dict[str, float] = field(default_factory=dict)
     respect_blocked: bool = False
     fail_units: frozenset[str] = frozenset()
+    #: Where a resolved escalation routes an ESCALATED unit (robustness UNIT 1
+    #: pin) — mirrors `_step_escalated`'s resolution routing. Default
+    #: AWAITING_HUMAN: a no-spawn blocked target so the drive transitions OUT of
+    #: ESCALATED and stops (no further spawn), keeping the cap provably intact.
+    escalation_resolves_to: str = "AWAITING_HUMAN"
     started: list[tuple[str, str]] = field(default_factory=list)
     finished: list[tuple[str, str]] = field(default_factory=list)
     concurrent: int = 0
     max_concurrent: int = 0
+
+    def spawn_roles(self, unit: object) -> tuple[str, ...]:
+        """UnitExecutor surface — the real StageExecutor/PhaseExecutor expose
+        this so the scheduler can keep no-spawn drives out of the agent-slot cap
+        (robustness UNIT 1). Mirrors `_step_spawn_roles`: `()` for the no-spawn
+        states (PENDING, gates, ESCALATED), a role tuple for the conveyor."""
+        state = unit.state.value  # type: ignore[attr-defined]
+        if state in _SPAWNING_STATES[self.level]:
+            return ("scripted_agent",)
+        return ()
 
     async def execute(self, unit_id: str) -> None:
         self.started.append((self.level.value, unit_id))
@@ -364,8 +394,9 @@ class ScriptedExecutor:
         self.concurrent += 1
         self.max_concurrent = max(self.max_concurrent, self.concurrent)
         try:
-            if self.hold_s:
-                await asyncio.sleep(self.hold_s)
+            hold = self.hold_unit_s.get(unit_id, self.hold_s)
+            if hold:
+                await asyncio.sleep(hold)
             while True:
                 unit = (
                     fdb.get_stage(self.db.read(), unit_id)
@@ -387,6 +418,27 @@ class ScriptedExecutor:
                         is not None
                     ):
                         pass  # answered -> walk on
+                    elif (
+                        state == "ESCALATED"
+                        and sched_mod._open_escalation_count(
+                            self.db.read(), self.level.value, unit_id
+                        )
+                        == 0
+                        and sched_mod._latest_resolved_escalation(
+                            self.db.read(), self.level.value, unit_id
+                        )
+                        is not None
+                    ):
+                        # Resolved escalation: the no-spawn `_step_escalated`
+                        # pickup routes the unit forward (robustness UNIT 1 pin).
+                        self.sm.transition(
+                            self.level,
+                            unit_id,
+                            self.escalation_resolves_to,
+                            actor="control_plane",
+                            reason="scripted escalation resolution",
+                        )
+                        return
                     else:
                         return
                 nxt = _NEXT[self.level].get(state)
@@ -457,6 +509,151 @@ async def test_parallel_cap_bounds_concurrent_units(db, config_dict) -> None:
 
     assert stage_exec.max_concurrent == cfg.process.max_parallel_agents == 2
     assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2", "s3", "s4"))
+
+
+def _resolve_escalation_for(db, level: Level, unit_id: str, resolution: str) -> int:
+    """Insert an OPEN escalation on an ESCALATED unit, then resolve it — the
+    'resolved-but-not-yet-routed' shape that re-enters dispatch only to run the
+    no-spawn `_step_escalated` pickup (robustness UNIT 1)."""
+    with db.transaction() as conn:
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level=level.value,
+                unit_id=unit_id,
+                trigger="cp1_verdict",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, resolution)
+    return esc_id
+
+
+async def test_no_spawn_escalation_proceeds_when_cap_full(db, config_dict) -> None:
+    """THE INVARIANT PIN (robustness UNIT 1): a no-spawn ESCALATED resolution
+    pickup transitions OUT of ESCALATED even while the agent-slot cap is FULL of
+    long-running SPAWNING stages.
+
+    MUTATION NOTE: without the fix, `_dispatch` gates EVERY drive behind
+    `if len(self._tasks) >= cap: break` — the ESCALATED unit (no agent needed)
+    would stay put until a SPAWNING slot frees (here: ~10s, far past the
+    observation window). Confirmed by reverting the `_drive_spawns`/`continue`
+    change: the assertion below then fails (stage stays ESCALATED). The spawner's
+    long hold makes the difference observable: only the cap-exemption lets the
+    control-plane pickup run within the window."""
+    cfg = make_config(config_dict, max_parallel_agents=1)  # cap = 1 (one slot)
+    insert_phase(db, "ph")
+    # The one slot is held by a SPAWNING stage stuck mid-BUILD for the whole
+    # test. Its id sorts FIRST in the scan (list_units ORDER BY id) so it is
+    # dispatched and fills the cap BEFORE the escalated unit is considered —
+    # this is what makes the buggy `break` gate strand the no-spawn pickup.
+    insert_stage(db, "a_spawner", "ph", StageState.BUILD)
+    # A resolved-but-not-routed escalation on a stage that sorts AFTER the
+    # spawner: re-enters dispatch only to run the no-spawn `_step_escalated`
+    # pickup. With the old `break` gate it waits behind the full cap; the fix
+    # exempts it.
+    insert_stage(db, "z_escalated", "ph", StageState.ESCALATED)
+    _resolve_escalation_for(db, Level.STAGE, "z_escalated", "rework:VALIDATE")
+    sm = StateMachine(db)
+    # 'a_spawner' holds the only slot for 10s; the ESCALATED pickup has no hold
+    # (hold 0) so it runs promptly through the SAME level-keyed executor.
+    stage_exec = ScriptedExecutor(
+        Level.STAGE, db, sm, hold_unit_s={"a_spawner": 10.0}, respect_blocked=True
+    )
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+
+    task = asyncio.create_task(scheduler.run_forever())
+    try:
+        # A handful of ticks (loop_tick_s=0.01) — well under the spawner's 10s
+        # hold, so the cap stays full the entire window.
+        for _ in range(50):
+            if stage_state(db, "z_escalated") is not StageState.ESCALATED:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The cap was full of the SPAWNING 'a_spawner' the whole window...
+    assert stage_state(db, "a_spawner") is StageState.BUILD
+    # ...yet the no-spawn ESCALATED pickup still ran (transitioned OUT).
+    assert stage_state(db, "z_escalated") is not StageState.ESCALATED
+    assert stage_state(db, "z_escalated") is StageState.AWAITING_HUMAN
+
+
+async def test_spawning_steps_still_capped(db, config_dict) -> None:
+    """The EXISTING cap invariant must hold (robustness UNIT 1 must not weaken
+    it): N+1 SPAWNING stages with cap=N -> at most N concurrent agent spawns,
+    the (N+1)th waits. Real concurrent agents never exceed max_parallel_agents
+    (design Falsifiability §10) — the companion to THE PIN."""
+    cfg = make_config(config_dict, max_parallel_agents=2)  # N = 2
+    insert_phase(db, "ph")
+    # Three stages all entering at a SPAWNING state (BUILD) — every drive runs an
+    # agent, so all three compete for the capped slots.
+    for sid in ("a", "b", "c"):
+        insert_stage(db, sid, "ph", StageState.BUILD)
+    sm = StateMachine(db)
+    stage_exec = ScriptedExecutor(Level.STAGE, db, sm, hold_s=0.08)
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+    await run_blocked(scheduler)
+
+    # Never more than N=2 concurrent spawning drives, despite 3 ready stages.
+    assert stage_exec.max_concurrent == cfg.process.max_parallel_agents == 2
+    assert all(stage_state(db, s) is StageState.DONE for s in ("a", "b", "c"))
+
+
+async def test_no_spawn_does_not_starve_later_no_spawn(db, config_dict) -> None:
+    """The `continue`-not-`break` pin (robustness UNIT 1): with the cap full of
+    spawners, TWO no-spawn ESCALATED units later in the scan BOTH proceed in the
+    same window. A `break` (the old gate) would strand the second behind the
+    capped spawner; `continue` keeps it reachable."""
+    cfg = make_config(config_dict, max_parallel_agents=1)  # one slot, held below
+    insert_phase(db, "ph")
+    # 'a_spawner' sorts FIRST (list_units ORDER BY id) and fills the only slot;
+    # the two ESCALATED units sort AFTER it, so the OLD `break` gate would
+    # strand BOTH behind the full cap. `continue` keeps them reachable.
+    insert_stage(db, "a_spawner", "ph", StageState.BUILD)  # holds the only slot
+    insert_stage(db, "z_esc1", "ph", StageState.ESCALATED)
+    insert_stage(db, "z_esc2", "ph", StageState.ESCALATED)
+    _resolve_escalation_for(db, Level.STAGE, "z_esc1", "rework:VALIDATE")
+    _resolve_escalation_for(db, Level.STAGE, "z_esc2", "rework:VALIDATE")
+    sm = StateMachine(db)
+    stage_exec = ScriptedExecutor(
+        Level.STAGE, db, sm, hold_unit_s={"a_spawner": 10.0}, respect_blocked=True
+    )
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+
+    task = asyncio.create_task(scheduler.run_forever())
+    try:
+        for _ in range(50):
+            if all(
+                stage_state(db, s) is not StageState.ESCALATED
+                for s in ("z_esc1", "z_esc2")
+            ):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert stage_state(db, "a_spawner") is StageState.BUILD  # cap still full
+    # BOTH no-spawn units advanced — the second was not stranded behind the cap.
+    assert stage_state(db, "z_esc1") is StageState.AWAITING_HUMAN
+    assert stage_state(db, "z_esc2") is StageState.AWAITING_HUMAN
 
 
 async def test_level_agnostic_same_loop_drives_phase_and_stages(db, config_dict) -> None:

@@ -144,6 +144,14 @@ class _AnswerConsumingExecutor:
         self._db = db
         self._sm = StateMachine(db)
 
+    def spawn_roles(self, unit: object) -> tuple[str, ...]:
+        # UnitExecutor surface (robustness UNIT 1): mirror `_step_spawn_roles` —
+        # the AWAITING_HUMAN entry step spawns nothing (the cap exempts it); the
+        # MERGE_GATE step it walks into would spawn the integration validator.
+        if getattr(unit, "state", None) is StageState.MERGE_GATE:
+            return ("integration_validator",)
+        return ()
+
     async def execute(self, unit_id: str) -> None:
         while True:
             stage = fdb.get_stage(self._db.read(), unit_id)
