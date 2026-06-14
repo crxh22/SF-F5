@@ -35,6 +35,7 @@ import sys
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -61,6 +62,7 @@ from sf_factory.consultation import _canonical_payload
 from sf_factory.dashboard import GLOSS, DashboardServer, resolve_bind_host
 from sf_factory.db import Database
 from sf_factory.models import (
+    ESCALATION_TARGET_LADDER,
     GATE_ANSWERS,
     PHASE_ESCALATION_RESOLUTIONS,
     STAGE_ESCALATION_RESOLUTIONS,
@@ -85,7 +87,6 @@ from sf_factory.models import (
     TransitionError,
     Trigger,
     new_id,
-    next_escalation_target,
     sched_category,
     utc_now,
 )
@@ -4683,16 +4684,15 @@ class Scheduler:
         #: per episode/rung so the §9 channel never thrashes (alarm fatigue):
         #:  • _escalation_opened_notified — open architect-targeted escalations
         #:    already given their first-notice page (Q2 ≤5-min law);
-        #:  • _escalation_bumped_at — esc_id → the target it was last bumped TO, so
-        #:    a second tick at the same rung does not re-bump (re-fires only after
-        #:    the NEXT threshold crossing for the NEW rung);
         #:  • _escalation_stuck_resolved_notified — resolved-but-unadvanced episodes
         #:    already paged once.
         #: All keyed by esc_id and self-clearing: an esc_id absent from the live
         #: open/resolved read is pruned each tick (the escalation closed/advanced),
-        #: so a future re-open with a fresh id re-arms cleanly.
+        #: so a future re-open with a fresh id re-arms cleanly. The open-too-long
+        #: climb (2a) needs NO latch: it derives the expected rung from the
+        #: escalation's age and bumps only when target lags it (stateless — the
+        #: persisted target IS the latch), so it survives restart on its own.
         self._escalation_opened_notified: set[int] = set()
-        self._escalation_bumped_at: dict[int, str] = {}
         self._escalation_stuck_resolved_notified: set[int] = set()
 
     # ----------------------------------------------------------- liveness files
@@ -5417,12 +5417,20 @@ class Scheduler:
              cârpă). founder-targeted escalations are NOT first-noticed here (they
              are the founder's domain via the trade-off-card path, not the
              architect's first-notice channel).
-          2a. OPEN-TOO-LONG: ``open`` with ``created_at`` older than
-             ``stuck_escalation_threshold_min`` and not yet bumped this episode ->
-             bump ``target`` ONE rung up the ladder, page the NEW rung, emit
-             ``escalation_bumped``. Latched once per escalation episode (a single
-             immutable ``created_at`` crosses the line once) so it never climbs to
-             founder on one tick-storm nor re-pages every tick.
+          2a. OPEN-TOO-LONG: ``open`` whose ``created_at`` age says it should sit
+             HIGHER on the ladder than its current ``target`` -> bump straight to
+             the age-derived rung, page that rung, emit ``escalation_bumped``. The
+             expected rung is ``min(age // threshold, len(ladder)-1)``: one
+             threshold old -> ``main_architect``, two -> ``founder``, then clamps.
+             STATELESS (no per-episode latch): the comparison ``current_idx <
+             expected_idx`` IS the latch — once ``target == ladder[expected_idx]``
+             it won't re-fire until age crosses the NEXT threshold, and at founder
+             ``expected_idx`` is pinned at the cap so it never re-pages. The climb
+             reaches the founder (the durability point: the founder is the backstop
+             when the architect session is dead, D-0042) yet never cascades — at
+             most one bump per escalation per tick, and the persisted target (which
+             survives restart) replaces the old in-memory ``_escalation_bumped_at``
+             as both the climb latch and the delivery-retry guard.
           2b. RESOLVED-NOT-ADVANCED (the incident-[20] pin): ``resolved`` with
              ``resolved_at`` older than the threshold AND the unit STILL in
              ``ESCALATED`` (the resolution never got picked up) -> page the current
@@ -5438,6 +5446,11 @@ class Scheduler:
         backstop. Latches self-prune to the live read so a re-opened escalation
         (fresh id) re-arms cleanly."""
         threshold = self._cfg.escalation.stuck_escalation_threshold_min
+        # ONE wall-clock snapshot for the whole tick — the SAME source the DB age
+        # filters use (datetime.now(UTC) vs the created_at written by utc_now), so
+        # the (2a) climb shares one clock with no intra-tick skew. Tests drive an
+        # old created_at exactly like the decision-latency path.
+        now = datetime.now(UTC)
         conn = self._db.read()
         open_now = fdb.list_escalations_by_status(conn, "open")
         open_ids = {e.id for e in open_now}
@@ -5469,12 +5482,36 @@ class Scheduler:
                     payload={"escalation_id": esc.id, "target": esc.target},
                 )
 
-        # --- (2a) open-too-long: bump one rung UP + re-page the NEW rung, once.
+        # --- (2a) open-too-long: STATELESS age-derived climb. Bump straight to the
+        # rung the escalation's AGE says it should be at; the persisted target is
+        # the latch (no _escalation_bumped_at). One threshold old -> main_architect,
+        # two -> founder, then clamps. The founder is the durable backstop when the
+        # architect session is dead (D-0042). At most one bump per esc per tick, and
+        # it won't re-fire until age crosses the NEXT threshold.
+        ladder = ESCALATION_TARGET_LADDER
         for esc in fdb.list_escalations_by_status(conn, "open", older_than_min=threshold):
             assert esc.id is not None
-            if esc.id in self._escalation_bumped_at:
-                continue  # already bumped this episode (one immutable created_at)
-            new_target = next_escalation_target(esc.target)
+            try:
+                current_idx = ladder.index(esc.target)
+            except ValueError:
+                continue  # unknown target (off-ladder) -> never guess forward, no-op
+            # Age in whole minutes from the SAME wall clock the DB filter used.
+            age_min = max(
+                0,
+                int(
+                    (
+                        now
+                        - datetime.strptime(esc.created_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                            tzinfo=UTC
+                        )
+                    ).total_seconds()
+                    // 60
+                ),
+            )
+            expected_idx = min(age_min // threshold, len(ladder) - 1)
+            if current_idx >= expected_idx:
+                continue  # already at/above where its age says -> implicit latch + clamp
+            new_target = ladder[expected_idx]
             streak_key = ("escalation_bumped", esc.id)
             delivered = await self._notify_architect(
                 f"escaladare blocată de peste {threshold} min, ridicată la "
@@ -5484,13 +5521,10 @@ class Scheduler:
                 context={"kind": "escalation_bumped", "escalation_id": esc.id},
             )
             if not delivered:
-                continue  # un-latched, target un-bumped -> retried next tick
-            self._escalation_bumped_at[esc.id] = new_target
+                continue  # page failed -> target un-bumped, no event -> retried next tick
             with self._db.transaction() as tx:
-                # Target relabel ONLY; status/resolution untouched. A no-op when
-                # already at founder (the ladder clamps) — we still re-page founder.
-                if new_target != esc.target:
-                    fdb.bump_escalation_target(tx, esc.id, new_target)
+                # Target relabel ONLY; status/resolution untouched.
+                fdb.bump_escalation_target(tx, esc.id, new_target)
                 fdb.insert_event(
                     tx,
                     unit_level=esc.unit_level,
@@ -5546,11 +5580,10 @@ class Scheduler:
 
         # Self-prune the latches to the live read: an escalation that closed
         # (no longer open) or whose unit advanced (no longer a stuck-resolved
-        # episode) drops out, so a future re-open with a fresh id re-arms.
+        # episode) drops out, so a future re-open with a fresh id re-arms. The
+        # (2a) climb keeps NO latch (stateless — the persisted target is the
+        # latch), so nothing to prune for it.
         self._escalation_opened_notified &= open_ids
-        self._escalation_bumped_at = {
-            esc_id: tgt for esc_id, tgt in self._escalation_bumped_at.items() if esc_id in open_ids
-        }
         self._escalation_stuck_resolved_notified &= resolved_ids
 
     async def _stall_detector(

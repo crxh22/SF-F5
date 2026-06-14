@@ -1044,34 +1044,66 @@ def _escalation_row(db, esc_id: int) -> dict:
     )
 
 
-async def test_stuck_open_escalation_bumps_target_and_pages(db, config_dict) -> None:
-    """Case (a): an OPEN escalation older than the threshold is bumped ONE rung up
-    the ladder + pages the NEW rung once. Second tick does NOT re-bump (latch)."""
+def _set_created_at(db, esc_id: int, created_at: str) -> None:
+    """Re-age an open escalation's created_at clock between ticks (simulating the
+    passage of time so the stateless (2a) age-derived climb advances a rung)."""
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE escalations SET created_at = ? WHERE id = ?", (created_at, esc_id)
+        )
+
+
+async def test_stuck_open_escalation_climbs_to_founder_spaced(db, config_dict) -> None:
+    """Case (2a) — STATELESS age-derived spaced climb to the founder. At age ∈
+    [threshold, 2·threshold) the target reaches main_architect; at age ≥ 2·threshold
+    it reaches founder; then clamps. NO cascade: at most one bump per tick, and the
+    SAME age on the next tick does not re-bump (the persisted target is the latch)."""
     cfg = make_config(config_dict)
+    threshold = cfg.escalation.stuck_escalation_threshold_min  # 30
     insert_phase(db, "ph")
     insert_stage(db, "s1", "ph", StageState.ESCALATED)
-    # 40 min old (threshold 30) and architect-targeted -> over the open line.
-    esc_id = _insert_escalation(db, unit_id="s1", target="phase_architect", created_at=_min_ago(40))
+    # One threshold old -> expected rung main_architect (one rung up, NOT founder).
+    esc_id = _insert_escalation(
+        db, unit_id="s1", target="phase_architect", created_at=_min_ago(threshold + 1)
+    )
     sm = StateMachine(db)
     scheduler, notify = make_scheduler(
         db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
     )
     await run_blocked(scheduler)
 
-    assert _escalation_row(db, esc_id)["target"] == "main_architect"  # bumped one rung
+    assert _escalation_row(db, esc_id)["target"] == "main_architect"  # one rung, not founder
     assert _escalation_row(db, esc_id)["status"] == "open"  # status untouched
     bumped = events_of(db, "s1", "escalation_bumped")
-    assert len(bumped) == 1
+    assert len(bumped) == 1  # exactly ONE bump this tick (no cascade to founder)
     payload = json.loads(bumped[0]["payload_json"])
     assert payload["from_target"] == "phase_architect"
     assert payload["to_target"] == "main_architect"
     bump_pushes = [p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]
     assert len(bump_pushes) == 1 and bump_pushes[0][2] == "max"
 
-    await run_blocked(scheduler)  # latch holds: no second bump, no second page
+    await run_blocked(scheduler)  # SAME age -> no re-bump (target == expected rung)
     assert _escalation_row(db, esc_id)["target"] == "main_architect"
     assert len(events_of(db, "s1", "escalation_bumped")) == 1
     assert len([p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]) == 1
+
+    # Age past TWO thresholds -> the climb now reaches the founder (the durable
+    # backstop when the architect session is dead, D-0042).
+    _set_created_at(db, esc_id, _min_ago(2 * threshold + 1))
+    await run_blocked(scheduler)
+
+    assert _escalation_row(db, esc_id)["target"] == "founder"  # reached the founder rung
+    bumped = events_of(db, "s1", "escalation_bumped")
+    assert len(bumped) == 2  # one more bump (main_architect -> founder), still one/tick
+    payload = json.loads(bumped[-1]["payload_json"])
+    assert payload["from_target"] == "main_architect"
+    assert payload["to_target"] == "founder"
+    assert len([p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]) == 2
+
+    await run_blocked(scheduler)  # clamped at founder -> no further bump/page
+    assert _escalation_row(db, esc_id)["target"] == "founder"
+    assert len(events_of(db, "s1", "escalation_bumped")) == 2
+    assert len([p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]) == 2
 
 
 async def test_stuck_resolved_not_advanced_pages(db, config_dict) -> None:
@@ -1185,8 +1217,13 @@ async def test_open_notice_skips_founder_target(db, config_dict) -> None:
 
 
 async def test_ladder_clamps_at_founder(db, config_dict) -> None:
-    """A founder-targeted escalation over the open threshold is bumped to founder
-    (a no-op relabel — no infinite climb) but STILL pages founder once."""
+    """A founder-targeted OPEN escalation over the open threshold is a NO-OP: the
+    founder is the ladder cap, so its current rung is never BELOW the age-expected
+    rung (current_idx 2 >= expected_idx, capped at 2) — no relabel, no event, no
+    page. (Semantics change vs the old single-bump, which self-bumped founder->founder
+    and re-paged founder; the stateless age-derived climb has nowhere higher to go,
+    so it correctly stays silent — the founder is reached via the climb FROM the
+    architect rungs, never by re-paging an already-founder escalation.)"""
     cfg = make_config(config_dict)
     insert_phase(db, "ph")
     insert_stage(db, "s1", "ph", StageState.ESCALATED)
@@ -1198,15 +1235,11 @@ async def test_ladder_clamps_at_founder(db, config_dict) -> None:
     await run_blocked(scheduler)
 
     assert _escalation_row(db, esc_id)["target"] == "founder"  # clamped, unchanged
-    bumped = events_of(db, "s1", "escalation_bumped")
-    assert len(bumped) == 1
-    payload = json.loads(bumped[0]["payload_json"])
-    assert payload["from_target"] == "founder" and payload["to_target"] == "founder"
-    bump_pushes = [p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]
-    assert len(bump_pushes) == 1  # still pages founder
+    assert events_of(db, "s1", "escalation_bumped") == []  # no infinite climb, no self-bump
+    assert [p for p in _arhitect_pushes(notify) if "ridicată" in p[0]] == []  # no founder spam
 
-    await run_blocked(scheduler)  # latch: no infinite re-climb
-    assert len(events_of(db, "s1", "escalation_bumped")) == 1
+    await run_blocked(scheduler)  # still silent (clamped)
+    assert events_of(db, "s1", "escalation_bumped") == []
 
 
 async def test_stuck_detector_delivery_failure_logs_once(db, config_dict) -> None:
