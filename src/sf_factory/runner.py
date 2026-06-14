@@ -315,6 +315,12 @@ class CodexAdapter:
         cmd += ["--json", "--skip-git-repo-check", "--sandbox", "workspace-write"]
         if route.model != "default":  # 'default' = let the codex config decide (D-0005)
             cmd += ["--model", route.model]
+        if route.effort is not None:
+            # D-0038: codex reasoning level via a config override (`-c key=value`,
+            # CLI-verified 0.139.0). The value is a TOML string — the literal
+            # double-quotes are part of the override syntax (`-c model="o3"`), so
+            # they must reach argv verbatim (no shell to strip them).
+            cmd += ["-c", f'model_reasoning_effort="{route.effort}"']
         # CCR-8: prompt on stdin — `-` = "instructions are read from stdin"
         # (both `codex exec` and `codex exec resume`). CLI-verified 2026-06-12
         # against the installed codex-cli 0.139.0:

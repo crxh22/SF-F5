@@ -92,25 +92,23 @@ class TestGoldenRealConfig:
         assert cfg.projects["erp"].test_command == "bash scripts/test.sh"
 
     def test_effort_routing_ratified(self, cfg: FactoryConfig):
-        # CCR-6 (12-06-2026): per-role claude reasoning effort. Omissions are
-        # deliberate: main_architect (interactive — the launcher owns --effort),
-        # cp1_triage (haiku), integration_validator + auditor_cross_model (codex).
+        # CCR-6 (12-06-2026) + D-0038: per-role reasoning effort. The codex roles
+        # (integration_validator, auditor_cross_model) now carry xhigh too (gpt-5.5
+        # via `-c model_reasoning_effort`). Omissions remain deliberate:
+        # main_architect (interactive — the launcher owns --effort), cp1_triage (haiku).
         for role in (
             "phase_architect",
             "spec_agent",
             "builder_heavy",
             "validator_structural",
             "auditor_same_model",
+            "integration_validator",
+            "auditor_cross_model",
         ):
             assert cfg.models[role].effort == "xhigh", role
         for role in ("builder_routine", "validator", "decision_session"):
             assert cfg.models[role].effort == "high", role
-        for role in (
-            "main_architect",
-            "cp1_triage",
-            "integration_validator",
-            "auditor_cross_model",
-        ):
+        for role in ("main_architect", "cp1_triage"):
             assert cfg.models[role].effort is None, role
 
     def test_usage_limit_signatures_shape(self, cfg: FactoryConfig):
@@ -137,16 +135,16 @@ class TestGoldenRealConfig:
         # CCR-10 (dashboard design §11.1): pricing.usd_per_mtok keyed by LEDGER
         # model strings — VALUES are founder-tunable, the structure is not. The
         # claude route models + 'default' (codex ledger rows) must be priced so
-        # NULL-cost rows estimate instead of hitting the missing-price marker;
-        # 'opus-4-8' is the D-0025 downshift reservation (F10: dead-config
-        # comment, not a route).
+        # NULL-cost rows estimate instead of hitting the missing-price marker.
+        # 'opus' is the D-0038 live heavy-role model (the D-0025 downshift
+        # reservation, formerly keyed 'opus-4-8', became real on the Fable outage).
         table = cfg.pricing.usd_per_mtok
         route_models = {
             route.model for route in cfg.models.values() if route.cli == "claude"
         }
         assert route_models <= set(table)
         assert "default" in table  # codex ledger rows record model 'default'
-        assert "opus-4-8" in table
+        assert "opus" in table
         for model, price in table.items():
             assert price.input > 0, model
             assert price.output > 0, model
@@ -375,15 +373,20 @@ class TestCrossChecks:
         config_dict["process"]["loop_tick_s"] = 1
         _expect_config_error(tmp_path, config_dict, match="staleness")
 
-    def test_effort_on_codex_route_rejected(self, tmp_path, config_dict):
-        # CCR-6: codex has no effort knob — a route declaring one would
-        # silently no-op; the error names the offending role.
+    def test_codex_effort_accepted_but_max_rejected(self, tmp_path, config_dict):
+        # D-0038: codex DOES carry a reasoning knob now (gpt-5.5,
+        # `-c model_reasoning_effort`). Valid codex levels load; 'max' is
+        # claude-only and is rejected fail-explicit, naming the offending role.
         config_dict["models"]["auditor_cross_model"] = {
             "cli": "codex",
-            "model": "default",
+            "model": "gpt-5.5",
             "mode": "print",
-            "effort": "high",
+            "effort": "xhigh",
         }
+        ok_path = tmp_path / "codex_xhigh.yaml"
+        ok_path.write_text(yaml.safe_dump(config_dict), encoding="utf-8")
+        load_config(ok_path)  # valid codex effort: loads without error
+        config_dict["models"]["auditor_cross_model"]["effort"] = "max"
         _expect_config_error(tmp_path, config_dict, match="auditor_cross_model")
 
     def test_effort_on_stub_route_rejected(self, tmp_path, config_dict):

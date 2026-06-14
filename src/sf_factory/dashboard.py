@@ -371,11 +371,12 @@ GLOSS: Mapping[str, str] = {
     "capacity_probe": "sondă de capacitate",
     # ledger model tokens (§11/F6: models.*.model values + pricing.usd_per_mtok
     # keys; codex rows record 'default' — the §11.5.4 attribution watch item)
-    "fable": "Claude Fable",
+    "fable": "Claude Fable",   # retained: historical ledger rows (foundation work built pre-D-0038)
     "sonnet": "Claude Sonnet",
     "haiku": "Claude Haiku",
-    "opus-4-8": "Claude Opus 4.8",
-    "default": "codex — model implicit",
+    "opus": "Claude Opus 4.8",   # D-0038: live heavy-role model (ledger records alias 'opus')
+    "default": "codex — model implicit",   # retained: historical codex ledger rows
+    "gpt-5.5": "Codex GPT-5.5",   # D-0038: live codex model
 }
 
 #: §10.2 state -> chip category (running=accent, blocked/awaiting=warn,

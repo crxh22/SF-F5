@@ -18,17 +18,22 @@ projects:
 
 models:
   # role -> CLI + model alias (resolved by the respective CLI). Cross-model pairs per D-0003.
-  # effort (CCR-6) omitted on purpose where the knob does not apply: main_architect (interactive — the founder launcher owns --effort), cp1_triage (haiku does not support effort), integration_validator + auditor_cross_model (codex has no effort knob).
-  main_architect:        {cli: claude, model: fable,   mode: interactive}
-  phase_architect:       {cli: claude, model: fable,   mode: print, effort: xhigh}
-  spec_agent:            {cli: claude, model: fable,   mode: print, effort: xhigh}
+  # effort (CCR-6) omitted on purpose where the knob does not apply: main_architect (interactive — the founder launcher owns --effort), cp1_triage (haiku does not support effort).
+  # D-0038: codex roles now carry effort too — gpt-5.5 reasoning level via `-c model_reasoning_effort="xhigh"` (codex tops at xhigh; founder-directed).
+  # D-0038 (14-06-2026): Fable went 404/model_not_found (indefinite); the 7 fable
+  # roles below rerouted fable→opus (founder-approved 'A'). Capability downshift
+  # (Fable is Mythos-tier, above Opus) — watch escalation frequency on heavy stages
+  # per DoD §13; finer stage granularity is the registered trigger-gated response.
+  main_architect:        {cli: claude, model: opus,    mode: interactive}
+  phase_architect:       {cli: claude, model: opus,    mode: print, effort: xhigh}
+  spec_agent:            {cli: claude, model: opus,    mode: print, effort: xhigh}
   builder_routine:       {cli: claude, model: sonnet,  mode: print, effort: high}
-  builder_heavy:         {cli: claude, model: fable,   mode: print, effort: xhigh}
+  builder_heavy:         {cli: claude, model: opus,    mode: print, effort: xhigh}
   validator:             {cli: claude, model: sonnet,  mode: print, effort: high}
-  validator_structural:  {cli: claude, model: fable,   mode: print, effort: xhigh}
-  integration_validator: {cli: codex,  model: default, mode: print}   # cross-model preferred (DoD §5.2)
-  auditor_same_model:    {cli: claude, model: fable,   mode: print, effort: xhigh}
-  auditor_cross_model:   {cli: codex,  model: default, mode: print}
+  validator_structural:  {cli: claude, model: opus,    mode: print, effort: xhigh}
+  integration_validator: {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}   # cross-model preferred (DoD §5.2)
+  auditor_same_model:    {cli: claude, model: opus,    mode: print, effort: xhigh}
+  auditor_cross_model:   {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
   # CCR-11 (D-0037): the capacity governor's hold-exit canary — cheapest claude
   # print run; an ordinary registered agent run (process registry + ledger).
@@ -36,7 +41,7 @@ models:
   # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
   # enforcement); founder-facing trade-off reasoning warrants the strongest model
   # (D-0017, OPEN-D3 resolved).
-  decision_session:      {cli: claude, model: fable,   mode: print, tools: none, effort: high}
+  decision_session:      {cli: claude, model: opus,    mode: print, tools: none, effort: high}
 
 budgets:
   per_stage:                          # tokens per stage by risk class; keys mirror risk_classes
@@ -82,10 +87,12 @@ pricing:
     fable:    {input: 10,   output: 50}
     sonnet:   {input: 3,    output: 15}
     haiku:    {input: 1,    output: 5}
-    opus-4-8: {input: 5,    output: 25}   # reserved for the D-0025 downshift candidate — no route uses it today
-    # codex ledger rows record model 'default'; values operator-estimated, to be verified against
-    # the OpenAI account — codex sums are ~ estimates either way (design §11.5.4 watch item).
+    opus:     {input: 5,    output: 25}   # D-0038: now the live heavy-role model (ledger records alias 'opus')
+    # codex ledger rows record the route model: pre-D-0038 = 'default', now = 'gpt-5.5'. Values
+    # operator-estimated, to be verified against the OpenAI account — codex sums are ~ estimates
+    # either way (design §11.5.4 watch item). 'default' retained for historical ledger rows.
     default:  {input: 1.25, output: 10}
+    gpt-5.5:  {input: 1.25, output: 10}   # D-0038: live codex model; estimate pending real invoice
 
 consultation_points:
   # The ONLY registered points. Any orchestrator LLM call outside this registry = governance breach (DoD §4),

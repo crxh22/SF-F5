@@ -34,6 +34,10 @@ set -euo pipefail
 LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 TMUX_SESSION="${SFF5_TMUX_SESSION:-sf-f5}"
+# Main-Architect model. Pinned explicitly so the session never silently inherits a
+# stale settings.json default (D-0038: Fable went 404; the launcher must NOT carry
+# the dead model forward to successor sessions). Override: SFF5_MODEL=<alias>.
+SFF5_MODEL="${SFF5_MODEL:-opus}"
 
 # Canon list (order = order in the injected block). Edit here to add/remove.
 CANON_FILES=(
@@ -63,7 +67,7 @@ fi
 
 # Direct exec when explicitly requested or when already inside tmux (no nesting).
 if [ -n "${SFF5_NO_TMUX:-}" ] || [ -n "${TMUX:-}" ]; then
-  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --effort "${SFF5_EFFORT:-xhigh}" "$@"
+  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-xhigh}" "$@"
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -71,6 +75,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --effort "${SFF5_EFFORT:-xhigh}" "$@")"
+CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-xhigh}" "$@")"
 echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
 exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"

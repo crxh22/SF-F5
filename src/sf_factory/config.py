@@ -30,9 +30,10 @@ class ModelRoute(_StrictModel):
     """cli: Literal['claude','codex','stub']; model: str; mode: Literal['print','interactive'];
     tools: Literal['all','none'] = 'all' (CCR-3/D-0017: tools-off Decision Sessions —
     structural no-write enforcement; honored by the runner adapters);
-    effort: Literal['low','medium','high','xhigh','max'] | None = None (CCR-6:
-    per-role claude `--effort` reasoning knob, §5.1 argv literal — cross-checked
-    claude-only in FactoryConfig; codex/stub have no effort knob)."""
+    effort: Literal['low','medium','high','xhigh','max'] | None = None (CCR-6/D-0038:
+    per-role reasoning knob — claude `--effort <v>`; codex `-c model_reasoning_effort=`
+    (codex tops at 'xhigh', 'max' is claude-only); cross-checked in FactoryConfig;
+    the stub CLI has no effort knob)."""
 
     cli: Literal["claude", "codex", "stub"]
     model: str
@@ -323,15 +324,28 @@ class FactoryConfig(_StrictModel):
                     raise ValueError(
                         f"risk_classes.{rc_name}.audits: {auditor!r} is not a models.* key"
                     )
-        # CCR-6: models.<role>.effort is the claude `--effort` flag (§5.1 argv
-        # literal) — codex/stub have no effort knob, so a route declaring one
-        # would silently no-op (Doctrine §7: fail-explicit at load).
+        # CCR-6 + D-0038: per-role reasoning effort. claude → `--effort <v>`
+        # (§5.1 argv literal); codex (gpt-5.x) → `-c model_reasoning_effort="<v>"`
+        # (codex tops at 'xhigh' — 'max' is claude-only). The stub CLI has no
+        # effort knob. A misrouted/over-ranged effort fails at load, never silently
+        # no-ops (Doctrine §7).
+        codex_efforts = {"low", "medium", "high", "xhigh"}
         for role_name, route in self.models.items():
-            if route.effort is not None and route.cli != "claude":
-                raise ValueError(
-                    f"models.{role_name}: effort={route.effort!r} requires cli='claude',"
-                    f" got cli={route.cli!r} — codex/stub have no effort knob"
-                )
+            if route.effort is None:
+                continue
+            if route.cli == "claude":
+                continue
+            if route.cli == "codex":
+                if route.effort not in codex_efforts:
+                    raise ValueError(
+                        f"models.{role_name}: effort={route.effort!r} is not a codex "
+                        f"reasoning level ({sorted(codex_efforts)}; 'max' is claude-only)"
+                    )
+                continue
+            raise ValueError(
+                f"models.{role_name}: effort={route.effort!r} requires cli='claude' or "
+                f"'codex', got cli={route.cli!r} — the stub CLI has no effort knob"
+            )
         # Consultation registry: unique ids; each role resolvable to a model route
         # (the runner spawns CP calls via config.models[role], design §4/§5.1).
         seen_ids: set[str] = set()

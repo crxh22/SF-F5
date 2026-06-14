@@ -267,6 +267,18 @@ def test_codex_build_cmd_and_default_model() -> None:
     ]
 
 
+def test_codex_build_cmd_reasoning_effort() -> None:
+    # D-0038: codex reasoning level via `-c model_reasoning_effort="<v>"` — the
+    # literal double-quotes are part of the TOML override syntax and must reach
+    # argv verbatim (no shell). gpt-5.5 + xhigh is the founder-directed route.
+    route = ModelRoute(cli="codex", model="gpt-5.5", mode="print", effort="xhigh")
+    assert CodexAdapter().build_cmd(route, "audit it") == [
+        "codex", "exec", "--json", "--skip-git-repo-check",
+        "--sandbox", "workspace-write", "--model", "gpt-5.5",
+        "-c", 'model_reasoning_effort="xhigh"', "-",
+    ]
+
+
 def test_codex_build_cmd_resume_subcommand() -> None:
     # Amended by CCR-8: `-` positional — `codex exec resume [SESSION_ID]
     # [PROMPT]` documents the same stdin contract for `-`.

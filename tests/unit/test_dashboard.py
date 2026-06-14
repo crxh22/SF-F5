@@ -1645,7 +1645,7 @@ def test_decision_session_route_is_tools_off_claude_in_golden_config(
     flagset (pinned here + in test_runner's adapter tests)."""
     golden = load_config(real_config_path)
     route = golden.models["decision_session"]
-    assert route.cli == "claude" and route.model == "fable" and route.tools == "none"
+    assert route.cli == "claude" and route.model == "opus" and route.tools == "none"
     argv = ADAPTERS["claude"].build_cmd(route, "discuss")
     index = argv.index("--tools")
     assert argv[index + 1] == ""  # the FULL built-in set disabled
