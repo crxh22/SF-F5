@@ -852,15 +852,26 @@ class AgentRunner:
         """Assemble the canon bundle for the role class (D-0009): consultation
         points get cfg.canon.inject.consultation_points (empty by default),
         founder-facing roles the founder_facing bundle, every other pipeline
-        agent the pipeline_agents bundle. Missing/empty canon file = spawn
-        impossibility — a partial canon is worse than a noisy stop."""
+        agent the pipeline_agents bundle. D-0040: the architect layer
+        (cfg.canon.inject.architect) is then COMPOSED on top for roles in
+        cfg.canon.architect_roles — additive, not exclusive, so a role that is
+        both founder-facing and architect gets the union (deduped). Missing/empty
+        canon file = spawn impossibility — a partial canon is worse than a noisy stop."""
         canon = self._cfg.canon
         if kind == "consultation":
-            keys = canon.inject.consultation_points
+            keys = list(canon.inject.consultation_points)
         elif role in canon.founder_facing_roles:
-            keys = canon.inject.founder_facing
+            keys = list(canon.inject.founder_facing)
         else:
-            keys = canon.inject.pipeline_agents
+            keys = list(canon.inject.pipeline_agents)
+        # D-0040: the architect layer is ADDITIVE — composed on top of the base
+        # bundle for architect-class roles (a role can be BOTH founder-facing and
+        # architect; it gets the union, deduped, order-preserved). Consultation
+        # calls are pure functions and never take it.
+        if kind != "consultation" and role in canon.architect_roles:
+            for key in canon.inject.architect:
+                if key not in keys:
+                    keys.append(key)
         if not keys:
             return None
         home = self._cfg.factory.home

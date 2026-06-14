@@ -21,8 +21,9 @@
 #   Override: SFF5_CANON_FILE=<path>   inject a specific file instead.
 #   Override binary: CLAUDE_BIN=<path>   (default: claude on PATH).
 #   Override tmux session name: SFF5_TMUX_SESSION=<name>.
-#   Effort: every launch passes --effort ${SFF5_EFFORT:-xhigh} (the persisted
-#   settings.json effortLevel caps at xhigh; only the flag/command reach max).
+#   Effort: every launch passes --effort ${SFF5_EFFORT:-max} (D-0040 founder
+#   directive: the Main-Architect session runs at MAX — the persisted
+#   settings.json effortLevel caps at xhigh, only the flag reaches max).
 #   Override: SFF5_EFFORT=low|medium|high|xhigh|max.
 # Fail-fast: any canon file missing/empty -> abort launch (a partial canon in
 # the system prompt is worse than a noisy stop). tmux missing -> abort with a
@@ -44,6 +45,9 @@ CANON_FILES=(
   "00 - DOCTRINA.md"
   "work-protocols/conventions.md"
   "work-protocols/protocol_interactiune_founder.md"
+  "work-protocols/architect-operations.md"   # D-0040: the Main-Architect session is BOTH
+                                              # founder-facing AND architect — the launcher composes
+                                              # a flat union, so it carries the architect layer too.
 )
 
 if [ -n "${SFF5_CANON_FILE:-}" ]; then
@@ -67,7 +71,7 @@ fi
 
 # Direct exec when explicitly requested or when already inside tmux (no nesting).
 if [ -n "${SFF5_NO_TMUX:-}" ] || [ -n "${TMUX:-}" ]; then
-  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-xhigh}" "$@"
+  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "$@"
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -75,6 +79,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-xhigh}" "$@")"
+CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "$@")"
 echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
 exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"

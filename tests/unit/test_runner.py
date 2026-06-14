@@ -40,6 +40,7 @@ from sf_factory.runner import (
 CANON_DOCTRINE = "doctrine body marker-D\n"
 CANON_CONVENTIONS = "conventions body marker-C\n"
 CANON_FOUNDER = "founder protocol body marker-F\n"
+CANON_ARCHITECT = "architect operations body marker-A\n"  # D-0040
 
 
 def _write_canon_files(home: Path) -> None:
@@ -49,6 +50,9 @@ def _write_canon_files(home: Path) -> None:
     (protocols / "conventions.md").write_text(CANON_CONVENTIONS, encoding="utf-8")
     (protocols / "protocol_interactiune_founder.md").write_text(
         CANON_FOUNDER, encoding="utf-8"
+    )
+    (protocols / "architect-operations.md").write_text(  # D-0040
+        CANON_ARCHITECT, encoding="utf-8"
     )
 
 
@@ -454,6 +458,22 @@ async def test_canon_founder_facing_bundle(renv: SimpleNamespace) -> None:
     )
     cmdline = _proc_rows(renv.db)[0]["cmdline"]
     assert CANON_FOUNDER.strip() in cmdline
+
+
+def test_canon_architect_layer_composition(renv: SimpleNamespace) -> None:
+    """D-0040: the architect layer is ADDITIVE, not an exclusive bundle. A role
+    that is BOTH founder-facing and architect gets the union; an architect-only
+    pipeline role gets base+architect without founder_protocol; a plain pipeline
+    role gets neither; consultation never takes it."""
+
+    def markers(role: str, kind: str = "agent") -> tuple[bool, bool]:
+        txt = renv.runner._canon_text(role=role, kind=kind) or ""
+        return (CANON_FOUNDER.strip() in txt, CANON_ARCHITECT.strip() in txt)
+
+    assert markers("phase_architect") == (True, True)   # founder-facing AND architect → union
+    assert markers("spec_agent") == (False, True)        # architect, not founder-facing
+    assert markers("builder_routine") == (False, False)  # plain pipeline → neither
+    assert markers("spec_agent", "consultation") == (False, False)  # pure function: no layer
 
 
 async def test_consultation_gets_no_canon_and_is_tagged(renv: SimpleNamespace) -> None:

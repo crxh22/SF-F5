@@ -432,3 +432,6 @@ def _write_canon_files(home: Path) -> None:
     (protocols / "protocol_interactiune_founder.md").write_text(
         "founder protocol body\n", encoding="utf-8"
     )
+    (protocols / "architect-operations.md").write_text(  # D-0040
+        "architect operations body\n", encoding="utf-8"
+    )

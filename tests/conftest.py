@@ -161,12 +161,15 @@ def config_dict(tmp_path: Path) -> dict[str, Any]:
                 "doctrine": "00 - DOCTRINA.md",
                 "conventions": "work-protocols/conventions.md",
                 "founder_protocol": "work-protocols/protocol_interactiune_founder.md",
+                "architect_ops": "work-protocols/architect-operations.md",
             },
             "inject": {
                 "pipeline_agents": ["doctrine", "conventions"],
                 "founder_facing": ["doctrine", "conventions", "founder_protocol"],
                 "consultation_points": [],
+                "architect": ["architect_ops"],
             },
+            "architect_roles": ["main_architect", "phase_architect", "spec_agent"],
             "founder_facing_roles": [
                 "intake",
                 "decision_session",

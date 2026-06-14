@@ -259,6 +259,11 @@ class CanonInjectCfg(_StrictModel):
     pipeline_agents: list[str]
     founder_facing: list[str]
     consultation_points: list[str]
+    # D-0040: an ADDITIVE layer (not an exclusive bundle) — appended on top of a
+    # role's base bundle when the role is in canon.architect_roles. Default empty
+    # = pre-D-0040 behavior (no architect layer). The Main-Architect session takes
+    # this layer via the launcher's flat CANON_FILES instead.
+    architect: list[str] = []
 
 
 class CanonCfg(_StrictModel):
@@ -267,11 +272,15 @@ class CanonCfg(_StrictModel):
     files: dict[str, str]
     inject: CanonInjectCfg
     founder_facing_roles: list[str]
+    # D-0040: roles that receive the additive architect layer on top of their base
+    # bundle (composition, not an exclusive bundle — a role may be both
+    # founder-facing AND architect and gets the union). Default empty.
+    architect_roles: list[str] = []
 
     @model_validator(mode="after")
     def _check_inject_refs(self) -> CanonCfg:
         declared = set(self.files)
-        for bundle_name in ("pipeline_agents", "founder_facing", "consultation_points"):
+        for bundle_name in ("pipeline_agents", "founder_facing", "consultation_points", "architect"):
             for key in getattr(self.inject, bundle_name):
                 if key not in declared:
                     raise ValueError(
