@@ -288,6 +288,9 @@ STAGE_ESCALATION_RESOLUTIONS: Mapping[str, StageState] = MappingProxyType(
         "rework:SPEC": StageState.SPEC,
         "respec": StageState.SPEC,
         "rework:VALIDATE": StageState.VALIDATE,
+        # Architect-only, for a merge-gate agent_run_failed (e.g. integration_validator
+        # overflow): re-enters ONLY the merge gate, no re-validate/re-audit. NEVER for
+        # unresolved_contest or a pre-AUDIT escalation — see architect-operations.md §3.
         "rework:MERGE_GATE": StageState.MERGE_GATE,
         "awaiting_human": StageState.AWAITING_HUMAN,
         "failed": StageState.FAILED,

@@ -41,3 +41,27 @@ Every rework re-entry you author (escalation resolution, respec, rebuild) must
 carry your rationale in the resolution `--reason`: it reaches the re-entered
 agent's prompt (rework_context). A fresh-context Spec/Build agent cannot fix what
 it cannot see — name the exact artifact, line, and the contradiction.
+
+## 3. `rework:MERGE_GATE` — only for a merge-gate failure, never to skip the gates before it
+
+`rework:MERGE_GATE` re-enters ONLY the merge gate (Tier-1 rebase+suite + Tier-2
+integration_validator) — no re-validate, no re-audit, no §9 human gate. It is the
+correct, cheap resolution for a stage that failed AT the merge gate with
+`agent_run_failed` (e.g. the integration_validator overflowed its context window):
+the structural validation and dual audit already passed and must not be re-run, and
+re-validating needlessly re-spends the (already large) stage budget — which is what
+forced this token into existence (D-0041, document-engine at 107M against the 120M
+structural cap).
+
+NEVER apply it to:
+- an **`unresolved_contest`** escalation — the gate only closes `open`
+  integration_validator findings, so the contested structural findings would be
+  left `contested` forever and the stage could merge to DONE with a dangling,
+  never-settled contest. Use `rework:VALIDATE` / `rework:BUILD`.
+- a stage that has **not yet passed AUDIT** (escalated from SPEC/BUILD) — it would
+  jump to the gate with zero structural validation and, on a critical stage,
+  bypass the founder §9 human gate. Re-enter the step that actually failed.
+
+There is deliberately **no machine guard** (Doctrine §8 — no preventive mechanism
+without an incident); this rule is the guard. A misapplication is the incident that
+would justify a code-level precondition.
