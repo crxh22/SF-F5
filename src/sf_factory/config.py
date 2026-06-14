@@ -137,6 +137,10 @@ class EscalationCfg(_StrictModel):
     churn_region_lines: int = Field(ge=1)  # divisor of the churn bucket — zero would crash
     max_context_resets: int = Field(ge=0)
     decision_latency_alert_h: int = Field(ge=1)
+    # robustness UNIT 2 / D-0042 (T_architect): an escalation OPEN longer than this
+    # (or RESOLVED-but-unit-still-ESCALATED longer than this) -> the stuck-detector
+    # bumps target one rung + pages the architect. Minutes; Doctrine §14.
+    stuck_escalation_threshold_min: int = Field(ge=1)
 
 
 class RiskClassCfg(_StrictModel):

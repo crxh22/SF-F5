@@ -65,3 +65,46 @@ NEVER apply it to:
 There is deliberately **no machine guard** (Doctrine §8 — no preventive mechanism
 without an incident); this rule is the guard. A misapplication is the incident that
 would justify a code-level precondition.
+
+## 4. Escalation routing ladder + the orchestrator's stuck-escalation detector (robustness UNIT 2, D-0042)
+
+The orchestrator now consumes `escalations.target` as a **live routing signal** — the
+durable, in-code replacement for the session-scoped bash monitor that previously was the
+architect's only notification path (D-0041/D-0042). It is a **mechanical layer only**: it
+reads, pages, and relabels `target`; it NEVER resolves an escalation, transitions a unit,
+or spawns an agent (the founder's no-resolver-agent mandate). Resolution stays your
+judgment — you still answer via `cli resolve-escalation` / the dashboard card.
+
+**The routing ladder** (`models.ESCALATION_TARGET_LADDER`, the single source consumed by
+the scheduler + glossed by the dashboard, == the `escalations.target` DDL CHECK set):
+
+```
+phase_architect  →  main_architect  →  founder
+```
+
+Creation sites write the first two by escalation nature (stage-conveyor →
+`phase_architect`, cross-cutting → `main_architect`); the detector climbs UP toward
+`founder` (the top product authority) and clamps there (no rung above founder). A bump is a
+**label + page-recipient change only** — bumping to `founder` does NOT raise a decision card
+or transition the unit (raising a card is judgment-adjacent; deferred, D-0042 Q3).
+
+**The detector** (`Scheduler._stuck_escalation_detector`, on every tick after the
+decision-latency alert) emits three distinct, machine-greppable events and pages via a
+DISTINCT **`[arhitect]`** ntfy title prefix on the ONE shared topic (D-0004 — no second
+topic; the title lets the founder relay correctly and a phone watcher disambiguate). Each
+fires ONCE per episode/rung (latched — no alarm-fatigue thrash):
+
+| event | when | action |
+|---|---|---|
+| `escalation_opened_notice` | an architect-targeted (`phase_architect`/`main_architect`) escalation is seen `open` and un-notified — **age 0, on the first tick, before any threshold** | one `[arhitect]` page → makes "the architect learns ≤5 min" (D-0042 HARD) a CODE law that survives a dead session monitor. `founder`-targeted escalations are NOT first-noticed here (they are the founder's domain via the trade-off-card path). |
+| `escalation_bumped` | `open` with `created_at` older than `escalation.stuck_escalation_threshold_min` (default 30 min) and not yet bumped this episode | bump `target` ONE rung up + re-page the NEW rung. Once per episode (a single immutable `created_at` crosses the line once — it does not climb to `founder` on a tick-storm). |
+| `escalation_stuck_resolved` | `resolved` with `resolved_at` older than the threshold AND the unit is STILL `ESCALATED` (the resolution never got picked up — incident-[20] / auth-cap starvation class) | page the current `target`. The row is already resolved; the SILENCE is the bug. The detector does NOT re-resolve / re-create / transition — UNIT 1 fixes the pickup cause; this is the loud backstop. |
+
+A delivery failure NEVER tears down the loop: it logs ONE `alert_delivery_failed` event
+per failure streak (`kind` carries which signal) and retries next tick — the same contract
+as the stall / decision-latency pages.
+
+**Your session monitor MUST grep these three event types** (and recognize `[arhitect]`
+ntfy titles) so a successor session learns of escalations within one poll of the threshold
+crossing — see `docs/runbooks/session-succession.md` for the hand-down. The ntfy `[arhitect]`
+push is the human backstop if the monitor is down.

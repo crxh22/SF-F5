@@ -420,3 +420,64 @@ class TestEscalationResolutionVocabulary:
             STAGE_ESCALATION_RESOLUTIONS["new"] = StageState.BUILD  # type: ignore[index]
         with pytest.raises(TypeError):
             PHASE_ESCALATION_RESOLUTIONS["new"] = PhaseState.RUNNING  # type: ignore[index]
+
+
+# --------------------------------------- escalation-routing ladder (robustness UNIT 2)
+
+
+class TestEscalationTargetLadder:
+    """The escalate-UP ladder the stuck-detector climbs (D-0042). Pins the ladder
+    is the single source for the routing vocabulary and stays in lock-step with
+    the escalations.target DDL CHECK set ∪ {founder} (design §UNIT 2)."""
+
+    def test_ladder_equals_ddl_target_check_set(self):
+        """The ladder values are EXACTLY the escalations.target DDL CHECK set
+        (phase_architect, main_architect, founder) — creation sites write the
+        first two, the detector bumps toward founder. If a migration changes the
+        CHECK set, this fails so the ladder is updated in lock-step."""
+        import re
+
+        from sf_factory.db import MIGRATIONS_DIR
+        from sf_factory.models import ESCALATION_TARGET_LADDER
+
+        ddl = (MIGRATIONS_DIR / "0001_init.sql").read_text(encoding="utf-8")
+        m = re.search(r"target\s+TEXT NOT NULL CHECK \(target IN \(([^)]*)\)\)", ddl)
+        assert m, "could not locate escalations.target CHECK in the init migration"
+        check_set = {tok.strip().strip("'") for tok in m.group(1).split(",")}
+        assert set(ESCALATION_TARGET_LADDER) == check_set
+        # Ordered low->high authority; founder is the top rung.
+        assert ESCALATION_TARGET_LADDER[-1] == "founder"
+
+    def test_ladder_matches_dashboard_gloss_tokens(self):
+        """The dashboard glosses every ladder rung (dashboard.py §10.4) — a bumped
+        target never renders bare. One source, kept in sync (design pin)."""
+        from sf_factory.dashboard import GLOSS
+        from sf_factory.models import ESCALATION_TARGET_LADDER
+
+        for rung in ESCALATION_TARGET_LADDER:
+            assert rung in GLOSS, rung
+
+    def test_next_target_climbs_one_rung(self):
+        from sf_factory.models import next_escalation_target
+
+        assert next_escalation_target("phase_architect") == "main_architect"
+        assert next_escalation_target("main_architect") == "founder"
+
+    def test_next_target_clamps_at_founder(self):
+        """No infinite climb: the top rung bumps to itself (the detector still
+        re-pages founder, but never invents a rung above it)."""
+        from sf_factory.models import next_escalation_target
+
+        assert next_escalation_target("founder") == "founder"
+
+    def test_next_target_unknown_is_returned_unchanged(self):
+        """An off-ladder value is never guessed forward (Doctrine §7) — returned
+        as-is (treated as already at the top); the detector still pages it."""
+        from sf_factory.models import next_escalation_target
+
+        assert next_escalation_target("nonsense") == "nonsense"
+
+    def test_ladder_is_a_tuple_immutable(self):
+        from sf_factory.models import ESCALATION_TARGET_LADDER
+
+        assert isinstance(ESCALATION_TARGET_LADDER, tuple)

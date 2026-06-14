@@ -85,6 +85,7 @@ from sf_factory.models import (
     TransitionError,
     Trigger,
     new_id,
+    next_escalation_target,
     sched_category,
     utc_now,
 )
@@ -4678,6 +4679,21 @@ class Scheduler:
         #: One alert_delivery_failed event per consecutive-failure streak (the
         #: retry itself continues every tick; only the event is deduplicated).
         self._delivery_failed_logged: set[object] = set()
+        #: Stuck-escalation detector latches (robustness UNIT 2). Each fires ONCE
+        #: per episode/rung so the §9 channel never thrashes (alarm fatigue):
+        #:  • _escalation_opened_notified — open architect-targeted escalations
+        #:    already given their first-notice page (Q2 ≤5-min law);
+        #:  • _escalation_bumped_at — esc_id → the target it was last bumped TO, so
+        #:    a second tick at the same rung does not re-bump (re-fires only after
+        #:    the NEXT threshold crossing for the NEW rung);
+        #:  • _escalation_stuck_resolved_notified — resolved-but-unadvanced episodes
+        #:    already paged once.
+        #: All keyed by esc_id and self-clearing: an esc_id absent from the live
+        #: open/resolved read is pruned each tick (the escalation closed/advanced),
+        #: so a future re-open with a fresh id re-arms cleanly.
+        self._escalation_opened_notified: set[int] = set()
+        self._escalation_bumped_at: dict[int, str] = {}
+        self._escalation_stuck_resolved_notified: set[int] = set()
 
     # ----------------------------------------------------------- liveness files
 
@@ -5052,6 +5068,7 @@ class Scheduler:
                     scan = self._scan_units()
                     await self._stall_detector(scan)
                     await self._decision_latency_alerts()
+                    await self._stuck_escalation_detector(scan)
                     if self._governor is not None:
                         # CCR-11 (D-0037): hold-exit probe — a no-op unless a
                         # capacity hold is active and the interval elapsed; a
@@ -5345,6 +5362,196 @@ class Scheduler:
                         "alert_after_h": self._cfg.escalation.decision_latency_alert_h,
                     },
                 )
+
+    async def _notify_architect(
+        self, title: str, *, link: str | None, streak_key: object, context: dict
+    ) -> bool:
+        """Page the architect (robustness UNIT 2, reused by UNIT 3). There is ONE
+        ntfy topic (the founder's, D-0004); the architect signal is a DISTINCT
+        ``[arhitect]`` title prefix on that same topic — the founder relays it and
+        a phone watcher disambiguates, while the GREPPABLE event the caller writes
+        is the architect monitor's machine signal. Delivery failure NEVER raises:
+        it logs ONE ``alert_delivery_failed`` event per consecutive-failure streak
+        (``streak_key`` in ``_delivery_failed_logged``) and returns ``False`` so the
+        caller leaves its own latch un-set and retries next tick — the exact
+        ``_decision_latency_alerts`` contract. Returns ``True`` on delivery."""
+        try:
+            await self._notify.publish(
+                f"[arhitect] {title}",
+                link=link,
+                priority=self._notify.priority_alert,
+            )
+        except NotifyError as exc:
+            if streak_key not in self._delivery_failed_logged:
+                self._delivery_failed_logged.add(streak_key)
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert_delivery_failed",
+                        actor=_ACTOR,
+                        payload=context | {"error": str(exc)},
+                    )
+            return False
+        self._delivery_failed_logged.discard(streak_key)
+        return True
+
+    async def _stuck_escalation_detector(
+        self, scan: list[tuple[Level, str, SchedCategory, Phase | Stage]]
+    ) -> None:
+        """Robustness UNIT 2 (D-0042, founder-approved MECHANICAL layer): make
+        ``escalations.target`` a live routing signal and guarantee no escalation
+        sits silently. Three pure-DB-predicate behaviors, all detection + notify;
+        the ONLY mutation is a target relabel (``bump_escalation_target``). It
+        NEVER resolves, transitions a unit, or spawns an agent — the founder's
+        no-resolver-agent mandate (falsifiable: any status flip / transition /
+        spawn here is an overstep).
+
+          1. FIRST-NOTICE (Q2, the ≤5-min code law): the moment an architect-
+             targeted escalation (target ∈ {phase_architect, main_architect}) is
+             seen ``open`` and un-notified — age 0, before any threshold — emit
+             ``escalation_opened_notice`` + one ``[arhitect]`` page. This makes
+             "the architect learns within ≤5 min" a CODE law surviving a dead
+             session monitor (the whole point of replacing the session-monitor
+             cârpă). founder-targeted escalations are NOT first-noticed here (they
+             are the founder's domain via the trade-off-card path, not the
+             architect's first-notice channel).
+          2a. OPEN-TOO-LONG: ``open`` with ``created_at`` older than
+             ``stuck_escalation_threshold_min`` and not yet bumped this episode ->
+             bump ``target`` ONE rung up the ladder, page the NEW rung, emit
+             ``escalation_bumped``. Latched once per escalation episode (a single
+             immutable ``created_at`` crosses the line once) so it never climbs to
+             founder on one tick-storm nor re-pages every tick.
+          2b. RESOLVED-NOT-ADVANCED (the incident-[20] pin): ``resolved`` with
+             ``resolved_at`` older than the threshold AND the unit STILL in
+             ``ESCALATED`` (the resolution never got picked up) -> page the current
+             ``target`` + emit ``escalation_stuck_resolved``, ONCE per episode. The
+             row is already resolved; the silence is what's wrong — do NOT
+             re-resolve / re-create / transition (UNIT 1 fixes the pickup cause;
+             this is the loud backstop, D-0042 "nothing sits silently >30min").
+
+        Distinct ``escalation_*`` event kinds keep this off the stall detector's
+        turf (which only fires when there are ZERO open escalations) and out of the
+        dashboard "Ultimul incident" thrash. The architect's session monitor greps
+        these events (≤5-min via its 45s poll); the ``[arhitect]`` ntfy is the human
+        backstop. Latches self-prune to the live read so a re-opened escalation
+        (fresh id) re-arms cleanly."""
+        threshold = self._cfg.escalation.stuck_escalation_threshold_min
+        conn = self._db.read()
+        open_now = fdb.list_escalations_by_status(conn, "open")
+        open_ids = {e.id for e in open_now}
+
+        # --- (1) first-notice: architect-targeted open escalations, un-notified.
+        for esc in open_now:
+            assert esc.id is not None
+            if esc.target not in ("phase_architect", "main_architect"):
+                continue  # founder-rung escalations are not the architect's first-notice
+            if esc.id in self._escalation_opened_notified:
+                continue
+            streak_key = ("escalation_opened_notice", esc.id)
+            delivered = await self._notify_architect(
+                f"escaladare nouă către {esc.target}: {esc.unit_level} {esc.unit_id}",
+                link=dashboard_link(self._cfg, "acum"),
+                streak_key=streak_key,
+                context={"kind": "escalation_opened_notice", "escalation_id": esc.id},
+            )
+            if not delivered:
+                continue  # un-latched -> retried next tick until the page lands
+            self._escalation_opened_notified.add(esc.id)
+            with self._db.transaction() as tx:
+                fdb.insert_event(
+                    tx,
+                    unit_level=esc.unit_level,
+                    unit_id=esc.unit_id,
+                    event_type="escalation_opened_notice",
+                    actor=_ACTOR,
+                    payload={"escalation_id": esc.id, "target": esc.target},
+                )
+
+        # --- (2a) open-too-long: bump one rung UP + re-page the NEW rung, once.
+        for esc in fdb.list_escalations_by_status(conn, "open", older_than_min=threshold):
+            assert esc.id is not None
+            if esc.id in self._escalation_bumped_at:
+                continue  # already bumped this episode (one immutable created_at)
+            new_target = next_escalation_target(esc.target)
+            streak_key = ("escalation_bumped", esc.id)
+            delivered = await self._notify_architect(
+                f"escaladare blocată de peste {threshold} min, ridicată la "
+                f"{new_target}: {esc.unit_level} {esc.unit_id}",
+                link=dashboard_link(self._cfg, "acum"),
+                streak_key=streak_key,
+                context={"kind": "escalation_bumped", "escalation_id": esc.id},
+            )
+            if not delivered:
+                continue  # un-latched, target un-bumped -> retried next tick
+            self._escalation_bumped_at[esc.id] = new_target
+            with self._db.transaction() as tx:
+                # Target relabel ONLY; status/resolution untouched. A no-op when
+                # already at founder (the ladder clamps) — we still re-page founder.
+                if new_target != esc.target:
+                    fdb.bump_escalation_target(tx, esc.id, new_target)
+                fdb.insert_event(
+                    tx,
+                    unit_level=esc.unit_level,
+                    unit_id=esc.unit_id,
+                    event_type="escalation_bumped",
+                    actor=_ACTOR,
+                    payload={
+                        "escalation_id": esc.id,
+                        "from_target": esc.target,
+                        "to_target": new_target,
+                        "threshold_min": threshold,
+                    },
+                )
+
+        # --- (2b) resolved-but-unit-still-ESCALATED: page once, NEVER mutate.
+        resolved_ids: set[int] = set()
+        for esc in fdb.list_escalations_by_status(conn, "resolved", older_than_min=threshold):
+            assert esc.id is not None
+            unit = (
+                fdb.get_stage(conn, esc.unit_id)
+                if esc.unit_level == Level.STAGE.value
+                else fdb.get_phase(conn, esc.unit_id)
+            )
+            if unit is None or unit.state.value != "ESCALATED":
+                continue  # the unit advanced (or vanished) -> the resolution landed
+            resolved_ids.add(esc.id)
+            if esc.id in self._escalation_stuck_resolved_notified:
+                continue
+            streak_key = ("escalation_stuck_resolved", esc.id)
+            delivered = await self._notify_architect(
+                f"escaladare rezolvată dar neavansată de peste {threshold} min: "
+                f"{esc.unit_level} {esc.unit_id}",
+                link=dashboard_link(self._cfg, "acum"),
+                streak_key=streak_key,
+                context={"kind": "escalation_stuck_resolved", "escalation_id": esc.id},
+            )
+            if not delivered:
+                continue  # un-latched -> retried next tick until the page lands
+            self._escalation_stuck_resolved_notified.add(esc.id)
+            with self._db.transaction() as tx:
+                fdb.insert_event(
+                    tx,
+                    unit_level=esc.unit_level,
+                    unit_id=esc.unit_id,
+                    event_type="escalation_stuck_resolved",
+                    actor=_ACTOR,
+                    payload={
+                        "escalation_id": esc.id,
+                        "target": esc.target,
+                        "threshold_min": threshold,
+                    },
+                )
+
+        # Self-prune the latches to the live read: an escalation that closed
+        # (no longer open) or whose unit advanced (no longer a stuck-resolved
+        # episode) drops out, so a future re-open with a fresh id re-arms.
+        self._escalation_opened_notified &= open_ids
+        self._escalation_bumped_at = {
+            esc_id: tgt for esc_id, tgt in self._escalation_bumped_at.items() if esc_id in open_ids
+        }
+        self._escalation_stuck_resolved_notified &= resolved_ids
 
     async def _stall_detector(
         self, scan: list[tuple[Level, str, SchedCategory, Phase | Stage]]

@@ -71,6 +71,7 @@ escalation:
   churn_region_lines: 40       # hunk-bucket size for the churn detector
   max_context_resets: 1        # context_budget firings executed as reset before escalating
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
+  stuck_escalation_threshold_min: 30 # escalation open / resolved-not-advanced too long -> bump target + page architect (D-0042 T_architect)
 
 risk_classes:
   routine:    {validator: validator,            audits: []}

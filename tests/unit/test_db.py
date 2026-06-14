@@ -16,6 +16,7 @@ from sf_factory.db import (
     Database,
     answer_decision,
     bump_churn,
+    bump_escalation_target,
     deps_done,
     finalize_process,
     find_artifact_ref,
@@ -38,6 +39,7 @@ from sf_factory.db import (
     iter_latest_artifact_refs,
     last_session_id,
     latest_artifact,
+    list_escalations_by_status,
     list_units,
     mark_decision_alerted,
     mark_process_running,
@@ -1315,6 +1317,83 @@ class TestEscalationsRepo:
                                   event_type="contract_change_request",
                                   actor="builder_routine")
         assert [r["seq"] for r in conn.execute(cursor_sql, params)] == [second]
+
+    # ------------------------------- list_escalations_by_status (robustness UNIT 2)
+
+    def test_list_by_status_filters_status(self, seeded_stage: Database):
+        db = seeded_stage
+        with db.transaction() as conn:
+            open_id = insert_escalation(conn, make_escalation(trigger="max_fix_iterations"))
+            done_id = insert_escalation(conn, make_escalation(trigger="churn_threshold"))
+        with db.transaction() as conn:
+            resolve_escalation(conn, done_id, "rework:BUILD")
+        opens = list_escalations_by_status(db.read(), "open")
+        resolved = list_escalations_by_status(db.read(), "resolved")
+        assert [e.id for e in opens] == [open_id]
+        assert [e.id for e in resolved] == [done_id]
+        assert all(isinstance(e, Escalation) for e in opens + resolved)
+
+    def test_list_open_age_uses_created_at(self, seeded_stage: Database):
+        db = seeded_stage
+        old = "2000-01-01T00:00:00Z"  # far past created_at
+        fresh = "2999-01-01T00:00:00Z"  # far future created_at
+        with db.transaction() as conn:
+            old_id = insert_escalation(conn, Escalation(
+                None, "stage", "st-1", "max_fix_iterations", "phase_architect", None, None,
+                "open", None, old, None))
+            insert_escalation(conn, Escalation(
+                None, "stage", "st-1", "churn_threshold", "phase_architect", None, None,
+                "open", None, fresh, None))
+        # Threshold 30 min: the old one is over the line, the future one is not.
+        stale = list_escalations_by_status(db.read(), "open", older_than_min=30)
+        assert [e.id for e in stale] == [old_id]
+
+    def test_list_resolved_age_uses_resolved_at(self, seeded_stage: Database):
+        db = seeded_stage
+        with db.transaction() as conn:
+            old_id = insert_escalation(conn, make_escalation(trigger="max_fix_iterations"))
+            recent_id = insert_escalation(conn, make_escalation(trigger="churn_threshold"))
+        # Resolve both, then back-date ONE resolved_at far into the past.
+        with db.transaction() as conn:
+            resolve_escalation(conn, old_id, "rework:BUILD")
+            resolve_escalation(conn, recent_id, "rework:BUILD")
+            conn.execute("UPDATE escalations SET resolved_at = ? WHERE id = ?",
+                         ("2000-01-01T00:00:00Z", old_id))
+        # The recent one's resolved_at is ~now -> NOT over a 30-min line; the
+        # back-dated one is. Proves the clock is resolved_at, not created_at.
+        stale = list_escalations_by_status(db.read(), "resolved", older_than_min=30)
+        assert [e.id for e in stale] == [old_id]
+
+    # ------------------------------- bump_escalation_target (robustness UNIT 2)
+
+    def test_bump_target_relabels_only(self, seeded_stage: Database):
+        db = seeded_stage
+        with db.transaction() as conn:
+            esc_id = insert_escalation(conn, make_escalation())
+        with db.transaction() as conn:
+            bump_escalation_target(conn, esc_id, "main_architect")
+        row = db.read().execute(
+            "SELECT * FROM escalations WHERE id = ?", (esc_id,)
+        ).fetchone()
+        assert row["target"] == "main_architect"
+        # status / resolution / timestamps UNTOUCHED — target-only mutation.
+        assert row["status"] == "open"
+        assert row["resolution"] is None
+        assert row["resolved_at"] is None
+
+    def test_bump_target_missing_row_raises(self, db: Database):
+        with pytest.raises(FactoryError, match="no escalation with id"):
+            with db.transaction() as conn:
+                bump_escalation_target(conn, 999, "founder")
+
+    def test_bump_target_rejects_off_ddl_value(self, seeded_stage: Database):
+        db = seeded_stage
+        with db.transaction() as conn:
+            esc_id = insert_escalation(conn, make_escalation())
+        # The DDL CHECK still guards target — an off-ladder value is rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            with db.transaction() as conn:
+                bump_escalation_target(conn, esc_id, "ceo")
 
 
 # --------------------------------------------------------------------- findings

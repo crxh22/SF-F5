@@ -858,6 +858,48 @@ def open_escalation(
     return None if row is None else _escalation_from_row(row)
 
 
+def list_escalations_by_status(
+    conn: sqlite3.Connection, status: str, *, older_than_min: int | None = None
+) -> list[Escalation]:
+    """Escalations in ``status``; with ``older_than_min``, only those whose age
+    exceeds the threshold. The age clock is ``created_at`` for ``open`` and
+    ``resolved_at`` for ``resolved`` (the stuck-detector's two read predicates,
+    robustness UNIT 2). Mirrors ``pending_decisions(unalerted_older_than_h=…)``."""
+    if older_than_min is None:
+        rows = conn.execute(
+            "SELECT * FROM escalations WHERE status = ? ORDER BY id",
+            (status,),
+        ).fetchall()
+    else:
+        # 'resolved' ages by resolved_at (when the fix landed but the unit never
+        # advanced); everything else by created_at (open-too-long). Don't confuse
+        # the two clocks (design §UNIT 2 foot-gun 2).
+        age_column = "resolved_at" if status == "resolved" else "created_at"
+        cutoff = (datetime.now(UTC) - timedelta(minutes=older_than_min)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"  # same format as models.utc_now
+        )
+        rows = conn.execute(
+            f"SELECT * FROM escalations WHERE status = ? AND {age_column} < ? ORDER BY id",
+            (status, cutoff),
+        ).fetchall()
+    return [_escalation_from_row(row) for row in rows]
+
+
+def bump_escalation_target(
+    conn: sqlite3.Connection, esc_id: int, new_target: str
+) -> None:
+    """Re-label an escalation's routing ``target`` (robustness UNIT 2 escalate-UP).
+    Target ONLY — status/resolution/timestamps untouched (the detector NEVER
+    resolves or transitions; the founder's mechanical-only mandate). Mirrors
+    ``resolve_escalation``'s single-row guard."""
+    cur = conn.execute(
+        "UPDATE escalations SET target = ? WHERE id = ?",
+        (new_target, esc_id),
+    )
+    if cur.rowcount != 1:
+        raise FactoryError(f"no escalation with id {esc_id}")
+
+
 # ----------------------------------------------------------- repository: findings
 
 

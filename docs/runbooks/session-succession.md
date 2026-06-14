@@ -56,3 +56,31 @@ workspace worktrees), Main-Architect subagents (builders/verifiers — they reac
 legitimately), and any ad-hoc session: silent exit 0. Tested 12-06-2026 (4 paths: match
 over threshold → note; non-match → silent; match under threshold → silent; corrupt input
 → silent).
+
+## Session notification monitor — events the successor's monitor MUST watch (robustness UNIT 2)
+
+The architect's notification path is a session-scoped bash monitor polling the factory DB
+(~45s). It is the architect's OWN infra under `~/.claude/` (outside this repo) — but its
+watch-set is a succession obligation: **when this session launches its monitor, it MUST
+exit-on-match (or page) for the orchestrator's escalation-routing events**, not just the
+legacy open-escalation / pending-decision / orchestrator-liveness sets.
+
+As of robustness UNIT 2 (D-0042, shipped on `robustness-antistall`), the orchestrator owns
+escalation notification in CODE (the durable replacement for the monitor cârpă). The monitor
+must grep these `events.event_type` values:
+
+```
+escalation_opened_notice   # an architect-targeted escalation just opened (≤5-min law)
+escalation_bumped          # an escalation sat open >threshold → target climbed one rung
+escalation_stuck_resolved  # a resolved escalation's unit never advanced (>threshold)
+```
+
+and recognize the **`[arhitect]`** ntfy title prefix (the human backstop on the one shared
+topic, D-0004) so phone pages are attributed to the architect, not the founder. Semantics,
+the routing ladder (`phase_architect → main_architect → founder`), and the once-per-episode
+latch are documented in `work-protocols/architect-operations.md §4`.
+
+Until/unless the orchestrator code is deployed, the current DB-polling monitor (open-escalation
+set + pending-decision set + orchestrator liveness) remains the architect's notification path;
+once deployed, the events above make "nothing sits silently >30 min, the architect learns
+≤5 min" a factory law independent of any single session's monitor being up.

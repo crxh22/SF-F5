@@ -102,6 +102,7 @@ def config_dict(tmp_path: Path) -> dict[str, Any]:
             "churn_region_lines": 40,
             "max_context_resets": 1,
             "decision_latency_alert_h": 24,
+            "stuck_escalation_threshold_min": 30,
         },
         "risk_classes": {
             "routine": {"validator": "validator", "audits": []},

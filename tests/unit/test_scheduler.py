@@ -993,6 +993,263 @@ async def test_delivery_failure_logged_and_unmarked(db, config_dict) -> None:
     assert len(failures) == 1  # one event per failure streak, not per tick
 
 
+# ----------------------------------- robustness UNIT 2: stuck-escalation detector
+
+
+def _min_ago(minutes: int) -> str:
+    """An ISO-UTC timestamp `minutes` in the past (models.utc_now format) — drives
+    the detector's created_at/resolved_at age clocks past the threshold."""
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _insert_escalation(
+    db,
+    *,
+    unit_id: str,
+    level: Level = Level.STAGE,
+    target: str = "phase_architect",
+    status: str = "open",
+    created_at: str | None = None,
+    resolved_at: str | None = None,
+    resolution: str | None = None,
+) -> int:
+    """Insert ONE escalation row with full control over target/status/age — the
+    stuck-detector's read shapes. Returns the escalation id."""
+    with db.transaction() as conn:
+        return fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level=level.value,
+                unit_id=unit_id,
+                trigger="cp1_verdict",
+                target=target,
+                payload_artifact_id=None,
+                event_seq=None,
+                status=status,
+                resolution=resolution,
+                created_at=created_at or utc_now(),
+                resolved_at=resolved_at,
+            ),
+        )
+
+
+def _arhitect_pushes(notify: FakeNotify) -> list[tuple[str, str | None, str]]:
+    return [p for p in notify.published if p[0].startswith("[arhitect]")]
+
+
+def _escalation_row(db, esc_id: int) -> dict:
+    return dict(
+        db.read().execute("SELECT * FROM escalations WHERE id = ?", (esc_id,)).fetchone()
+    )
+
+
+async def test_stuck_open_escalation_bumps_target_and_pages(db, config_dict) -> None:
+    """Case (a): an OPEN escalation older than the threshold is bumped ONE rung up
+    the ladder + pages the NEW rung once. Second tick does NOT re-bump (latch)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    # 40 min old (threshold 30) and architect-targeted -> over the open line.
+    esc_id = _insert_escalation(db, unit_id="s1", target="phase_architect", created_at=_min_ago(40))
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    assert _escalation_row(db, esc_id)["target"] == "main_architect"  # bumped one rung
+    assert _escalation_row(db, esc_id)["status"] == "open"  # status untouched
+    bumped = events_of(db, "s1", "escalation_bumped")
+    assert len(bumped) == 1
+    payload = json.loads(bumped[0]["payload_json"])
+    assert payload["from_target"] == "phase_architect"
+    assert payload["to_target"] == "main_architect"
+    bump_pushes = [p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]
+    assert len(bump_pushes) == 1 and bump_pushes[0][2] == "max"
+
+    await run_blocked(scheduler)  # latch holds: no second bump, no second page
+    assert _escalation_row(db, esc_id)["target"] == "main_architect"
+    assert len(events_of(db, "s1", "escalation_bumped")) == 1
+    assert len([p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]) == 1
+
+
+async def test_stuck_resolved_not_advanced_pages(db, config_dict) -> None:
+    """Case (b) — the incident-[20] pin: a RESOLVED escalation whose unit is STILL
+    ESCALATED pages ONCE; the row is NOT re-resolved, NOT re-created, status
+    UNCHANGED (the detector NEVER mutates a resolved escalation)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)  # resolution never picked up
+    esc_id = _insert_escalation(
+        db,
+        unit_id="s1",
+        target="phase_architect",
+        status="resolved",
+        created_at=_min_ago(90),
+        resolved_at=_min_ago(45),  # resolved 45 min ago, threshold 30
+        resolution="rework:VALIDATE",
+    )
+    before = _escalation_row(db, esc_id)
+    sm = StateMachine(db)
+    # respect_blocked=False: the ScriptedExecutor must NOT advance the unit, so the
+    # resolved-but-stuck condition persists for the detector to observe.
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm)}
+    )
+    await run_blocked(scheduler)
+
+    stuck = events_of(db, "s1", "escalation_stuck_resolved")
+    assert len(stuck) == 1
+    stuck_pushes = [p for p in _arhitect_pushes(notify) if "neavansată" in p[0]]
+    assert len(stuck_pushes) == 1 and stuck_pushes[0][2] == "max"
+    # MUTATION GUARD: row identical (no re-resolve), and exactly ONE escalation row.
+    assert _escalation_row(db, esc_id) == before
+    n_rows = db.read().execute(
+        "SELECT COUNT(*) FROM escalations WHERE unit_id = 's1'"
+    ).fetchone()[0]
+    assert n_rows == 1  # NOT re-created
+
+    await run_blocked(scheduler)  # once per episode
+    assert len(events_of(db, "s1", "escalation_stuck_resolved")) == 1
+    assert len([p for p in _arhitect_pushes(notify) if "neavansată" in p[0]]) == 1
+
+
+async def test_resolved_and_advanced_does_not_page(db, config_dict) -> None:
+    """A resolved escalation whose unit has MOVED ON (not ESCALATED) is silent —
+    the resolution landed, there is nothing stuck."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.BUILD)  # advanced past ESCALATED
+    _insert_escalation(
+        db,
+        unit_id="s1",
+        status="resolved",
+        created_at=_min_ago(90),
+        resolved_at=_min_ago(45),
+        resolution="rework:BUILD",
+    )
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    assert events_of(db, "s1", "escalation_stuck_resolved") == []
+    assert [p for p in _arhitect_pushes(notify) if "neavansată" in p[0]] == []
+
+
+async def test_architect_learns_on_open(db, config_dict) -> None:
+    """The ≤5-min law (Q2): a freshly-open architect-targeted escalation pages the
+    architect + emits escalation_opened_notice on the FIRST tick, before any
+    threshold; ONCE (second tick silent)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    # age 0 (created now), architect-targeted -> first-notice fires immediately.
+    _insert_escalation(db, unit_id="s1", target="phase_architect")
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    notices = events_of(db, "s1", "escalation_opened_notice")
+    assert len(notices) == 1
+    open_pushes = [p for p in _arhitect_pushes(notify) if "escaladare nouă" in p[0]]
+    assert len(open_pushes) == 1 and open_pushes[0][2] == "max"
+    # No bump (under threshold), no stuck-resolved.
+    assert events_of(db, "s1", "escalation_bumped") == []
+
+    await run_blocked(scheduler)  # latch: one notice only
+    assert len(events_of(db, "s1", "escalation_opened_notice")) == 1
+    assert len([p for p in _arhitect_pushes(notify) if "escaladare nouă" in p[0]]) == 1
+
+
+async def test_open_notice_skips_founder_target(db, config_dict) -> None:
+    """A founder-targeted OPEN escalation is NOT treated as an architect
+    first-notice (the founder's domain is the trade-off-card path, not the
+    architect channel) — no escalation_opened_notice, no [arhitect] page."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    _insert_escalation(db, unit_id="s1", target="founder")  # age 0, founder rung
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    assert events_of(db, "s1", "escalation_opened_notice") == []
+    assert _arhitect_pushes(notify) == []
+
+
+async def test_ladder_clamps_at_founder(db, config_dict) -> None:
+    """A founder-targeted escalation over the open threshold is bumped to founder
+    (a no-op relabel — no infinite climb) but STILL pages founder once."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    esc_id = _insert_escalation(db, unit_id="s1", target="founder", created_at=_min_ago(40))
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    assert _escalation_row(db, esc_id)["target"] == "founder"  # clamped, unchanged
+    bumped = events_of(db, "s1", "escalation_bumped")
+    assert len(bumped) == 1
+    payload = json.loads(bumped[0]["payload_json"])
+    assert payload["from_target"] == "founder" and payload["to_target"] == "founder"
+    bump_pushes = [p for p in _arhitect_pushes(notify) if "ridicată" in p[0]]
+    assert len(bump_pushes) == 1  # still pages founder
+
+    await run_blocked(scheduler)  # latch: no infinite re-climb
+    assert len(events_of(db, "s1", "escalation_bumped")) == 1
+
+
+async def test_stuck_detector_delivery_failure_logs_once(db, config_dict) -> None:
+    """FakeNotify(fail=True): a page failure logs ONE alert_delivery_failed event
+    per streak, NEVER raises, and leaves the latch un-set so it retries (the
+    escalation is not silently dropped) — the stall/latency contract."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    esc_id = _insert_escalation(
+        db, unit_id="s1", target="phase_architect", created_at=_min_ago(40)
+    )
+    sm = StateMachine(db)
+    scheduler, _ = make_scheduler(
+        db,
+        cfg,
+        {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)},
+        notify=FakeNotify(fail=True),
+    )
+    await run_blocked(scheduler)  # must not raise
+
+    failures = (
+        db.read()
+        .execute("SELECT * FROM events WHERE event_type='alert_delivery_failed'")
+        .fetchall()
+    )
+    # First-notice + open-too-long both target s1; each failed page logs once per
+    # its own streak key, and neither re-logs every tick.
+    kinds = {json.loads(dict(f)["payload_json"])["kind"] for f in failures}
+    assert kinds <= {"escalation_opened_notice", "escalation_bumped"}
+    n_before = len(failures)
+    await run_blocked(scheduler)  # same streak -> no new failure events
+    n_after = (
+        db.read()
+        .execute("SELECT COUNT(*) FROM events WHERE event_type='alert_delivery_failed'")
+        .fetchone()[0]
+    )
+    assert n_after == n_before
+    # Page failed -> the target was NOT bumped (un-latched, retried next tick), the
+    # row is untouched and the escalation is never silently lost.
+    assert _escalation_row(db, esc_id)["target"] == "phase_architect"
+
+
 async def test_containment_escalates_failed_unit_siblings_continue(
     db, config_dict
 ) -> None:

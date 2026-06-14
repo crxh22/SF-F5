@@ -316,6 +316,33 @@ PHASE_ESCALATION_RESOLUTIONS: Mapping[str, PhaseState] = MappingProxyType(
     }
 )
 
+#: Escalation-routing ladder (robustness UNIT 2 / D-0042): the rungs the
+#: stuck-escalation detector climbs and the page-recipient vocabulary. The ONE
+#: source (Doctrine §9, the STAGE_ESCALATION_RESOLUTIONS precedent) consumed by
+#: the scheduler's `_stuck_escalation_detector`; the dashboard glosses the same
+#: tokens (dashboard.py §10.4). These values are EXACTLY the ``escalations.target``
+#: DDL CHECK set (migrations/0001_init.sql: phase_architect, main_architect,
+#: founder) — creation sites write the first two, the detector bumps UP toward
+#: ``founder`` (the top product authority). Keep in lock-step with the DDL CHECK
+#: and the dashboard gloss (pinned by test).
+ESCALATION_TARGET_LADDER: tuple[str, ...] = (
+    "phase_architect",
+    "main_architect",
+    "founder",
+)
+
+
+def next_escalation_target(current: str) -> str:
+    """The next rung UP the ESCALATION_TARGET_LADDER, clamped at ``founder``
+    (no infinite climb — the top rung bumps to itself). An unknown ``current``
+    (not on the ladder) is treated as already at the top and returned unchanged
+    (never guessed forward — Doctrine §7); the detector still pages it."""
+    try:
+        idx = ESCALATION_TARGET_LADDER.index(current)
+    except ValueError:
+        return current
+    return ESCALATION_TARGET_LADDER[min(idx + 1, len(ESCALATION_TARGET_LADDER) - 1)]
+
 
 # ------------------------------------------------------------------------ helpers
 
