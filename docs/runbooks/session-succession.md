@@ -19,17 +19,24 @@ firing session's id).
    Archive pattern per existing handoffs. Commit it.
 3. **Launch the successor** (incremented letter: ETAPA-5a → 5b → 5c …):
    ```bash
-   SFF5_TMUX_SESSION=etapa-5<next> /home/artur/projects/SF-F5/claude_canon.sh \
+   SFF5_TMUX_SESSION=etapa-5<next> SFF5_RC_NAME=ETAPA-5<next> /home/artur/projects/SF-F5/claude_canon.sh \
      "Ești ETAPA-5<next>, succesoarea sesiunii Main-Architect. Citește docs/session-handoff-<...>.md și continuă. Scrie session_id-ul tău în ~/.claude/sf-architect-session (înlocuiește conținutul) ca să preiei garda de context."
    ```
-   The launcher carries the canon + effort settings identically (claude_canon.sh contract).
+   The launcher carries the canon + effort + **Remote Control** identically (claude_canon.sh
+   contract): it passes `--model opus --effort max --remote-control ETAPA-5<next>`, so RC is
+   ON and the session is phone-named at launch (D-0041) — no manual taps. `SFF5_RC_NAME`
+   sets the phone-visible label (defaults to the tmux session name otherwise).
 4. **Hand over the marker:** the successor's FIRST duty (in its launch prompt) is writing
    its own session id into `~/.claude/sf-architect-session` — the context guard follows
    the marker, never the name. (The predecessor can pre-clear the marker if paranoid;
    a missing marker = guard inert, never wrong-target.)
-5. **Founder's two taps in the new session** (not yet automatable): `/rename ETAPA-5<next>`
-   and `/rc` (remote control). The old session stays attached in its tmux window, idle —
-   founder reviews history via remote control and exits it manually when done.
+5. **Founder: zero taps needed** (D-0041 automated `/rc` + naming). The successor already
+   appears on the phone as `ETAPA-5<next>` with Remote Control live — the founder just OPENS
+   it. **VERIFY before the predecessor goes silent:** confirm the successor shows up on the
+   phone (claude.ai/code, green dot) — if RC silently failed, the founder is still reachable
+   on the predecessor's live RC, so DO NOT go silent until the successor's RC is confirmed.
+   The old session stays attached in its tmux window, idle — founder reviews history via
+   remote control and exits it manually when done.
 6. The predecessor announces the succession to the founder (one line, where the successor
    lives) and goes silent. It must NOT keep working after the successor takes the marker
    (two architects = two writers — same reason the factory has a sole-writer rule).

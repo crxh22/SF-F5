@@ -39,6 +39,15 @@ TMUX_SESSION="${SFF5_TMUX_SESSION:-sf-f5}"
 # stale settings.json default (D-0038: Fable went 404; the launcher must NOT carry
 # the dead model forward to successor sessions). Override: SFF5_MODEL=<alias>.
 SFF5_MODEL="${SFF5_MODEL:-opus}"
+# Remote Control (D-0041): the Main-Architect session is the founder's PHONE control
+# surface — RC must be enabled AT LAUNCH because the founder cannot run /rc from the
+# phone (no terminal). `--remote-control <name>` turns RC on AND sets the phone-visible
+# session name in one shot (verified against the claude-code remote-control docs; needs
+# the CLI's existing claude.ai login — same auth the manual /rc used). Name defaults to
+# the tmux session; override with SFF5_RC_NAME. Disable with SFF5_NO_RC=1 (offline launch).
+SFF5_RC_NAME="${SFF5_RC_NAME:-$TMUX_SESSION}"
+RC_ARGS=()
+if [ -z "${SFF5_NO_RC:-}" ]; then RC_ARGS=(--remote-control "$SFF5_RC_NAME"); fi
 
 # Canon list (order = order in the injected block). Edit here to add/remove.
 CANON_FILES=(
@@ -71,7 +80,7 @@ fi
 
 # Direct exec when explicitly requested or when already inside tmux (no nesting).
 if [ -n "${SFF5_NO_TMUX:-}" ] || [ -n "${TMUX:-}" ]; then
-  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "$@"
+  exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@"
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -79,6 +88,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "$@")"
+CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@")"
 echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
 exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"

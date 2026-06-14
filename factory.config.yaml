@@ -31,7 +31,13 @@ models:
   builder_heavy:         {cli: claude, model: opus,    mode: print, effort: xhigh}
   validator:             {cli: claude, model: sonnet,  mode: print, effort: high}
   validator_structural:  {cli: claude, model: opus,    mode: print, effort: xhigh}
-  integration_validator: {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}   # cross-model preferred (DoD §5.2)
+  # D-0041: integration validator moved codex(gpt-5.5)→opus. Its merge-gate payload
+  # = full diff of the gating unit + ALL sibling diffs since contract freeze; that
+  # grows with each merged sibling and exceeded gpt-5.5's context window on
+  # document-engine (the 4th-merging unit). DoD §5.2 cross-model is PREFERRED, not
+  # mandatory; opus's 1M window is the hard requirement (the validator must FIT what
+  # it reviews). Cross-model diversity stays at the per-stage AUDIT (auditor_cross_model).
+  integration_validator: {cli: claude, model: opus,    mode: print, effort: xhigh}
   auditor_same_model:    {cli: claude, model: opus,    mode: print, effort: xhigh}
   auditor_cross_model:   {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
