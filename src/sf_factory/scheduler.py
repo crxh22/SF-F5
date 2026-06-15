@@ -5574,9 +5574,20 @@ class Scheduler:
                 )
 
         # --- (2b) resolved-but-unit-still-ESCALATED: page once, NEVER mutate.
+        # SCOPE to each unit's MOST-RECENT escalation (case-2b over-fire fix,
+        # ETAPA-5f): an OLDER resolved escalation of a unit re-ESCALATED for a NEWER
+        # reason is superseded by that newer escalation (open -> covered by (2a)/
+        # first-notice; another resolved -> that one is the live episode), NOT a
+        # genuine stuck-resolved. Without this, EVERY old resolved escalation of a
+        # currently-ESCALATED unit matched (resolved + old + unit ESCALATED) and
+        # paged once each — a flood (~32 false [arhitect] pages in production:
+        # register-schemas, 4-resolution history, re-ESCALATED on a new budget breach).
+        latest_by_unit = fdb.latest_escalation_ids_by_unit(conn)
         resolved_ids: set[int] = set()
         for esc in fdb.list_escalations_by_status(conn, "resolved", older_than_min=threshold):
             assert esc.id is not None
+            if esc.id != latest_by_unit.get((esc.unit_level, esc.unit_id)):
+                continue  # superseded by a newer escalation -> not this unit's live episode
             unit = (
                 fdb.get_stage(conn, esc.unit_id)
                 if esc.unit_level == Level.STAGE.value

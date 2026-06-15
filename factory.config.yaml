@@ -76,11 +76,12 @@ escalation:
   churn_region_lines: 40       # hunk-bucket size for the churn detector
   max_context_resets: 1        # context_budget firings executed as reset before escalating
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
-  stuck_escalation_threshold_min: 999999 # TEMP 15-06 (D-0044): huge value DISABLES case-2a(climb)+2b(resolved-not-advanced)
-                          # to stop a production over-fire — case-2b fired escalation_stuck_resolved for EVERY old resolved
-                          # escalation of a re-ESCALATED unit (latch self-prunes on oscillation -> re-fires), flooding the
-                          # [arhitect] channel (~32 false pages). first-notice (age 0) still works. RESTORE to 30 when the
-                          # proper case-2b fix ships (task #9: fire only for the unit's latest resolved-not-advanced).
+  stuck_escalation_threshold_min: 30 # open-too-long climb (2a) + resolved-not-advanced (2b) trigger past this age
+                          # RESTORED to 30 by ETAPA-5f after the proper case-2b fix shipped: the over-fire (case-2b
+                          # paging escalation_stuck_resolved for EVERY old resolved escalation of a re-ESCALATED unit,
+                          # ~32 false [arhitect] pages) is fixed by scoping (2b) to each unit's MOST-RECENT escalation
+                          # (scheduler._stuck_escalation_detector + db.latest_escalation_ids_by_unit). The 999999 TEMP
+                          # disable (D-0044) is retired.
 
 risk_classes:
   routine:    {validator: validator,            audits: []}

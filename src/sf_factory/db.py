@@ -900,6 +900,28 @@ def bump_escalation_target(
         raise FactoryError(f"no escalation with id {esc_id}")
 
 
+def latest_escalation_ids_by_unit(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], int]:
+    """``(unit_level, unit_id) -> MAX(escalation id)`` across ALL statuses — the
+    id of each unit's MOST-RECENT escalation (ids are monotonic, so max id == latest).
+
+    The stuck-detector's (2b) resolved-not-advanced check fires ONLY for a unit's
+    most-recent escalation (case-2b over-fire fix, ETAPA-5f). An OLDER resolved
+    escalation of a unit re-ESCALATED for a NEWER reason is superseded by that newer
+    escalation (an open one -> covered by (2a)/first-notice; another resolved one ->
+    that one is the live episode), NOT a genuine stuck-resolved. Without this scope,
+    EVERY old resolved escalation of a currently-ESCALATED unit matched
+    ``resolved + older_than_threshold + unit ESCALATED`` and paged once each — a
+    flood (~32 false [arhitect] pages observed in production, register-schemas with
+    a 4-resolution history re-ESCALATED on a new budget breach)."""
+    rows = conn.execute(
+        "SELECT unit_level, unit_id, MAX(id) AS max_id FROM escalations "
+        "GROUP BY unit_level, unit_id"
+    ).fetchall()
+    return {(r["unit_level"], r["unit_id"]): int(r["max_id"]) for r in rows}
+
+
 # ----------------------------------------------------------- repository: findings
 
 

@@ -1178,6 +1178,79 @@ async def test_resolved_and_advanced_does_not_page(db, config_dict) -> None:
     assert [p for p in _arhitect_pushes(notify) if "neavansată" in p[0]] == []
 
 
+async def test_stuck_resolved_skips_superseded_when_reescalated(db, config_dict) -> None:
+    """case-2b over-fire fix (ETAPA-5f): a unit with a HISTORY of old resolved
+    escalations, re-ESCALATED for a NEW reason (a current OPEN escalation), pages
+    (2b) ZERO times. The OPEN escalation is the unit's live episode (surfaced by
+    (2a)/first-notice); the old resolved rows are superseded, not stuck-resolved.
+    Before the fix EACH old resolved row matched (resolved + old + unit ESCALATED)
+    and paged once each — the production flood (~32 false [arhitect] pages,
+    register-schemas with a 4-resolution history)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    # Four OLD resolved escalations (the register-schemas-style history).
+    for _ in range(4):
+        _insert_escalation(
+            db,
+            unit_id="s1",
+            status="resolved",
+            created_at=_min_ago(180),
+            resolved_at=_min_ago(90),  # older than threshold 30
+            resolution="rework:BUILD",
+        )
+    # Re-ESCALATED for a NEW reason: a current OPEN escalation = the live episode.
+    open_id = _insert_escalation(db, unit_id="s1", target="phase_architect")  # age 0
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    # (2b) fires ZERO — no OLD resolved escalation is the unit's most-recent.
+    assert events_of(db, "s1", "escalation_stuck_resolved") == []
+    assert [p for p in _arhitect_pushes(notify) if "neavansată" in p[0]] == []
+    # The live OPEN escalation still gets its first-notice (signal NOT suppressed).
+    notices = events_of(db, "s1", "escalation_opened_notice")
+    assert len(notices) == 1
+    assert json.loads(notices[0]["payload_json"])["escalation_id"] == open_id
+
+
+async def test_stuck_resolved_fires_only_for_latest_of_many(db, config_dict) -> None:
+    """case-2b scope (ETAPA-5f): a unit with MULTIPLE old resolved escalations and
+    NO open one, still ESCALATED (the resolution never advanced it), pages (2b)
+    exactly ONCE — for its MOST-RECENT escalation only, never once per resolved row."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.ESCALATED)
+    _insert_escalation(
+        db,
+        unit_id="s1",
+        status="resolved",
+        created_at=_min_ago(180),
+        resolved_at=_min_ago(120),  # older episode
+        resolution="rework:BUILD",
+    )
+    latest_id = _insert_escalation(
+        db,
+        unit_id="s1",
+        status="resolved",
+        created_at=_min_ago(90),
+        resolved_at=_min_ago(45),  # most-recent, still older than threshold 30
+        resolution="rework:VALIDATE",
+    )
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm)}
+    )
+    await run_blocked(scheduler)
+
+    events = events_of(db, "s1", "escalation_stuck_resolved")
+    assert len(events) == 1  # ONCE, not once-per-resolved-row
+    assert json.loads(events[0]["payload_json"])["escalation_id"] == latest_id
+    assert len([p for p in _arhitect_pushes(notify) if "neavansată" in p[0]]) == 1
+
+
 async def test_architect_learns_on_open(db, config_dict) -> None:
     """The ≤5-min law (Q2): a freshly-open architect-targeted escalation pages the
     architect + emits escalation_opened_notice on the FIRST tick, before any
