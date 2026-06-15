@@ -64,12 +64,14 @@ budgets:
                             # not honest rework. BOUNDED: split a structural stage that exceeds 200M (do NOT extend
                             # again); max_fix_iterations/churn are the loop guards independent of the token cap.
                             # (D-0039 history: 75M→120M for document-engine's honest 82M.) Revisit downward once split.
-    critical: 220000000   # D-0044: 150M→220M (founder-approved 14-06-2026). auth-access genuinely burned
-                          # ~156M on the [23] broad device-test-integration scope (ALL API-client fixtures +
-                          # permanent conformance guard — honest work, converging: high+medium findings fixed,
-                          # 1 medium left) and tripped the 150M cap. Caps catch RUNAWAYS, not honest work on a
-                          # deliberately-broad critical stage. BOUNDED: if a critical stage exceeds 220M, SPLIT
-                          # (finer decomposition), do NOT extend again. Revisit downward post-foundation.
+    critical: 250000000   # D-0045: 220M→250M (founder-approved 15-06-2026). auth-access PASSED everything
+                          # (validate + dual-audit + human re-confirm + merge-gate Tier-1/Tier-2 green) but the
+                          # final integration check's own cost tipped it to 225.65M — 2.6% over the 220M cap, a
+                          # COMPLETION overage, NOT a runaway. rework:MERGE_GATE re-runs the integration_validator
+                          # (~10-20M) so the cap must clear ~240M. Opus-era critical stages run larger than the
+                          # Fable-calibrated cap; auth-access is the broadest. BOUNDED: if a FUTURE critical stage
+                          # exceeds 250M, SPLIT (finer decomposition), do NOT extend again. (D-0044 history:
+                          # 150M→220M for the same broad-[23]-scope stage.) Future critical stages decomposed finer.
   usage_missing_policy: estimate      # estimate = logged-stream-bytes/4 into ledger (estimated=1) | escalate_after
   usage_missing_max_per_stage: 3      # used by escalate_after policy
 
