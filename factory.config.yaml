@@ -56,14 +56,14 @@ budgets:
     # routine build run measured ~6M raw. Caps ≈ 5x healthy single-pass so the detector catches
     # runaways, not honest work. D-0005 starter values (300k/1M/2M) predate any real run.
     routine: 30000000
-    structural: 200000000   # D-0045: 120M→200M (founder-approved 15-06-2026). register-schemas (~127M) +
-                            # status-notifications (~132M) — genuine honest work (~94% clean runs), near-done —
-                            # re-tripped the 120M cap; Opus-era structural stages run systematically larger than
-                            # the Fable-calibrated cap (D-0038 capability downgrade). Architect rec 160M; founder
-                            # chose 200M (completion headroom, fewer re-block interruptions). Caps catch RUNAWAYS,
-                            # not honest rework. BOUNDED: split a structural stage that exceeds 200M (do NOT extend
-                            # again); max_fix_iterations/churn are the loop guards independent of the token cap.
-                            # (D-0039 history: 75M→120M for document-engine's honest 82M.) Revisit downward once split.
+    structural: 250000000   # D-0046: 200M→250M (founder-directed 15-06-2026) — proactive headroom for
+                            # status-notifications (status-layer + notification framework, a large 2-subsystem
+                            # structural stage; ~176M mid-validate and climbing) so it does NOT stall near
+                            # completion like auth-access did at its merge gate (D-0045). Founder: "la prima
+                            # ocazie, altfel riscăm să pierdem lucrul." Now == the critical cap. Caps catch
+                            # RUNAWAYS, not honest rework; max_fix_iterations/churn are the loop guards. BOUNDED:
+                            # split a structural stage that exceeds 250M (do NOT extend again).
+                            # (History: D-0039 75→120 for document-engine; D-0045 120→200.) Revisit downward once split.
     critical: 250000000   # D-0045: 220M→250M (founder-approved 15-06-2026). auth-access PASSED everything
                           # (validate + dual-audit + human re-confirm + merge-gate Tier-1/Tier-2 green) but the
                           # final integration check's own cost tipped it to 225.65M — 2.6% over the 220M cap, a
