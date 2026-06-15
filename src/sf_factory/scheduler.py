@@ -3497,7 +3497,14 @@ class StageExecutor:
             f"\nWrite {unit_rel}/integration-report.md (prose) and "
             f"{unit_rel}/integration-report.json — EXACTLY "
             '{"findings": [{"ref": "...", "severity": "...", "summary": "...", '
-            '"location": "..."}]} (empty list = no findings).\n' + self._layout_note(stage)
+            '"location": "..."}]} (empty list = no findings).\n'
+            # D-0048: the integration_validator re-derives findings clean-context
+            # every merge-gate run, so a `settled`/`overruled` integration finding
+            # (architect-operations §1 no-action disposition) would otherwise
+            # regenerate on the re-run gate → BUILD → re-contest → loop. Same
+            # do-not-re-raise memory the structural _audit_prompt carries.
+            + self._prior_adjudications_note(stage)
+            + self._layout_note(stage)
         ]
         fixed_bytes = sum(len(p.encode("utf-8")) for p in (*pre, *tail))
         sib_lines, used_headers = _render_sibling_diffs(

@@ -2687,6 +2687,33 @@ def test_audit_prompt_no_block_when_no_prior_adjudications(
     assert "PREVIOUSLY ADJUDICATED" not in prompt
 
 
+def test_tier2_prompt_carries_prior_adjudications_memory(
+    db, config_dict, tmp_path
+) -> None:
+    """D-0048: the merge-gate integration_validator prompt MUST carry the same
+    settled/overruled do-not-re-raise memory as _audit_prompt — else a
+    `settled` integration finding (architect-operations §1 no-action) regenerates
+    on the re-run merge gate → BUILD → re-contest → loop. Same safety pin:
+    settled/overruled listed; sustained/complied/duplicate/open never."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    _seed_finding(db, ref="SN-INT-001", status="settled", severity="low",
+                  auditor_role="integration_validator")
+    _seed_finding(db, ref="OVR-1", status="overruled", severity="major")
+    for ref, status in (("SUS-1", "sustained"), ("CMP-1", "complied"),
+                        ("DUP-1", "duplicate"), ("OPN-1", "open")):
+        _seed_finding(db, ref=ref, status=status)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert stage is not None
+    prompt = env.executor._tier2_prompt(
+        stage, {}, {}, "diff --git a/x b/x\n@@ -1 +1 @@\n+x\n", {}
+    )
+    assert "PREVIOUSLY ADJUDICATED" in prompt
+    assert "SN-INT-001" in prompt  # settled integration finding -> not re-raised
+    assert "OVR-1" in prompt  # overruled -> listed
+    for must_not in ("SUS-1", "CMP-1", "DUP-1", "OPN-1"):
+        assert must_not not in prompt, f"{must_not} must remain re-raisable"
+
+
 async def test_escalation_rework_build_reason_reaches_builder_prompt(
     db, config_dict, tmp_path
 ) -> None:
