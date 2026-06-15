@@ -155,6 +155,7 @@ def config_dict(tmp_path: Path) -> dict[str, Any]:
             "loop_tick_s": 1,
             "heartbeat_min_interval_s": 1,
             "tier2_max_diff_bytes_per_unit": 100000,
+            "tier2_max_total_bytes": 2000000,
             "stub_agent_path": str(REPO_ROOT / "tests" / "stub_agent.py"),
         },
         "canon": {

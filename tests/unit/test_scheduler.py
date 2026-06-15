@@ -1652,6 +1652,53 @@ async def test_phase_planning_replay_identical_plan_anchors_freeze_on_head(
     assert phase_state(db, "ph") is PhaseState.RUNNING  # replay continued cleanly
 
 
+def test_render_sibling_diffs_budget_switches_to_hunk_headers() -> None:
+    """D-0046: the Tier-2 sibling block renders full diff bodies under the total
+    byte budget and collapses to file+@@ hunk headers above it; the gating
+    unit's diff (the caller's ``fixed_bytes``) is never the helper's to touch.
+    Boundary is inclusive (<=) and has teeth — one byte over flips to headers."""
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " context\n"
+        "-removed_body\n"
+        "+ADDED_BODY_MARKER\n"
+        " tail\n"
+    )
+    siblings = {"unit-b": diff, "unit-a": diff}  # unsorted on purpose
+
+    # empty -> the caller's empty_text verbatim, never headers
+    assert sched_mod._render_sibling_diffs({}, 0, 10, "(none)") == (["(none)"], False)
+
+    full_lines = [f"--- merged unit {u} ---\n{diff}" for u in ("unit-a", "unit-b")]
+    full_bytes = sum(len(s.encode("utf-8")) for s in full_lines)
+    fixed = 500
+
+    # exactly at budget -> full bodies (inclusive), sorted by unit id
+    lines, used = sched_mod._render_sibling_diffs(
+        siblings, fixed, fixed + full_bytes, "(none)"
+    )
+    assert used is False
+    assert lines == full_lines
+    assert "ADDED_BODY_MARKER" in "\n".join(lines)
+
+    # one byte over -> hunk headers: bodies gone, changed regions + file headers kept
+    lines, used = sched_mod._render_sibling_diffs(
+        siblings, fixed, fixed + full_bytes - 1, "(none)"
+    )
+    assert used is True
+    joined = "\n".join(lines)
+    assert "ADDED_BODY_MARKER" not in joined  # body elided
+    assert "removed_body" not in joined  # body elided
+    assert "@@ -1,3 +1,4 @@" in joined  # changed region kept
+    assert "diff --git a/foo.py b/foo.py" in joined  # file header kept
+    assert joined.count("hunk headers only") == 2  # both siblings flagged
+    assert joined.index("unit-a") < joined.index("unit-b")  # sorted
+
+
 async def test_phase_tier2_sibling_window_survives_tier1_rebase(
     db, config_dict, tmp_path
 ) -> None:

@@ -189,6 +189,13 @@ process:
   loop_tick_s: 5                  # scheduler tick / liveness refresh
   heartbeat_min_interval_s: 1
   tier2_max_diff_bytes_per_unit: 300000
+  # D-0046: total-prompt byte ceiling for the Tier-2 integration_validator. Above
+  # this, sibling diffs collapse to file+@@ hunk headers (not full bodies) so the
+  # print-mode prompt stays under the 1M context window; the gating unit's diff +
+  # contracts always stay verbatim. Measured: posting-engine full-body=2.36MB
+  # (~587k conv tok @ ~4 B/tok) overflowed; header-mode=0.39MB (~97k tok). 1.5MB
+  # keeps full fidelity for conv <=~375k tok (<=~823k total w/ ~448k fixed overhead).
+  tier2_max_total_bytes: 1500000
   stub_agent_path: tests/stub_agent.py   # used only by routes with cli: stub (tests)
   # Build/test droppings the §3.1 Validator-isolation assertion ignores (fnmatch
   # against each porcelain path and its path segments; directories end with /).

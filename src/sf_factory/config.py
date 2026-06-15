@@ -308,6 +308,10 @@ class ProcessCfg(_StrictModel):
     loop_tick_s: float = Field(gt=0)
     heartbeat_min_interval_s: float = Field(gt=0)
     tier2_max_diff_bytes_per_unit: int = Field(ge=1)
+    # D-0046: total-prompt byte ceiling for the Tier-2 integration_validator. Above
+    # it, sibling diffs render as file+@@ hunk headers (not full bodies) so the
+    # print-mode prompt stays under the agent's 1M context window.
+    tier2_max_total_bytes: int = Field(ge=1)
     stub_agent_path: Path
     # Build/test droppings the §3.1 Validator-isolation assertion ignores:
     # fnmatch globs against each porcelain path and its path segments.

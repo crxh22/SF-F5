@@ -94,7 +94,13 @@ from sf_factory.notify import NtfyPublisher, dashboard_link
 from sf_factory.runner import AgentResult, AgentRunner, cmdline_matches
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
-from sf_factory.worktrees import StaleGateError, WorktreeManager, commit_paths, run_git
+from sf_factory.worktrees import (
+    StaleGateError,
+    WorktreeManager,
+    _hunk_headers,
+    commit_paths,
+    run_git,
+)
 
 if TYPE_CHECKING:  # type-only: Consultor/Verdict instances are injected, never built here
     from sf_factory.consultation import Consultor, Verdict
@@ -449,6 +455,50 @@ def _bounded(text: str, max_bytes: int) -> str:
     if len(data) <= max_bytes:
         return text
     return data[:max_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+
+
+def _render_sibling_diffs(
+    sibling_diffs: Mapping[str, str],
+    fixed_bytes: int,
+    max_total_bytes: int,
+    empty_text: str,
+) -> tuple[list[str], bool]:
+    """Render the merged-sibling diff block for a Tier-2 integration prompt,
+    bounding the integration_validator's print-mode context (D-0046: at the
+    Nth-merging unit the FULL sibling bodies dominate the prompt — measured
+    ~2.06MB of ~2.36MB at posting-engine — and overflow the agent's 1M window).
+
+    Full diff bodies when the WHOLE assembled prompt fits ``max_total_bytes``
+    (``fixed_bytes`` = the gating unit's full diff + contracts + plan +
+    boilerplate, already counted by the caller, PLUS the sibling bodies);
+    otherwise each sibling collapses to file + ``@@`` hunk headers
+    (``_hunk_headers``) — changed-region visibility kept, bulk dropped. The
+    gating unit's diff + the contracts ALWAYS stay verbatim. Returns
+    ``(lines_to_append, used_headers)``; ``used_headers`` lets the caller warn
+    the validator it is seeing regions, not full bodies."""
+    if not sibling_diffs:
+        return ([empty_text], False)
+    ordered = sorted(sibling_diffs.items())
+    full = [f"--- merged unit {uid} ---\n{diff}" for uid, diff in ordered]
+    if fixed_bytes + sum(len(s.encode("utf-8")) for s in full) <= max_total_bytes:
+        return (full, False)
+    headers = [
+        f"--- merged unit {uid} (diff bodies elided to fit the integration "
+        f"context budget — file + @@ hunk headers only) ---\n{_hunk_headers(diff)}"
+        for uid, diff in ordered
+    ]
+    return (headers, True)
+
+
+#: Appended to the sibling-diff section header when bodies were elided to headers,
+#: so the validator judges from regions + the gating unit's full diff + contracts
+#: and does NOT flag the elision itself as an integration finding.
+_SIBLING_ELISION_NOTE = (
+    "(NOTE: some sibling diff bodies exceeded the integration context budget and "
+    "are shown as file + @@ hunk headers only — judge cross-unit integration from "
+    "these changed regions together with the gating unit's full diff and the "
+    "contracts in force; do not raise the elision itself as a finding.)"
+)
 
 
 def _fit_consultation_inputs(
@@ -3428,7 +3478,7 @@ class StageExecutor:
         sibling_diffs: Mapping[str, str],
     ) -> str:
         max_bytes = self._cfg.process.tier2_max_diff_bytes_per_unit
-        parts = [
+        pre = [
             f"You are the Integration Validator at the merge gate of stage '{stage.id}' "
             "(clean context). Check contract conformance IN SUBSTANCE, cross-boundary "
             "invariant violations, duplicate/divergent implementations, and assumptions "
@@ -3436,25 +3486,29 @@ class StageExecutor:
             "\n== CONTRACTS IN FORCE ==",
         ]
         for name, text in contracts.items():
-            parts.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
-        parts.append("\n== PHASE PLAN ==")
+            pre.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
+        pre.append("\n== PHASE PLAN ==")
         for name, text in plan_texts.items():
-            parts.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
-        parts.append(f"\n== FULL DIFF OF GATING UNIT {stage.id} ==\n{full_diff}")
-        parts.append("\n== FULL DIFFS OF SIBLINGS MERGED SINCE CONTRACT FREEZE ==")
-        if sibling_diffs:
-            for unit_id, diff in sorted(sibling_diffs.items()):
-                parts.append(f"--- merged unit {unit_id} ---\n{diff}")
-        else:
-            parts.append("(none merged since contract freeze)")
+            pre.append(f"--- {name} ---\n{_bounded(text, max_bytes)}")
+        pre.append(f"\n== FULL DIFF OF GATING UNIT {stage.id} ==\n{full_diff}")
+        pre.append("\n== SIBLING DIFFS MERGED SINCE CONTRACT FREEZE ==")
         unit_rel = f"_factory/stages/{stage.id}"
-        parts.append(
+        tail = [
             f"\nWrite {unit_rel}/integration-report.md (prose) and "
             f"{unit_rel}/integration-report.json — EXACTLY "
             '{"findings": [{"ref": "...", "severity": "...", "summary": "...", '
             '"location": "..."}]} (empty list = no findings).\n' + self._layout_note(stage)
+        ]
+        fixed_bytes = sum(len(p.encode("utf-8")) for p in (*pre, *tail))
+        sib_lines, used_headers = _render_sibling_diffs(
+            sibling_diffs,
+            fixed_bytes,
+            self._cfg.process.tier2_max_total_bytes,
+            "(none merged since contract freeze)",
         )
-        return "\n".join(parts)
+        if used_headers:
+            pre.append(_SIBLING_ELISION_NOTE)
+        return "\n".join((*pre, *sib_lines, *tail))
 
 
 # ----------------------------------------------------------------- PhaseExecutor
@@ -4101,7 +4155,7 @@ class PhaseExecutor:
         )
         sibling_diffs = {uid: d for uid, d in sibling_diffs.items() if uid != phase.id}
 
-        parts = [
+        pre = [
             f"You are the Integration Validator at the integration gate of phase"
             f" '{phase.id}' (clean context). Check contract conformance in substance,"
             " cross-boundary invariants, duplicate/divergent implementations,"
@@ -4111,22 +4165,22 @@ class PhaseExecutor:
             "\n== PHASE PLAN ==",
             *(f"--- {n} ---\n{_bounded(t, max_bytes)}" for n, t in plan_texts.items()),
             f"\n== FULL DIFF OF PHASE {phase.id} vs {target} ==\n{full_diff}",
-            "\n== FULL DIFFS OF UNITS MERGED INTO THE TARGET SINCE FORK ==",
+            "\n== UNIT DIFFS MERGED INTO THE TARGET SINCE FORK ==",
         ]
-        if sibling_diffs:
-            parts += [
-                f"--- merged unit {uid} ---\n{diff}"
-                for uid, diff in sorted(sibling_diffs.items())
-            ]
-        else:
-            parts.append("(none)")
         unit_rel = f"_factory/phases/{phase.id}"
-        parts.append(
+        tail = [
             f"\nWrite {unit_rel}/integration-report.md and {unit_rel}/integration-report.json"
             ' — EXACTLY {"findings": [{"ref": "...", "severity": "...", "summary": "...",'
             ' "location": "..."}]} (empty list = no findings). If you cannot proceed,'
             f" write {unit_rel}/_DECLARED_FAILURE.md instead of guessing."
+        ]
+        fixed_bytes = sum(len(p.encode("utf-8")) for p in (*pre, *tail))
+        sib_lines, used_headers = _render_sibling_diffs(
+            sibling_diffs, fixed_bytes, self._cfg.process.tier2_max_total_bytes, "(none)"
         )
+        if used_headers:
+            pre.append(_SIBLING_ELISION_NOTE)
+        parts = [*pre, *sib_lines, *tail]
 
         branch = self._branch(phase)
         scratch = await self._wt.create(
