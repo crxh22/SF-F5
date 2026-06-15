@@ -194,7 +194,8 @@ class ClaudeAdapter:
     ) -> list[str]:
         # §5.1 literal argv order (CCR-8 semantic amendment): claude --model <m>
         # --output-format stream-json --verbose [--effort <e>]
-        # [--tools "" | --permission-mode bypassPermissions]
+        # [--tools "" | --tools <name…> --permission-mode bypassPermissions
+        #  | --permission-mode bypassPermissions]
         # --append-system-prompt <canon> [--resume <id>] -p
         # The PROMPT is NOT in argv (CCR-8): Linux MAX_ARG_STRLEN caps one argv
         # string at ~128KB and Tier-2 prompt bounds (300KB/unit) exceed it —
@@ -215,13 +216,30 @@ class ClaudeAdapter:
             # with no tool-name enumeration to drift as the CLI grows.
             cmd += ["--tools", ""]
         else:
+            if isinstance(route.tools, list):
+                # Per-role tool ALLOWLIST (context-budget fix, 2026-06-15): load
+                # ONLY the named built-in tools. The full 32-tool built-in set is
+                # ~half the prompt (its JSON schemas), and the merge-gate
+                # integration_validator (opus, 1M window) overflowed at ~1.05M
+                # tokens carrying tools it never uses — it only Reads inputs and
+                # Writes its report. `--tools <name> <name> …` (space-separated;
+                # the installed CLI's documented form: "specify tool names")
+                # restricts the set with zero review-fidelity cost. CLI-verified
+                # 2026-06-15 against claude 2.1.177: `--tools Read Write` yields an
+                # init line with exactly tools=[Read,Write] and, paired with the
+                # bypass flag below, the Write succeeds in print mode (no denial).
+                # Config validates the list (non-empty, unique, known names).
+                cmd += ["--tools", *route.tools]
             # Phase-seeding design §5 (D-0024): claude print mode default-DENIES
             # writes and a print-mode agent has no human to answer prompts — a
             # denied write is a wedged stage, so every tools-on pipeline agent
-            # bypasses claude's own gating. NOT symmetric with the codex
-            # OS-enforced `--sandbox workspace-write`: the lost guardrail is
-            # replaced by the control plane's out-of-bounds detector
-            # (scheduler, §5); narrowing later is the pre-registered
+            # bypasses claude's own gating. This is ORTHOGONAL to --tools (which
+            # selects WHICH built-ins load; bypassPermissions decides whether the
+            # loaded ones may act unprompted) — both are required so an allowlist
+            # role's Write is permitted in print mode (CLI-verified 2026-06-15).
+            # NOT symmetric with the codex OS-enforced `--sandbox workspace-write`:
+            # the lost guardrail is replaced by the control plane's out-of-bounds
+            # detector (scheduler, §5); narrowing later is the pre-registered
             # `models.<role>.permission_mode` config key shape — a config
             # addition, not a contract change. Tools-off sessions unchanged.
             cmd += ["--permission-mode", "bypassPermissions"]

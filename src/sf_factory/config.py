@@ -26,10 +26,37 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+#: Built-in claude tool names a route allowlist may name (CLI-verified against the
+#: installed claude `--tools` set, 2026-06-15). The set is a TYPO guardrail, not an
+#: exhaustive registry — the runner passes whatever names survive validation straight
+#: to `--tools`, so an unknown-but-real future tool fails here rather than silently
+#: drifting. Extend this list when a route legitimately needs a tool not yet named.
+_KNOWN_CLAUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Task",
+        "Bash",
+        "Glob",
+        "Grep",
+        "Read",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+    }
+)
+
+
 class ModelRoute(_StrictModel):
     """cli: Literal['claude','codex','stub']; model: str; mode: Literal['print','interactive'];
-    tools: Literal['all','none'] = 'all' (CCR-3/D-0017: tools-off Decision Sessions —
-    structural no-write enforcement; honored by the runner adapters);
+    tools: Literal['all','none'] | list[str] = 'all' (CCR-3/D-0017: tools-off Decision
+    Sessions — structural no-write enforcement; honored by the runner adapters). A LIST
+    is a per-role ALLOWLIST (context-budget fix, 2026-06-15): the claude adapter spawns
+    with `--tools <name> <name> …` so only those built-in tools load — the merge-gate
+    integration_validator carries the full 32-tool built-in set (~half its prompt) but
+    only needs Read+Write, and the unused schemas pushed its opus prompt past the 1M
+    window. Validated as a non-empty list of unique known tool names (see
+    ``_KNOWN_CLAUDE_TOOLS``); 'all'/'none' keep their CCR-3 meaning.
     effort: Literal['low','medium','high','xhigh','max'] | None = None (CCR-6/D-0038:
     per-role reasoning knob — claude `--effort <v>`; codex `-c model_reasoning_effort=`
     (codex tops at 'xhigh', 'max' is claude-only); cross-checked in FactoryConfig;
@@ -38,8 +65,37 @@ class ModelRoute(_StrictModel):
     cli: Literal["claude", "codex", "stub"]
     model: str
     mode: Literal["print", "interactive"]
-    tools: Literal["all", "none"] = "all"
+    tools: Literal["all", "none"] | list[str] = "all"
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+
+    @model_validator(mode="after")
+    def _check_tools_allowlist(self) -> ModelRoute:
+        """A tool-list ``tools`` is a per-role allowlist: it must be a non-empty
+        list of unique, non-empty, known built-in tool names (fail-explicit at
+        load, Doctrine §7 — a typo'd or empty allowlist would spawn an agent that
+        cannot do its job). 'all'/'none' are unaffected."""
+        if isinstance(self.tools, str):
+            return self
+        if not self.tools:
+            raise ValueError(
+                "tools allowlist must be a non-empty list of built-in tool names "
+                "(use 'none' to disable all tools, 'all' for the full set)"
+            )
+        seen: set[str] = set()
+        for name in self.tools:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"tools allowlist entries must be non-empty tool-name strings, got {name!r}"
+                )
+            if name in seen:
+                raise ValueError(f"tools allowlist has duplicate entry {name!r}")
+            seen.add(name)
+            if name not in _KNOWN_CLAUDE_TOOLS:
+                raise ValueError(
+                    f"tools allowlist names unknown built-in tool {name!r} "
+                    f"(known: {sorted(_KNOWN_CLAUDE_TOOLS)})"
+                )
+        return self
 
 
 class ModelPrice(_StrictModel):
@@ -288,7 +344,8 @@ class CanonCfg(_StrictModel):
     @model_validator(mode="after")
     def _check_inject_refs(self) -> CanonCfg:
         declared = set(self.files)
-        for bundle_name in ("pipeline_agents", "founder_facing", "consultation_points", "architect"):
+        bundles = ("pipeline_agents", "founder_facing", "consultation_points", "architect")
+        for bundle_name in bundles:
             for key in getattr(self.inject, bundle_name):
                 if key not in declared:
                     raise ValueError(

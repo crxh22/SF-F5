@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from sf_factory import db as fdb
-from sf_factory.config import FactoryConfig, ModelRoute
+from sf_factory.config import FactoryConfig, ModelRoute, load_config
 from sf_factory.models import (
     ConsultationBreachError,
     ProcessError,
@@ -214,6 +214,115 @@ def test_stub_ignores_tools_field(tmp_path: Path) -> None:
     route = ModelRoute(cli="stub", model="stub-model", mode="print", tools="none")
     cmd = StubAdapter(tmp_path / "stub.py").build_cmd(route, "x")
     assert "--tools" not in cmd
+
+
+# ----------------------------- ModelRoute.tools allowlist (context-budget fix)
+
+
+def test_claude_tools_allowlist_emits_only_named_tools() -> None:
+    """A list ``tools`` is a per-role allowlist (context-budget fix, 2026-06-15):
+    the argv carries `--tools <name> <name> …` (space-separated, the installed
+    CLI's documented form) with EXACTLY those names and not the heavy unused
+    built-ins — that schema bulk is ~half the prompt and overflowed the
+    integration_validator's opus 1M window. The bypass flag stays so the Write
+    lands in print mode (CLI-verified 2026-06-15). Amended by CCR-8: trailing
+    `-p`, prompt on stdin."""
+    route = ModelRoute(cli="claude", model="opus", mode="print", tools=["Read", "Write"])
+    cmd = ClaudeAdapter().build_cmd(route, "review", system_append="CANON")
+    assert cmd == [
+        "claude",
+        "--model",
+        "opus",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "Read",
+        "Write",
+        "--permission-mode",
+        "bypassPermissions",
+        "--append-system-prompt",
+        "CANON",
+        "-p",
+    ]
+    # The heavy built-ins the diagnosis blamed (~32-tool schema bulk) are GONE.
+    for unused in ("Task", "Bash", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"):
+        assert unused not in cmd
+
+
+def test_claude_tools_allowlist_keeps_bypass_so_write_is_permitted() -> None:
+    """The allowlist (--tools) and the print-mode write-permission flag
+    (--permission-mode bypassPermissions) are ORTHOGONAL and BOTH required: the
+    first selects which built-ins load, the second lets the loaded Write act
+    unprompted (print mode has no human to approve). Pins that an allowlist role
+    still carries bypassPermissions — the integration_validator's mandatory
+    integration-report sidecar write must not become a wedged denial."""
+    route = ModelRoute(cli="claude", model="opus", mode="print", tools=["Read", "Write"])
+    cmd = ClaudeAdapter().build_cmd(route, "x")
+    assert "Write" in cmd
+    assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
+    # argv order (§5.1 literal): tools handling precedes the bypass flag.
+    assert cmd.index("--tools") < cmd.index("--permission-mode")
+
+
+def test_claude_tools_allowlist_single_tool() -> None:
+    """A one-element allowlist emits the single name after `--tools` (no stray
+    empty string, which would mean 'disable all')."""
+    route = ModelRoute(cli="claude", model="sonnet", mode="print", tools=["Read"])
+    cmd = ClaudeAdapter().build_cmd(route, "x")
+    ti = cmd.index("--tools")
+    assert cmd[ti + 1] == "Read"
+    assert cmd[ti + 2] == "--permission-mode"  # nothing else slipped into the tool list
+
+
+def test_integration_validator_real_route_can_read_and_write_report(
+    real_config_path: Path,
+) -> None:
+    """Sidecar-contract guard: the REAL integration_validator route, spawned
+    through the claude adapter, still loads BOTH Read (its inputs) and Write
+    (its mandatory integration-report.md + integration-report.json sidecar,
+    scheduler._tier2) AND carries bypassPermissions so the Write is not denied
+    in print mode. This pins that the context-budget tool-trim did not break the
+    merge-gate report write — scheduler._tier2 raises ArtifactContractError if
+    the sidecar is absent."""
+    cfg = load_config(real_config_path)
+    route = cfg.models["integration_validator"]
+    assert route.cli == "claude"  # the adapter under test
+    cmd = ClaudeAdapter().build_cmd(route, "review", system_append="CANON")
+    ti = cmd.index("--tools")
+    # Available built-ins = exactly the names between --tools and the next flag.
+    available = []
+    for tok in cmd[ti + 1 :]:
+        if tok.startswith("--") or tok == "-p":
+            break
+        available.append(tok)
+    assert "Read" in available  # reads cited files in the scratch worktree
+    assert "Write" in available  # writes the report + findings sidecar
+    assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_claude_tools_all_and_none_byte_unchanged_with_allowlist_support() -> None:
+    """Pin (regression guard): adding list support left the 'all' and 'none'
+    argv byte-for-byte identical to before. 'all' adds no --tools and keeps the
+    bypass flag; 'none' is the single `--tools ""` disable with no bypass flag."""
+    adapter = ClaudeAdapter()
+    all_cmd = adapter.build_cmd(ModelRoute(cli="claude", model="sonnet", mode="print"), "hi")
+    assert all_cmd == [
+        "claude", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
+        "--permission-mode", "bypassPermissions",
+        "-p",
+    ]
+    none_cmd = adapter.build_cmd(
+        ModelRoute(cli="claude", model="fable", mode="print", tools="none"),
+        "discuss", system_append="CANON", resume_session="sid-7",
+    )
+    assert none_cmd == [
+        "claude", "--model", "fable", "--output-format", "stream-json", "--verbose",
+        "--tools", "",
+        "--append-system-prompt", "CANON",
+        "--resume", "sid-7",
+        "-p",
+    ]
 
 
 def test_claude_parse_lines() -> None:

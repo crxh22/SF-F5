@@ -37,7 +37,14 @@ models:
   # document-engine (the 4th-merging unit). DoD §5.2 cross-model is PREFERRED, not
   # mandatory; opus's 1M window is the hard requirement (the validator must FIT what
   # it reviews). Cross-model diversity stays at the per-stage AUDIT (auditor_cross_model).
-  integration_validator: {cli: claude, model: opus,    mode: print, effort: xhigh}
+  # tools allowlist (context-budget fix, 2026-06-15): the FULL 32-tool built-in set
+  # is ~half this agent's prompt (its JSON schemas) and tipped opus past the 1M window
+  # at the merge gate (request ~1.05M tokens). It only READS inputs (its diffs/contracts
+  # are embedded in the prompt, but it may Read a cited file in the scratch worktree —
+  # diffs are bounded at process.tier2_max_diff_bytes_per_unit) and WRITES its mandatory
+  # integration-report.md + integration-report.json sidecar (scheduler _tier2). Read+Write
+  # only; CLI-verified the Write still lands in print mode (paired with bypassPermissions).
+  integration_validator: {cli: claude, model: opus,    mode: print, effort: xhigh, tools: [Read, Write]}
   auditor_same_model:    {cli: claude, model: opus,    mode: print, effort: xhigh}
   auditor_cross_model:   {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway

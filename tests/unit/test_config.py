@@ -111,6 +111,25 @@ class TestGoldenRealConfig:
         for role in ("main_architect", "cp1_triage"):
             assert cfg.models[role].effort is None, role
 
+    def test_integration_validator_tools_allowlist(self, cfg: FactoryConfig):
+        # Context-budget fix (2026-06-15): the merge-gate integration_validator
+        # overflowed opus's 1M window (~1.05M tokens) because the full 32-tool
+        # built-in schema set was ~half its prompt. It only Reads inputs and
+        # Writes its mandatory integration-report sidecar (scheduler _tier2), so
+        # its route carries the minimal Read+Write allowlist — the runner spawns
+        # it with `--tools Read Write` instead of the full set. DoD-locked: the
+        # allowlist is exactly Read+Write (every OTHER tool-on role stays 'all').
+        iv = cfg.models["integration_validator"]
+        assert iv.tools == ["Read", "Write"]
+        # No other role narrows its tools to a list — only the validator needed it.
+        listed = {name for name, r in cfg.models.items() if isinstance(r.tools, list)}
+        assert listed == {"integration_validator"}
+        # The tools-off Decision Sessions / capacity canary keep their 'none'
+        # (CCR-3/CCR-11 structural no-write); everything else is the default 'all'.
+        assert cfg.models["decision_session"].tools == "none"
+        assert cfg.models["capacity_probe"].tools == "none"
+        assert cfg.models["validator"].tools == "all"
+
     def test_usage_limit_signatures_shape(self, cfg: FactoryConfig):
         # CCR-6: non-empty lowercase substrings (the detector lowercases the
         # scanned text, never the signatures); entries are founder-tunable but
@@ -253,6 +272,44 @@ class TestSchemaRejection:
         # CCR-6: effort is a closed Literal set — an unknown level is rejected.
         config_dict["models"]["builder_routine"]["effort"] = "ultra"
         _expect_config_error(tmp_path, config_dict, match="effort")
+
+    # -------------------- tools allowlist (context-budget fix, 2026-06-15)
+
+    def test_tools_allowlist_accepted(self, tmp_path, config_dict):
+        # A list ``tools`` is the per-role allowlist: a non-empty list of known
+        # built-in tool names loads through the REAL config path.
+        config_dict["models"]["builder_routine"]["tools"] = ["Read", "Write"]
+        path = tmp_path / "ok.yaml"
+        path.write_text(yaml.safe_dump(config_dict), encoding="utf-8")
+        cfg = load_config(path)
+        assert cfg.models["builder_routine"].tools == ["Read", "Write"]
+
+    def test_tools_empty_allowlist_rejected(self, tmp_path, config_dict):
+        # An empty list is a defect (an agent that can do nothing) — use 'none'
+        # to disable all tools (fail-explicit at load, Doctrine §7).
+        config_dict["models"]["builder_routine"]["tools"] = []
+        _expect_config_error(tmp_path, config_dict, match="non-empty")
+
+    def test_tools_unknown_name_rejected(self, tmp_path, config_dict):
+        # A typo'd / unknown tool name is rejected at load rather than silently
+        # passed to --tools (where it would spawn a mis-equipped agent).
+        config_dict["models"]["builder_routine"]["tools"] = ["Read", "Wriet"]
+        _expect_config_error(tmp_path, config_dict, match="unknown built-in tool")
+
+    def test_tools_duplicate_name_rejected(self, tmp_path, config_dict):
+        config_dict["models"]["builder_routine"]["tools"] = ["Read", "Read"]
+        _expect_config_error(tmp_path, config_dict, match="duplicate")
+
+    def test_tools_literal_all_and_none_still_accepted(self, tmp_path, config_dict):
+        # Backward compat: the CCR-3 string forms keep their meaning under the
+        # widened ``Literal['all','none'] | list[str]`` type.
+        config_dict["models"]["builder_routine"]["tools"] = "all"
+        config_dict["models"]["validator"]["tools"] = "none"
+        path = tmp_path / "compat.yaml"
+        path.write_text(yaml.safe_dump(config_dict), encoding="utf-8")
+        cfg = load_config(path)
+        assert cfg.models["builder_routine"].tools == "all"
+        assert cfg.models["validator"].tools == "none"
 
     def test_empty_usage_limit_signatures_rejected(self, tmp_path, config_dict):
         config_dict["founder_channel"]["usage_limit_signatures"] = []
