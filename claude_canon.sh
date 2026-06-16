@@ -78,8 +78,19 @@ else
   } > "$CANONFILE"
 fi
 
-# Direct exec when explicitly requested or when already inside tmux (no nesting).
-if [ -n "${SFF5_NO_TMUX:-}" ] || [ -n "${TMUX:-}" ]; then
+# Is this an INTERACTIVE launch (a human at a real terminal)? Both stdin AND stdout
+# must be TTYs. A programmatic launch (e.g. session succession run from another
+# architect session's Bash tool) has NEITHER — and crucially INHERITS that session's
+# $TMUX, which used to send it down the "exec claude directly" branch below and run it
+# HEADLESS (no pty -> Remote Control never registers). That is the 5f/5i incident
+# (D-0051). The TTY test is the reliable signal; $TMUX alone is not.
+INTERACTIVE=0
+if [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
+
+# Direct exec (no new tmux) ONLY when explicitly requested, or when a human is ALREADY
+# inside a tmux pane (interactive + $TMUX) and wants claude in that pane. NEVER direct
+# for a non-interactive launch — that is the headless trap.
+if [ -n "${SFF5_NO_TMUX:-}" ] || { [ -n "${TMUX:-}" ] && [ "$INTERACTIVE" = 1 ]; }; then
   exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@"
 fi
 
@@ -89,5 +100,22 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@")"
-echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
-exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"
+if [ "$INTERACTIVE" = 1 ]; then
+  # Human at a terminal: attach-or-create (they want to SEE the session).
+  echo "claude_canon: tmux session '$TMUX_SESSION' — detach: Ctrl-b d, re-attach: rerun this script" >&2
+  exec tmux new-session -A -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"
+fi
+# Non-interactive (programmatic succession): create DETACHED so claude runs in a real
+# tmux pty and Remote Control REGISTERS — no terminal needed (the founder reaches it by
+# RC, not by attaching). A name collision would silently re-attach with args IGNORED
+# (`-A` semantics) or duplicate the architect — refuse instead.
+# Drop any inherited $TMUX/$TMUX_PANE (the calling architect session runs inside tmux):
+# a fresh detached session must not be bound to the parent server, and tmux refuses to
+# nest while $TMUX is set.
+unset TMUX TMUX_PANE
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "claude_canon: tmux session '$TMUX_SESSION' already exists — refusing (attach: tmux attach -t $TMUX_SESSION, or set a fresh SFF5_TMUX_SESSION)." >&2
+  exit 1
+fi
+tmux new-session -d -s "$TMUX_SESSION" -c "$LAUNCHER_DIR" "$CMD"
+echo "claude_canon: launched DETACHED tmux '$TMUX_SESSION' (RC name: $SFF5_RC_NAME) — claude runs in a pty, RC will register. Attach: tmux attach -t $TMUX_SESSION" >&2
