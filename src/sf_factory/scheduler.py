@@ -3188,6 +3188,22 @@ class StageExecutor:
             scratch_dir = self._unit_dir(scratch, stage)
             report = scratch_dir / "integration-report.md"
             sidecar = scratch_dir / "integration-report.json"
+            # D-0056: the integration_validator runs with cwd=scratch, but its prompt's
+            # FULL DIFF carries the REGULAR worktree's absolute paths, so the agent
+            # sometimes writes its report into the regular stage worktree's frozen layout
+            # dir instead of its scratch cwd (observed on stock-core-reservation-release
+            # ×2; foundation wrote to the scratch). The report is findings-only (no code —
+            # the worktree git status shows only the two report files untracked), so
+            # accept BOTH locations: prefer the isolated scratch, else fall back to the
+            # regular stage worktree dir (== the copy target below, where the agent writes).
+            if not sidecar.is_file():
+                fb = self._unit_dir(worktree, stage)
+                if (fb / "integration-report.json").is_file():
+                    scratch_dir, report, sidecar = (
+                        fb,
+                        fb / "integration-report.md",
+                        fb / "integration-report.json",
+                    )
             if not sidecar.is_file():
                 raise ArtifactContractError(
                     f"integration validator produced no findings sidecar at {sidecar}"
@@ -3197,11 +3213,15 @@ class StageExecutor:
             unit_dir = self._unit_dir(worktree, stage)
             unit_dir.mkdir(parents=True, exist_ok=True)
             copied = [unit_dir / report.name, unit_dir / sidecar.name]
+            # When the agent wrote into the stage worktree directly (D-0056 fallback),
+            # source == destination — skip the self-copy (shutil raises SameFileError).
             if report.is_file():
-                shutil.copyfile(report, copied[0])
+                if report.resolve() != copied[0].resolve():
+                    shutil.copyfile(report, copied[0])
             else:
                 copied[0].write_text("(no prose report)\n", encoding="utf-8")
-            shutil.copyfile(sidecar, copied[1])
+            if sidecar.resolve() != copied[1].resolve():
+                shutil.copyfile(sidecar, copied[1])
             sha = await self._commit_unit_paths(
                 stage, worktree, copied, f"stage {stage.id}: tier2 report"
             )
