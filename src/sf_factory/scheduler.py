@@ -1244,7 +1244,7 @@ class CapacityGovernor:
         from_state via ``_CAPACITY_RESOLUTIONS`` (AUDIT → 'rework:VALIDATE':
         no rework:AUDIT exists in the vocabulary — the re-validation cost is
         accepted; the transition tables stay untouched). Missing facts
-        (no event_seq, no limit mark, unmapped from_state such as MERGE_GATE)
+        (no event_seq, no limit mark, or a from_state absent from the map)
         leave the row open for the architect — never guessed (Doctrine §7).
         Phase-level rows are out of scope by construction (the incident-7 gate
         only inserts stage rows — phase spawns are the D-0036 watch item); the
@@ -1314,14 +1314,20 @@ _CAPACITY_RESOLVE_REASON = (
 #: test; the §3 transition tables are NOT touched). AUDIT maps to
 #: 'rework:VALIDATE' because no rework:AUDIT token exists in the vocabulary —
 #: the limit-killed auditor re-enters through a fresh validation pass
-#: (re-validation cost accepted). MERGE_GATE is deliberately absent: a
-#: limit-killed Tier-2 run has no declared mapping — it stays open for the
-#: architect.
+#: (re-validation cost accepted). MERGE_GATE maps to 'rework:MERGE_GATE'
+#: (D-0057): a limit-killed Tier-2 run (agent_run_failed + usage_limit) is the
+#: ONE failure class the architect could not also recover manually, being
+#: frozen by the SAME weekly limit (incidents [61]/[53]). Re-entering ONLY the
+#: gate is safe — the trigger='agent_run_failed' filter structurally excludes
+#: unresolved_contest, and a stage AT merge-gate has definitionally passed
+#: structural validation + dual AUDIT, so the architect-operations §3
+#: misapplication risks (unresolved_contest / pre-AUDIT) cannot arise.
 _CAPACITY_RESOLUTIONS: Mapping[str, str] = {
     "SPEC": "rework:SPEC",
     "BUILD": "rework:BUILD",
     "VALIDATE": "rework:VALIDATE",
     "AUDIT": "rework:VALIDATE",
+    "MERGE_GATE": "rework:MERGE_GATE",
 }
 
 

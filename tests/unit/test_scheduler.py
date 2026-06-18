@@ -4879,9 +4879,10 @@ async def test_capacity_resolution_map_audit_maps_to_rework_validate(
     db, config_dict, tmp_path
 ) -> None:
     """from_state -> token mapping (D-0037 item 5): AUDIT resolves as
-    'rework:VALIDATE' (no rework:AUDIT exists in the vocabulary — pinned), the
-    map's values all belong to STAGE_ESCALATION_RESOLUTIONS, and the routing
-    re-enters VALIDATE through the untouched transition table."""
+    'rework:VALIDATE' (no rework:AUDIT exists in the vocabulary — pinned),
+    MERGE_GATE resolves as 'rework:MERGE_GATE' (D-0057), the map's values all
+    belong to STAGE_ESCALATION_RESOLUTIONS, and the routing re-enters VALIDATE
+    through the untouched transition table."""
     from sf_factory.models import STAGE_ESCALATION_RESOLUTIONS
 
     assert sched_mod._CAPACITY_RESOLUTIONS == {
@@ -4889,17 +4890,19 @@ async def test_capacity_resolution_map_audit_maps_to_rework_validate(
         "BUILD": "rework:BUILD",
         "VALIDATE": "rework:VALIDATE",
         "AUDIT": "rework:VALIDATE",
+        "MERGE_GATE": "rework:MERGE_GATE",
     }
     assert set(sched_mod._CAPACITY_RESOLUTIONS.values()) <= set(
         STAGE_ESCALATION_RESOLUTIONS
     )
-    # DELIBERATE absence (scheduler.py:_CAPACITY_RESOLUTIONS comment): a
-    # limit-killed Tier-2 (MERGE_GATE) has NO auto-resolve mapping — it stays
-    # open for the architect. The 'rework:MERGE_GATE' token exists ONLY for the
-    # manual `resolve-escalation` path, never for the capacity governor, so
-    # neither the from_state key nor the resolution token may appear here.
-    assert "MERGE_GATE" not in sched_mod._CAPACITY_RESOLUTIONS
-    assert "rework:MERGE_GATE" not in sched_mod._CAPACITY_RESOLUTIONS.values()
+    # D-0057: MERGE_GATE IS now mapped (deliberately ABSENT pre-D-0057). A
+    # limit-killed Tier-2 (agent_run_failed + usage_limit) is the ONE failure
+    # class the architect could not recover manually — frozen by the SAME weekly
+    # limit (incidents [61]/[53]). The capacity governor auto-resolves it to
+    # 'rework:MERGE_GATE' (re-runs ONLY the gate); safe because _auto_resolve's
+    # trigger='agent_run_failed' filter structurally excludes unresolved_contest
+    # and a stage at merge-gate has passed structural validation + dual AUDIT.
+    assert sched_mod._CAPACITY_RESOLUTIONS["MERGE_GATE"] == "rework:MERGE_GATE"
 
     env = make_governor_env(db, config_dict, tmp_path, risk="structural")
     with db.transaction() as conn:
