@@ -71,7 +71,12 @@ budgets:
                             # RUNAWAYS, not honest rework; max_fix_iterations/churn are the loop guards. BOUNDED:
                             # split a structural stage that exceeds 250M (do NOT extend again).
                             # (History: D-0039 75→120 for document-engine; D-0045 120→200.) Revisit downward once split.
-    critical: 250000000   # D-0045: 220M→250M (founder-approved 15-06-2026). auth-access PASSED everything
+    critical: 280000000   # D-0058: 250M→280M ONE-TIME for warehouse-issue completion (founder-approved 18-06-2026:
+                          # core stock stage hit the 250M cap with a trivial low fix left). REVERT to 250M after
+                          # warehouse-issue is DONE — the cap stays 250M + the split-discipline stands for ALL
+                          # other/future critical stages (founder's "pentru etapa asta" = this stage only).
+                          # --- prior rationale (cap history) ---
+                          # D-0045: 220M→250M (founder-approved 15-06-2026). auth-access PASSED everything
                           # (validate + dual-audit + human re-confirm + merge-gate Tier-1/Tier-2 green) but the
                           # final integration check's own cost tipped it to 225.65M — 2.6% over the 220M cap, a
                           # COMPLETION overage, NOT a runaway. rework:MERGE_GATE re-runs the integration_validator
