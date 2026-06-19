@@ -33,6 +33,8 @@ import signal
 import sqlite3
 import sys
 import traceback
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1026,6 +1028,21 @@ class CapacityGovernor:
         self._delivery_failed_logged = False
         #: Same dedup, separate streak, for the UNIT 3 architect resume page.
         self._architect_resume_failed_logged = False
+        #: D-0059 PROACTIVE limit hold — independent of the reactive ``_held``
+        #: (entry: a %-threshold cross on the live OAuth usage; exit: usage back
+        #: under BOTH thresholds, NEVER the canary probe). The ``blocks`` gate is
+        #: shared, so a step held by either reason behaves identically.
+        self._proactive_held = False
+        #: Loop-clock deadline of the next OAuth usage poll (0.0 ⇒ poll on the
+        #: first tick so the limit state is known at startup).
+        self._next_limit_poll_at = 0.0
+        #: One alert event + one founder page per usage-poll-failure streak (the
+        #: proactive guard is blind while the query fails; reactive still backs up).
+        self._limit_poll_failed_logged = False
+        #: Separate streak latch for the proactive founder pages (never shares the
+        #: reactive ``_delivery_failed_logged``, so a proactive success can't clear
+        #: the reactive latch and vice-versa).
+        self._proactive_page_failed_logged = False
 
     @property
     def enabled(self) -> bool:
@@ -1033,13 +1050,15 @@ class CapacityGovernor:
 
     @property
     def held(self) -> bool:
-        return self._held
+        """Held for EITHER reason — the reactive signature hold or the D-0059
+        proactive %-threshold hold. The executor gate reads this."""
+        return self._held or self._proactive_held
 
     def blocks(self, roles: Sequence[str]) -> bool:
-        """True when the capacity hold gates a step that would spawn any
-        claude-route role. Config-unknown roles never block here — their
-        fail-explicit ConfigError belongs to the step itself."""
-        if not self._held:
+        """True when a capacity hold (reactive OR proactive) gates a step that
+        would spawn any claude-route role. Config-unknown roles never block
+        here — their fail-explicit ConfigError belongs to the step itself."""
+        if not self.held:
             return False
         models = self._cfg.models
         return any(role in models and models[role].cli == "claude" for role in roles)
@@ -1096,6 +1115,24 @@ class CapacityGovernor:
                         ),
                     },
                 )
+        # D-0059: the proactive hold is in-memory too — close a stale pair so the
+        # dashboard never shows a proactive hold no live governor owns; the next
+        # usage poll re-discovers it if still over threshold.
+        if self._proactive_hold_pair_open(self._db.read()):
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level="factory",
+                    unit_id=None,
+                    event_type="proactive_limit_hold_ended",
+                    actor=_ACTOR,
+                    payload={
+                        "reason": (
+                            "orchestrator restart — proactive hold is in-memory and"
+                            " is re-discovered on the next usage poll (D-0059)"
+                        ),
+                    },
+                )
 
     @staticmethod
     def _hold_pair_open(conn: sqlite3.Connection) -> bool:
@@ -1108,11 +1145,26 @@ class CapacityGovernor:
         ).fetchone()
         return int(row[0]) > int(row[1])
 
+    @staticmethod
+    def _proactive_hold_pair_open(conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT"
+            " COALESCE(MAX(CASE WHEN event_type='proactive_limit_hold_started' THEN seq END), 0),"
+            " COALESCE(MAX(CASE WHEN event_type='proactive_limit_hold_ended' THEN seq END), 0)"
+            " FROM events WHERE event_type IN"
+            " ('proactive_limit_hold_started','proactive_limit_hold_ended')"
+        ).fetchone()
+        return int(row[0]) > int(row[1])
+
     async def tick(self) -> None:
-        """Scheduler-loop hook: when held and the probe is due, run it INLINE.
-        The await is bounded well under the watchdog staleness threshold (see
-        ``_probe``), and running executor tasks continue concurrently — only
-        new dispatches wait out the canary."""
+        """Scheduler-loop hook (every loop_tick_s). TWO independent concerns:
+        FIRST the D-0059 proactive usage poll (own interval) so a fresh
+        threshold cross holds new spawns before this tick's dispatch; THEN —
+        only while a REACTIVE hold is active and its probe interval elapsed —
+        the canary hold-exit probe run INLINE. The await is bounded well under
+        the watchdog staleness threshold (see ``_probe``), and running executor
+        tasks continue concurrently — only new dispatches wait out the canary."""
+        await self._proactive_limit_tick()
         if not self._held:
             return
         now = asyncio.get_running_loop().time()
@@ -1120,6 +1172,165 @@ class CapacityGovernor:
             return
         self._next_probe_at = now + self._cfg.capacity_governor.probe_interval_s
         await self._probe()
+
+    async def _proactive_limit_tick(self) -> None:
+        """D-0059 (founder-directed 19-06-2026): poll the LIVE OAuth usage on its
+        own interval and hold/lift the PROACTIVE cap. Active only under
+        ``enabled`` + ``proactive_enabled`` (a disabled governor never polls —
+        the byte-identical invariant). A failed query is fail-explicit (Doctrine
+        §7): the current hold state is kept and the reactive signature path backs
+        it up — never a guessed limit. The hold lifts only when BOTH the 5h and
+        weekly utilizations are back under their thresholds (i.e. after the
+        reset); the canary probe NEVER lifts a proactive hold (it would succeed
+        at 80% and defeat the purpose)."""
+        cg = self._cfg.capacity_governor
+        if not (self.enabled and cg.proactive_enabled):
+            return
+        now = asyncio.get_running_loop().time()
+        if now < self._next_limit_poll_at:
+            return
+        self._next_limit_poll_at = now + cg.proactive_poll_interval_s
+        usage = await asyncio.to_thread(self._query_usage)
+        if usage is None:
+            await self._note_poll_failure()
+            return
+        self._limit_poll_failed_logged = False  # streak cleared on a good poll
+        five_hour, seven_day = usage
+        over = (
+            five_hour >= cg.five_hour_threshold_pct
+            or seven_day >= cg.seven_day_threshold_pct
+        )
+        if over and not self._proactive_held:
+            await self._enter_proactive_hold(five_hour, seven_day)
+        elif not over and self._proactive_held:
+            await self._lift_proactive_hold(five_hour, seven_day)
+
+    def _query_usage(self) -> tuple[float, float] | None:
+        """Blocking OAuth usage GET — runs OFF-loop via ``asyncio.to_thread``
+        (the notify.py precedent, §7). Returns ``(five_hour%, seven_day%)`` or
+        ``None`` on ANY failure (missing/short token file, network, malformed
+        body) — never a guessed number (Doctrine §7). sf-limit.sh parity
+        (D-0058): same endpoint, beta header, and credentials key."""
+        cg = self._cfg.capacity_governor
+        try:
+            path = os.path.expanduser(cg.oauth_credentials_path)
+            with open(path, encoding="utf-8") as handle:
+                token = json.load(handle)["claudeAiOauth"]["accessToken"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        request = urllib.request.Request(
+            cg.usage_endpoint,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": cg.usage_beta_header,
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=cg.usage_poll_timeout_s
+            ) as response:
+                data = json.load(response)
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return None
+        try:
+            five_hour = float((data.get("five_hour") or {}).get("utilization"))
+            seven_day = float((data.get("seven_day") or {}).get("utilization"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return five_hour, seven_day
+
+    async def _enter_proactive_hold(self, five_hour: float, seven_day: float) -> None:
+        """Threshold crossed: hold new claude spawns (running agents finish via
+        the SHARED ``blocks`` gate — exactly the founder's "termină în siguranță
+        cei care lucrează"). ONE 'proactive_limit_hold_started' event + an
+        informational founder page (the factory paused ITSELF — notable, but
+        working-as-designed, so default priority, not an alert)."""
+        cg = self._cfg.capacity_governor
+        self._proactive_held = True
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level="factory",
+                unit_id=None,
+                event_type="proactive_limit_hold_started",
+                actor=_ACTOR,
+                payload={
+                    "five_hour": five_hour,
+                    "seven_day": seven_day,
+                    "five_hour_threshold": cg.five_hour_threshold_pct,
+                    "seven_day_threshold": cg.seven_day_threshold_pct,
+                },
+            )
+        await self._page(
+            f"Fabrica drenează proactiv — limită aproape (5h {five_hour:.0f}%"
+            f" / săpt {seven_day:.0f}%): agenții curenți termină, fără spawn-uri noi"
+        )
+
+    async def _lift_proactive_hold(self, five_hour: float, seven_day: float) -> None:
+        """Usage fell back under BOTH thresholds (the reset): release the hold —
+        the next dispatch resumes claude spawns on its own. ONE
+        'proactive_limit_hold_ended' event + a founder page."""
+        self._proactive_held = False
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level="factory",
+                unit_id=None,
+                event_type="proactive_limit_hold_ended",
+                actor=_ACTOR,
+                payload={"five_hour": five_hour, "seven_day": seven_day},
+            )
+        await self._page(
+            f"Capacitate sub prag (5h {five_hour:.0f}% / săpt {seven_day:.0f}%)"
+            f" — fabrica a reluat singură"
+        )
+
+    async def _note_poll_failure(self) -> None:
+        """Fail-explicit (Doctrine §7/§20): the proactive query failed — log ONE
+        'alert' event + page the founder ONCE per failure streak (the proactive
+        guard is blind; the reactive signature path still protects). The streak
+        latch clears on the next successful poll."""
+        if self._limit_poll_failed_logged:
+            return
+        self._limit_poll_failed_logged = True
+        with self._db.transaction() as conn:
+            fdb.insert_event(
+                conn,
+                unit_level="factory",
+                unit_id=None,
+                event_type="alert",
+                actor=_ACTOR,
+                payload={"kind": "proactive_limit_poll_failed"},
+            )
+        await self._page(
+            "Interogarea limitei eșuează — protecția proactivă e oarbă"
+            " (rămâne doar cea reactivă)",
+            priority=self._notify.priority_alert,
+        )
+
+    async def _page(self, title: str, *, priority: str | None = None) -> None:
+        """Founder ntfy page that NEVER raises into the loop (§7): the durable
+        event has already landed; a delivery failure is logged ONCE per streak
+        (its own latch, never the reactive one) and swallowed."""
+        try:
+            await self._notify.publish(
+                title,
+                link=dashboard_link(self._cfg, "acum"),
+                priority=priority if priority is not None else "default",
+            )
+            self._proactive_page_failed_logged = False
+        except NotifyError as exc:
+            if not self._proactive_page_failed_logged:
+                self._proactive_page_failed_logged = True
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level="factory",
+                        unit_id=None,
+                        event_type="alert_delivery_failed",
+                        actor=_ACTOR,
+                        payload={"kind": "proactive_limit_page", "error": str(exc)},
+                    )
 
     async def _probe(self) -> None:
         """One canary run. Success = exit 0 (not killed/timed out) AND no

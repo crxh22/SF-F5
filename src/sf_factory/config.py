@@ -131,6 +131,30 @@ class CapacityGovernorCfg(_StrictModel):
     #: durable resume signal; the founder (noise-sensitive) can suppress it.
     notify_architect_on_resume: bool = True
 
+    #: PROACTIVE %-threshold limit management (D-0059, founder-directed
+    #: 19-06-2026). The orchestrator OAuth-polls the LIVE usage every
+    #: ``proactive_poll_interval_s`` and, BEFORE the wall, holds new claude
+    #: spawns once the 5h OR weekly utilization crosses its threshold —
+    #: running agents finish (the SAME ``blocks`` gate as the reactive hold),
+    #: and the hold lifts on its own once BOTH utilizations fall back under
+    #: their thresholds (i.e. after the reset). The reactive ``note_match``
+    #: signature path stays the backstop (Doctrine §7/§20). Gated UNDER
+    #: ``enabled`` so ``enabled: false`` stays byte-identical to pre-CCR-11.
+    proactive_enabled: bool = False
+    proactive_poll_interval_s: float = Field(default=300, gt=0)
+    #: Hold when five_hour utilization% >= this (founder: 80 for the 5h window).
+    five_hour_threshold_pct: float = Field(default=80, gt=0, le=100)
+    #: Hold when seven_day utilization% >= this (founder: 90 for the weekly
+    #: window — the longer-binding limit, drained later than the 5h).
+    seven_day_threshold_pct: float = Field(default=90, gt=0, le=100)
+    #: OAuth usage source (sf-limit.sh parity, D-0058): GET endpoint, the beta
+    #: header it requires, and the credentials file holding the bearer token
+    #: (``claudeAiOauth.accessToken``). ``~`` is expanded at query time.
+    usage_endpoint: str = "https://api.anthropic.com/api/oauth/usage"
+    usage_beta_header: str = "oauth-2025-04-20"
+    oauth_credentials_path: str = "~/.claude/.credentials.json"
+    usage_poll_timeout_s: float = Field(default=20, gt=0)
+
 
 class ConsultationPointCfg(_StrictModel):
     """id, purpose, inputs: list[str], verdicts: list[str], fallback: str, role: str,

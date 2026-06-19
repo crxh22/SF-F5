@@ -5080,6 +5080,217 @@ def test_recover_reconciles_stale_hold_event_pair(db, config_dict) -> None:
     assert len(_factory_events(db, "capacity_hold_ended")) == 1
 
 
+# ----------------------------------------------- D-0059 proactive %-threshold hold
+
+
+def _proactive_governor(
+    db,
+    config_dict,
+    *,
+    poll_interval_s: float = 0.001,
+    five_hour_threshold_pct: float = 80,
+    seven_day_threshold_pct: float = 90,
+):
+    """A CapacityGovernor with the D-0059 proactive poll ENABLED (on top of
+    _enable_governor). Tests set ``governor._query_usage`` to drive the poll
+    without real HTTP (the instance attr shadows the method asyncio.to_thread
+    invokes)."""
+    _enable_governor(config_dict)
+    cg = config_dict["capacity_governor"]
+    cg["proactive_enabled"] = True
+    cg["proactive_poll_interval_s"] = poll_interval_s
+    cg["five_hour_threshold_pct"] = five_hour_threshold_pct
+    cg["seven_day_threshold_pct"] = seven_day_threshold_pct
+    cfg = make_config(config_dict)
+    notify = FakeNotify()
+    governor = CapacityGovernor(db, cfg, FakeRunner(db), notify)
+    return SimpleNamespace(governor=governor, notify=notify, cfg=cfg)
+
+
+async def test_proactive_hold_enters_on_five_hour_threshold(db, config_dict) -> None:
+    """D-0059: the 5h utilization at/over its threshold (weekly under) enters the
+    proactive hold — ONE 'proactive_limit_hold_started' event (both utils +
+    thresholds) + a founder page — and the SHARED blocks() gate now stops a
+    claude-route spawn while leaving non-claude roles free."""
+    env = _proactive_governor(db, config_dict)
+    env.governor._query_usage = lambda: (80.0, 40.0)  # 5h AT threshold
+    await env.governor.tick()
+    assert env.governor.held is True
+    assert env.governor.blocks(["capacity_probe"]) is True  # claude role gated
+    assert env.governor.blocks([]) is False
+    (started,) = _factory_events(db, "proactive_limit_hold_started")
+    assert started["actor"] == "control_plane"
+    assert json.loads(started["payload_json"]) == {
+        "five_hour": 80.0,
+        "seven_day": 40.0,
+        "five_hour_threshold": 80.0,
+        "seven_day_threshold": 90.0,
+    }
+    (page,) = env.notify.published
+    assert "proactiv" in page[0] and page[2] == "default"
+    # ONE started event per episode: a second over-threshold poll adds none.
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert len(_factory_events(db, "proactive_limit_hold_started")) == 1
+
+
+async def test_proactive_hold_enters_on_weekly_threshold(db, config_dict) -> None:
+    """D-0059: the weekly (seven_day) utilization at/over its threshold enters the
+    hold even with the 5h far under — the weekly limit is managed DISTINCTLY (the
+    founder's 90% knob, the longer-binding window)."""
+    env = _proactive_governor(db, config_dict)
+    env.governor._query_usage = lambda: (10.0, 90.0)  # weekly AT threshold
+    await env.governor.tick()
+    assert env.governor.held is True
+    (started,) = _factory_events(db, "proactive_limit_hold_started")
+    assert json.loads(started["payload_json"])["seven_day"] == 90.0
+
+
+async def test_proactive_no_hold_below_both_thresholds(db, config_dict) -> None:
+    """D-0059: both utilizations under threshold ⇒ no hold, no event, no page."""
+    env = _proactive_governor(db, config_dict)
+    env.governor._query_usage = lambda: (50.0, 50.0)
+    await env.governor.tick()
+    assert env.governor.held is False
+    assert env.governor.blocks(["capacity_probe"]) is False
+    assert _factory_events(db, "proactive_limit_hold_started") == []
+    assert env.notify.published == []
+
+
+async def test_proactive_hold_lifts_only_when_back_under_both(db, config_dict) -> None:
+    """D-0059: the hold lifts ONLY when BOTH utilizations are back under threshold
+    (the reset) — still-over on EITHER keeps it; the lift emits
+    'proactive_limit_hold_ended' + a founder resume page."""
+    env = _proactive_governor(db, config_dict)
+    usage = [(85.0, 95.0)]  # over on both at entry
+    env.governor._query_usage = lambda: usage[0]
+    await env.governor.tick()
+    assert env.governor.held is True
+    # Weekly back under but 5h STILL over — NOT lifted.
+    usage[0] = (85.0, 10.0)
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert env.governor.held is True
+    assert _factory_events(db, "proactive_limit_hold_ended") == []
+    # Back under BOTH — lifts and resumes on its own.
+    usage[0] = (10.0, 10.0)
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert env.governor.held is False
+    assert env.governor.blocks(["capacity_probe"]) is False
+    (ended,) = _factory_events(db, "proactive_limit_hold_ended")
+    assert json.loads(ended["payload_json"]) == {"five_hour": 10.0, "seven_day": 10.0}
+    assert any("reluat" in p[0] for p in env.notify.published)
+
+
+async def test_proactive_poll_failure_is_fail_explicit_and_latched(db, config_dict) -> None:
+    """D-0059 (Doctrine §7): a failed usage query keeps the current state and logs
+    ONE 'alert' (kind proactive_limit_poll_failed) + ONE founder ALERT page per
+    failure streak; a later good poll clears the latch."""
+    env = _proactive_governor(db, config_dict)
+    env.governor._query_usage = lambda: None
+
+    def _failed():
+        return [
+            e
+            for e in _factory_events(db, "alert")
+            if json.loads(e["payload_json"]).get("kind") == "proactive_limit_poll_failed"
+        ]
+
+    await env.governor.tick()
+    assert env.governor.held is False
+    assert len(_failed()) == 1
+    assert len(env.notify.published) == 1
+    assert env.notify.published[0][2] == "max"  # priority_alert
+    # Second consecutive failure: no second event/page (streak latched).
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert len(_failed()) == 1
+    assert len(env.notify.published) == 1
+    # A good poll clears the latch so a future failure re-pages.
+    env.governor._query_usage = lambda: (50.0, 50.0)
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert env.governor._limit_poll_failed_logged is False
+
+
+async def test_proactive_disabled_never_polls(db, config_dict) -> None:
+    """D-0059: proactive_enabled=false ⇒ the poll never runs (no query, no event)
+    — the enabled:false byte-identical invariant extends to the sub-toggle."""
+    _enable_governor(config_dict)
+    config_dict["capacity_governor"]["proactive_enabled"] = False
+    cfg = make_config(config_dict)
+    governor = CapacityGovernor(db, cfg, FakeRunner(db), FakeNotify())
+
+    def _boom():
+        raise AssertionError("must not query usage when proactive disabled")
+
+    governor._query_usage = _boom
+    await governor.tick()  # no reactive _held, proactive off ⇒ pure no-op
+    assert governor.held is False
+    assert _factory_events(db, "proactive_limit_hold_started") == []
+
+
+async def test_proactive_poll_respects_interval(db, config_dict) -> None:
+    """D-0059: within one poll interval the usage is queried at most once
+    (429-safe cadence), regardless of the much faster loop tick."""
+    env = _proactive_governor(db, config_dict, poll_interval_s=300)
+    calls: list[int] = []
+
+    def _count():
+        calls.append(1)
+        return (50.0, 50.0)
+
+    env.governor._query_usage = _count
+    await env.governor.tick()
+    await env.governor.tick()  # within the 300s interval — no second poll
+    assert len(calls) == 1
+
+
+async def test_proactive_canary_probe_does_not_lift_proactive_hold(db, config_dict) -> None:
+    """D-0059: the reactive canary probe NEVER lifts a proactive hold (it would
+    succeed at 80% and defeat the purpose) — with no reactive _held, tick() polls
+    but runs no capacity_probe, and a still-over usage keeps the hold."""
+    env = _proactive_governor(db, config_dict)
+    env.governor._query_usage = lambda: (85.0, 40.0)
+    env.governor._runner.outcomes["capacity_probe"] = [
+        {"exit_code": 0, "result_text": "pong"}
+    ]
+    await env.governor.tick()
+    assert env.governor.held is True
+    await asyncio.sleep(0.005)
+    await env.governor.tick()
+    assert env.governor.held is True  # still over ⇒ still held
+    assert [c for c in env.governor._runner.calls if c.role == "capacity_probe"] == []
+
+
+def test_recover_reconciles_stale_proactive_hold_pair(db, config_dict) -> None:
+    """D-0059 restart honesty: a stale proactive_limit_hold_started with no _ended
+    is closed by recover() so the dashboard never shows a proactive hold no live
+    governor owns; the next poll re-discovers it if still over threshold."""
+    env = _proactive_governor(db, config_dict)
+    with db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="factory",
+            unit_id=None,
+            event_type="proactive_limit_hold_started",
+            actor="control_plane",
+            payload={"five_hour": 85.0, "seven_day": 40.0},
+        )
+    sm = StateMachine(db)
+    executors = {
+        Level.PHASE: ScriptedExecutor(Level.PHASE, db, sm),
+        Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm),
+    }
+    scheduler = Scheduler(db, sm, env.cfg, executors, env.notify, governor=env.governor)
+    scheduler.recover()
+    (ended,) = _factory_events(db, "proactive_limit_hold_ended")
+    assert "restart" in json.loads(ended["payload_json"])["reason"]
+    scheduler.recover()  # idempotent: closed pair adds no second event
+    assert len(_factory_events(db, "proactive_limit_hold_ended")) == 1
+
+
 def test_build_prompt_forbids_self_commit(db, config_dict, tmp_path) -> None:
     """CCR-8: the Builder prompt carries the no-self-commit line — an agent
     committing its own work would hide changes from the control plane's

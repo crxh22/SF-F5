@@ -118,6 +118,15 @@ capacity_governor:
   # On hold lift, also page the architect ("reia lucrul") so it resumes alone
   # (D-0042, robustness UNIT 3). Default-on; set false to suppress the second buzz.
   notify_architect_on_resume: true
+  # D-0059 (founder-directed 19-06-2026): PROACTIVE %-threshold drain. The
+  # orchestrator OAuth-polls the live usage every proactive_poll_interval_s and,
+  # BEFORE the wall, holds new claude spawns once the 5h OR weekly utilization
+  # crosses its threshold; running agents finish; the hold lifts on its own once
+  # BOTH are back under threshold (after the reset). Reactive note_match backstops.
+  proactive_enabled: true
+  proactive_poll_interval_s: 300   # ~12 polls/hr, 429-safe (sf-limit.sh cadence)
+  five_hour_threshold_pct: 80      # founder 19-06: hold at 80% of the 5h window
+  seven_day_threshold_pct: 90      # founder 19-06: hold at 90% of the weekly window
 
 pricing:
   # USD per 1M tokens, keyed by LEDGER model strings (design §11.1, CCR-10). Founder-tunable;

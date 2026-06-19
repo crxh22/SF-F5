@@ -109,6 +109,7 @@ RO: Mapping[str, str] = {
     "pulse_stale": "posibil căzut",
     "pulse_now": "acum",
     "capacity_hold": "pauză de capacitate — sondez la fiecare {minutes} min",
+    "proactive_limit_hold": "pauză proactivă de limită — reia automat după reset",
     "phases_label": "Faze",
     "queue_label": "Coadă etape",
     "queue_waiting": "în așteptarea dependențelor",
@@ -953,6 +954,10 @@ class HealthStrip:
     #: active (a capacity_hold_started event without a later _ended one —
     #: read-path only); None otherwise.
     capacity_hold_display: str | None = None
+    #: D-0059: set when a PROACTIVE %-threshold limit hold is active (a
+    #: proactive_limit_hold_started event without a later _ended one); None
+    #: otherwise. Read-path only — the governor owns the writes.
+    proactive_limit_hold_display: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1306,21 @@ def _build_health(
         minutes = max(1, round(cfg.capacity_governor.probe_interval_s / 60))
         capacity_hold_display = RO["capacity_hold"].format(minutes=minutes)
 
+    # D-0059: the PROACTIVE limit hold has its OWN event pair (distinct from the
+    # reactive one above) so the two never collide; same MAX-seq read-path.
+    proactive_row = conn.execute(
+        "SELECT"
+        " COALESCE(MAX(CASE WHEN event_type='proactive_limit_hold_started' THEN seq END), 0)"
+        " AS started,"
+        " COALESCE(MAX(CASE WHEN event_type='proactive_limit_hold_ended' THEN seq END), 0)"
+        " AS ended"
+        " FROM events WHERE event_type IN"
+        " ('proactive_limit_hold_started','proactive_limit_hold_ended')"
+    ).fetchone()
+    proactive_limit_hold_display = None
+    if int(proactive_row["started"]) > int(proactive_row["ended"]):
+        proactive_limit_hold_display = RO["proactive_limit_hold"]
+
     resolved_row = conn.execute(
         "SELECT * FROM escalations WHERE status = 'resolved'"
         " ORDER BY resolved_at DESC, id DESC LIMIT 1"
@@ -1333,6 +1353,7 @@ def _build_health(
         escalations=tuple(escalations),
         last_resolved=last_resolved,
         capacity_hold_display=capacity_hold_display,
+        proactive_limit_hold_display=proactive_limit_hold_display,
     )
 
 
@@ -1741,10 +1762,18 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if health.capacity_hold_display
         else ""
     )
+    # D-0059: the proactive limit hold shows its own Puls line (the factory
+    # paused itself near the limit and resumes after the reset).
+    proactive_hold_line = (
+        f"<p class='rosu'>{esc(health.proactive_limit_hold_display)}</p>"
+        if health.proactive_limit_hold_display
+        else ""
+    )
     blocks.append(
         _bloc(
             RO["pulse_label"],
-            f"<p>{esc(health.liveness_display)}{stale_mark}</p>{hold_line}",
+            f"<p>{esc(health.liveness_display)}{stale_mark}</p>"
+            f"{hold_line}{proactive_hold_line}",
         )
     )
 
