@@ -1615,3 +1615,71 @@ class TestListDagEdges:
             ("ph-1", "ph-3"),
             ("ph-2", "ph-3"),
         ]
+
+
+def test_prior_disposed_finding_and_recurrence_event(seeded_stage: Database) -> None:
+    """D-0059: prior_disposed_finding flags a SETTLED/OVERRULED (stage, ref) and
+    None otherwise; _note_finding_recurrence emits ONE finding_recurrence event for
+    a re-raised disposed ref and nothing for a fresh ref (the recurrence backstop,
+    architect-operations §1)."""
+    import json as _json
+
+    from sf_factory.db import prior_disposed_finding
+    from sf_factory.scheduler import _note_finding_recurrence
+
+    with seeded_stage.transaction() as conn:
+        report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))
+        for ref, status in (
+            ("CE-AUDIT-1", "settled"),
+            ("AA-A2", "overruled"),
+            ("OPEN-1", "open"),
+        ):
+            insert_finding(
+                conn,
+                Finding(
+                    None, "st-1", "auditor_cross_model", ref, "major", report,
+                    status, None, None, T0, T0,
+                ),
+            )
+    conn = seeded_stage.read()
+    A = "auditor_cross_model"
+    assert prior_disposed_finding(conn, "st-1", "CE-AUDIT-1", A) == "settled"
+    assert prior_disposed_finding(conn, "st-1", "AA-A2", A) == "overruled"
+    assert prior_disposed_finding(conn, "st-1", "OPEN-1", A) is None  # open is not a disposition
+    assert prior_disposed_finding(conn, "st-1", "NEVER", A) is None
+    # cross-auditor: a DIFFERENT auditor reusing the same ref string is a DISTINCT
+    # finding (finding_ref is report-scoped), NOT a recurrence — no false positive.
+    assert prior_disposed_finding(conn, "st-1", "CE-AUDIT-1", "auditor_same_model") is None
+
+    with seeded_stage.transaction() as conn:
+        _note_finding_recurrence(
+            conn, "st-1",
+            [{"ref": "CE-AUDIT-1"}, {"ref": "FRESH"}],
+            auditor="auditor_cross_model",
+        )
+    rows = (
+        seeded_stage.read()
+        .execute("SELECT payload_json FROM events WHERE event_type = 'finding_recurrence'")
+        .fetchall()
+    )
+    assert len(rows) == 1
+    assert _json.loads(rows[0]["payload_json"]) == {
+        "auditor": "auditor_cross_model",
+        "recurred": [{"ref": "CE-AUDIT-1", "prior_disposition": "settled"}],
+    }
+    # a fresh-only round, AND a different auditor reusing the disposed ref, emit nothing new
+    with seeded_stage.transaction() as conn:
+        _note_finding_recurrence(
+            conn, "st-1", [{"ref": "FRESH"}], auditor="auditor_cross_model"
+        )
+        _note_finding_recurrence(
+            conn, "st-1", [{"ref": "CE-AUDIT-1"}], auditor="auditor_same_model"
+        )
+    assert (
+        len(
+            seeded_stage.read()
+            .execute("SELECT 1 FROM events WHERE event_type = 'finding_recurrence'")
+            .fetchall()
+        )
+        == 1
+    )

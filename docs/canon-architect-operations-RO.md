@@ -24,7 +24,8 @@ niciodată „anulează-și-amână":
 - **Artefactul e genuin greșit** — SPECIFICAȚIA/contractul afirmă ceva ce codul corect NU face
   (textul minte despre cod). → Amendează textul acum (`rework:SPEC`). TREBUIE să se schimbe. Dacă
   amendamentul e pur documentar (nu schimbă cod), **trimite-l pe calea documentară ca să nu forțeze
-  o reconstrucție inutilă.** 👻 *(„calea documentară" = mecanismul neconstruit nr. 1)*
+  o reconstrucție inutilă.** ✅ *(„calea documentară" = `rework:SPEC_DOC`, ACUM CONSTRUITĂ — D-0059:
+  amendează textul, sare peste BUILD direct la VALIDATE; validarea+auditul verifică mecanic)*
 
 - **Constatarea e corectă dar nu cere acțiune** — și codul și specificația sunt bune; observația e
   adevărată dar comportamentul e acceptat (ex. o margine mai restrictivă, auto-vindecătoare; o idee
@@ -35,8 +36,9 @@ niciodată „anulează-și-amână":
 
 **Flag-ul mecanic de recurență de pe dashboard e plasa de siguranță:** dacă o constatare pe care ai
 închis-o sau anulat-o reapare, ăsta e semnalul că rădăcina n-a fost reparată cu adevărat —
-întoarce-te la artefactul generator, nu anula din nou. 👻 *(„flag-ul de recurență" = mecanismul
-neconstruit nr. 2)*
+întoarce-te la artefactul generator, nu anula din nou. ✅ *(„flag-ul de recurență" = evenimentul
+`finding_recurrence`, ACUM CONSTRUIT — D-0059: se aprinde când un audit re-ridică o constatare pe care
+ACELAȘI auditor a închis-o; vizibil pe dashboard + în monitor)*
 
 ## 2. Cară DE CE-ul în rolul re-intrat
 

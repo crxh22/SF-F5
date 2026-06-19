@@ -110,6 +110,7 @@ RO: Mapping[str, str] = {
     "pulse_now": "acum",
     "capacity_hold": "pauză de capacitate — sondez la fiecare {minutes} min",
     "proactive_limit_hold": "pauză proactivă de limită — reia automat după reset",
+    "finding_recurrence": "⚠ recurență constatări pe {n} etap(e) — rădăcina nereparată",
     "phases_label": "Faze",
     "queue_label": "Coadă etape",
     "queue_waiting": "în așteptarea dependențelor",
@@ -295,6 +296,7 @@ GLOSS: Mapping[str, str] = {
     "approved": "aprobă",
     "rework:BUILD": "refă construcția",
     "rework:SPEC": "refă specificația",
+    "rework:SPEC_DOC": "refă specificația (doar text — sare peste construire, re-validează)",
     "changes": "cere modificări",
     "resume": "reia",
     "replan": "replanifică",
@@ -958,6 +960,9 @@ class HealthStrip:
     #: proactive_limit_hold_started event without a later _ended one); None
     #: otherwise. Read-path only — the governor owns the writes.
     proactive_limit_hold_display: str | None = None
+    #: D-0059: set when ≥1 ACTIVE (non-terminal) stage carries a finding_recurrence
+    #: event — a settled/overruled finding reappeared (architect-operations §1).
+    finding_recurrence_display: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1321,6 +1326,20 @@ def _build_health(
     if int(proactive_row["started"]) > int(proactive_row["ended"]):
         proactive_limit_hold_display = RO["proactive_limit_hold"]
 
+    # D-0059: the recurrence backstop (architect-operations §1) — a settled/overruled
+    # finding that reappeared. Count ACTIVE stages (non-terminal) carrying a
+    # finding_recurrence event; a recurrence on a DONE stage is history.
+    recurrence_n = int(
+        conn.execute(
+            "SELECT COUNT(DISTINCT e.unit_id) FROM events e JOIN stages s ON s.id = e.unit_id"
+            " WHERE e.event_type = 'finding_recurrence'"
+            " AND s.state NOT IN ('DONE', 'FAILED', 'CANCELLED')"
+        ).fetchone()[0]
+    )
+    finding_recurrence_display = (
+        RO["finding_recurrence"].format(n=recurrence_n) if recurrence_n else None
+    )
+
     resolved_row = conn.execute(
         "SELECT * FROM escalations WHERE status = 'resolved'"
         " ORDER BY resolved_at DESC, id DESC LIMIT 1"
@@ -1354,6 +1373,7 @@ def _build_health(
         last_resolved=last_resolved,
         capacity_hold_display=capacity_hold_display,
         proactive_limit_hold_display=proactive_limit_hold_display,
+        finding_recurrence_display=finding_recurrence_display,
     )
 
 
@@ -1769,11 +1789,17 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if health.proactive_limit_hold_display
         else ""
     )
+    # D-0059: the recurrence backstop line — a settled/overruled finding reappeared.
+    recurrence_line = (
+        f"<p class='rosu'>{esc(health.finding_recurrence_display)}</p>"
+        if health.finding_recurrence_display
+        else ""
+    )
     blocks.append(
         _bloc(
             RO["pulse_label"],
             f"<p>{esc(health.liveness_display)}{stale_mark}</p>"
-            f"{hold_line}{proactive_hold_line}",
+            f"{hold_line}{proactive_hold_line}{recurrence_line}",
         )
     )
 

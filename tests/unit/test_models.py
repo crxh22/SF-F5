@@ -45,7 +45,8 @@ class TestTransitionTables:
         s = StageState
         expected = {
             s.PENDING: {s.SPEC, s.CANCELLED},
-            s.SPEC: {s.BUILD, s.ESCALATED, s.CANCELLED},
+            # VALIDATE is the D-0059 documentary path (rework:SPEC_DOC skips BUILD).
+            s.SPEC: {s.BUILD, s.VALIDATE, s.ESCALATED, s.CANCELLED},
             s.BUILD: {s.VALIDATE, s.ESCALATED, s.CANCELLED},
             s.VALIDATE: {s.MERGE_GATE, s.AUDIT, s.BUILD, s.SPEC, s.ESCALATED, s.CANCELLED},
             s.AUDIT: {s.MERGE_GATE, s.AWAITING_HUMAN, s.BUILD, s.ESCALATED, s.CANCELLED},

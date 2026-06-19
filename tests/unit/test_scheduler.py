@@ -2435,6 +2435,119 @@ async def test_escalation_resolution_payload_carries_operator_reason(
     assert payload["rework_context"] == "spec is internally contradictory"
 
 
+def _escalate_and_resolve_stage(db, esc_id_out: list, resolution: str, reason: str) -> None:
+    """Put ph.s1 in ESCALATED with one open escalation, then resolve it with
+    ``resolution`` (the CLI's short tx shape) — the D-0059 documentary tests'
+    shared setup."""
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "ESCALATED")
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="stage",
+                unit_id="ph.s1",
+                trigger="cp1_verdict",
+                target="phase_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+    esc_id_out.append(esc_id)
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc_id, resolution)
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="escalation_resolved",
+            actor="main_architect",
+            payload={
+                "escalation_id": esc_id,
+                "resolution": resolution,
+                "reason": reason,
+                "via": "cli",
+            },
+        )
+
+
+def _spec_agent_writing(text: str):
+    def spec_agent(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "spec.md").write_text(text, encoding="utf-8")
+
+    return spec_agent
+
+
+async def test_rework_spec_doc_stamps_documentary_and_skips_build_to_validate(
+    db, config_dict, tmp_path
+) -> None:
+    """D-0059 documentary path: rework:SPEC_DOC stamps documentary:true on the
+    ESCALATED→SPEC transition, and _step_spec then routes SPEC→VALIDATE (skip
+    BUILD) — the expensive code RE-GENERATION is avoided while VALIDATE+AUDIT
+    still re-check the amended spec against the UNCHANGED code (the mechanical
+    guard: a misclassified edit is caught, not trusted on the architect's word)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    out: list = []
+    _escalate_and_resolve_stage(
+        db, out, "rework:SPEC_DOC", "spec line 12 claims a rollback the code never had"
+    )
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_escalated(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC
+    spec_entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "SPEC"
+    ][-1]
+    assert json.loads(spec_entry["payload_json"])["documentary"] is True
+
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("amended spec text")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.VALIDATE  # BUILD skipped
+
+
+async def test_plain_rework_spec_routes_to_build_not_validate(
+    db, config_dict, tmp_path
+) -> None:
+    """Regression pin: plain rework:SPEC carries documentary:false and keeps the
+    normal SPEC→BUILD path (the code IS re-generated)."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    out: list = []
+    _escalate_and_resolve_stage(db, out, "rework:SPEC", "rebuild needed")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    await env.executor._step_escalated(stage)
+    spec_entry = [
+        e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "SPEC"
+    ][-1]
+    assert json.loads(spec_entry["payload_json"])["documentary"] is False
+
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("respec")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    await env.executor._step_spec(stage)
+    assert stage_state(db, "ph.s1") is StageState.BUILD
+
+
+def test_spec_prompt_documentary_instruction(db, config_dict, tmp_path) -> None:
+    """D-0059: a documentary SPEC entry adds the TEXT-ONLY instruction + the
+    'WILL be caught and bounced back' mechanical warning; a normal entry omits it."""
+    env = make_stage_env(db, config_dict, tmp_path)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    phase = fdb.get_phase(db.read(), "ph")
+    doc = env.executor._spec_prompt(
+        stage, phase, env.worktree, {"rework_context": "fix line 12", "documentary": True}
+    )
+    assert "DOCUMENTARY amendment" in doc and "bounced back" in doc
+    plain = env.executor._spec_prompt(
+        stage, phase, env.worktree, {"rework_context": "fix line 12", "documentary": False}
+    )
+    assert "DOCUMENTARY amendment" not in plain
+
+
 async def test_escalation_rework_merge_gate_routes_back_to_merge_gate(
     db, config_dict, tmp_path
 ) -> None:

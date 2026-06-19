@@ -20,6 +20,8 @@ escalation-routing / budget / watchdog / monitor / succession. **PRODUCT** = the
 
 ## B. FACTORY — needs build / fix / decision (actionable; surfaced or sharpened this session)
 
+> **UPDATE (19-06, later same session):** **B1 RESOLVED** — founder directed "both fixes"; the documentary path (`rework:SPEC_DOC`) + the recurrence backstop (`finding_recurrence`) are BUILT, adversarially verified, canon updated (D-0059). **B2 FIXED** (monitor exit-12 pid-anchored). **B5 FIXED** (stale headers corrected). B3/B4 remain trigger-gated watch-items below.
+
 ### B1. ⚠️ CANON GHOSTS — `architect-operations §1` references TWO mechanisms that were never built
 Verified in code this session (no `recurr` in dashboard.py; only `rework:SPEC` full-rebuild exists):
 - **Dashboard recurrence flag (Slice 3 — D-0040/42/43).** §1 states "the mechanical recurrence flag on the dashboard is the backstop: if a finding you settled or overruled reappears…". **NOT built.** The D-0048 do-not-re-raise prompt-memory (scheduler.py:3661) partly serves the GOAL (prevents regeneration at the source), but the named dashboard backstop does not exist.

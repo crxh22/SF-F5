@@ -1003,6 +1003,25 @@ def findings(
     return [_finding_from_row(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def prior_disposed_finding(
+    conn: sqlite3.Connection, stage_id: str, finding_ref: str, auditor_role: str
+) -> str | None:
+    """D-0059 recurrence signal (architect-operations §1): the most-recent SETTLED
+    or OVERRULED disposition of ``(stage_id, finding_ref, auditor_role)``, or None.
+    A NEW audit finding whose ref the SAME auditor already settled/overruled on this
+    stage means the root was not actually fixed — the caller emits a
+    'finding_recurrence' event. The auditor_role is part of the match: finding_ref
+    is report-scoped (not stage-unique), so two different auditors reusing one ref
+    string (e.g. 'F-1') are DISTINCT findings, not a recurrence."""
+    row = conn.execute(
+        "SELECT status FROM audit_findings WHERE stage_id = ? AND finding_ref = ?"
+        " AND auditor_role = ? AND status IN ('settled', 'overruled')"
+        " ORDER BY id DESC LIMIT 1",
+        (stage_id, finding_ref, auditor_role),
+    ).fetchone()
+    return row["status"] if row else None
+
+
 # ----------------------------------------------------------- repository: decisions
 
 

@@ -104,7 +104,8 @@ VALID_STAGE_TRANSITIONS: Mapping[StageState, frozenset[StageState]] = MappingPro
     {
         StageState.PENDING: frozenset({StageState.SPEC, StageState.CANCELLED}),
         StageState.SPEC: frozenset(
-            {StageState.BUILD, StageState.ESCALATED, StageState.CANCELLED}
+            # VALIDATE is the D-0059 documentary path (skip BUILD); the normal exit is BUILD.
+            {StageState.BUILD, StageState.VALIDATE, StageState.ESCALATED, StageState.CANCELLED}
         ),
         StageState.BUILD: frozenset(
             {StageState.VALIDATE, StageState.ESCALATED, StageState.CANCELLED}
@@ -286,6 +287,15 @@ STAGE_ESCALATION_RESOLUTIONS: Mapping[str, StageState] = MappingProxyType(
     {
         "rework:BUILD": StageState.BUILD,
         "rework:SPEC": StageState.SPEC,
+        # D-0059 (founder-directed): documentary spec amendment — the architect
+        # asserts the fix is TEXT-ONLY (no code change). Routes to SPEC like
+        # rework:SPEC, but ``_step_spec`` then skips BUILD straight to VALIDATE:
+        # the expensive code RE-GENERATION is avoided while VALIDATE + AUDIT still
+        # MECHANICALLY verify the amended spec against the unchanged code — a
+        # misclassified "documentary" edit that actually needs a code change is
+        # caught there (the architect's claim is VERIFIED, not trusted). The
+        # documentary intent rides the ESCALATED→SPEC transition payload.
+        "rework:SPEC_DOC": StageState.SPEC,
         "respec": StageState.SPEC,
         "rework:VALIDATE": StageState.VALIDATE,
         # Architect-only, for a merge-gate agent_run_failed (e.g. integration_validator
@@ -306,6 +316,11 @@ STAGE_ESCALATION_RESOLUTIONS: Mapping[str, StageState] = MappingProxyType(
 #: map lookup (mirrors how rework:MERGE_GATE needed its own handling). The CLI
 #: accepts it for the STAGE level only.
 STAGE_NOACTION_RESOLUTION = "settled"
+#: D-0059 documentary spec-amendment resolution. It IS a STAGE_ESCALATION_RESOLUTIONS
+#: key (→SPEC, so the CLI/pin machinery treats it like any rework), but the scheduler
+#: also reads it to stamp ``documentary: true`` on the ESCALATED→SPEC transition payload;
+#: ``_step_spec`` then routes SPEC→VALIDATE (skip BUILD) instead of SPEC→BUILD.
+STAGE_SPEC_DOC_RESOLUTION = "rework:SPEC_DOC"
 PHASE_ESCALATION_RESOLUTIONS: Mapping[str, PhaseState] = MappingProxyType(
     {
         "replan": PhaseState.PLANNING,

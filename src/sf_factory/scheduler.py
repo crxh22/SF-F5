@@ -69,6 +69,7 @@ from sf_factory.models import (
     PHASE_ESCALATION_RESOLUTIONS,
     STAGE_ESCALATION_RESOLUTIONS,
     STAGE_NOACTION_RESOLUTION,
+    STAGE_SPEC_DOC_RESOLUTION,
     ArtifactContractError,
     ConfigError,
     DecisionRequest,
@@ -328,6 +329,36 @@ def _last_transition_payload(
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _note_finding_recurrence(
+    conn: sqlite3.Connection,
+    stage_id: str,
+    findings: Sequence[Mapping[str, object]],
+    *,
+    auditor: str,
+) -> None:
+    """D-0059 mechanical recurrence backstop (architect-operations §1): if an audit
+    raises a ``finding_ref`` already SETTLED or OVERRULED on this stage, the root
+    was not actually fixed. Emit ONE 'finding_recurrence' event (durable —
+    dashboard-surfaced + monitor-greppable) listing the recurring refs + their
+    prior disposition. Called in the SAME tx as the finding insertion, BEFORE it,
+    so the just-raised (status 'open') rows never self-match."""
+    recurred = [
+        {"ref": str(f["ref"]), "prior_disposition": prior}
+        for f in findings
+        if (prior := fdb.prior_disposed_finding(conn, stage_id, str(f["ref"]), auditor))
+        is not None
+    ]
+    if recurred:
+        fdb.insert_event(
+            conn,
+            unit_level=Level.STAGE.value,
+            unit_id=stage_id,
+            event_type="finding_recurrence",
+            actor=_ACTOR,
+            payload={"auditor": auditor, "recurred": recurred},
+        )
 
 
 def _resolution_reason(
@@ -2098,6 +2129,12 @@ class StageExecutor:
         entry = _last_transition_payload(
             conn, Level.STAGE.value, stage.id, StageState.SPEC.value
         )
+        # D-0059 documentary path: the architect asserted a TEXT-ONLY amendment
+        # (rework:SPEC_DOC) — skip BUILD (no code re-generation) and go straight to
+        # VALIDATE, where VALIDATE + AUDIT mechanically verify the amended spec
+        # against the UNCHANGED code (a misclassified edit is caught there, NOT
+        # trusted on the architect's word).
+        documentary = bool(entry and entry.get("documentary"))
         await self._run_step_agent(
             stage,
             "spec_agent",
@@ -2117,9 +2154,13 @@ class StageExecutor:
         self._sm.transition(
             Level.STAGE,
             stage.id,
-            StageState.BUILD.value,
+            (StageState.VALIDATE if documentary else StageState.BUILD).value,
             actor=_ACTOR,
-            reason="spec artifact registered",
+            reason=(
+                "spec amended (documentary) — BUILD skipped, re-validating"
+                if documentary
+                else "spec artifact registered"
+            ),
             coupled=lambda conn: register_artifact(
                 conn,
                 unit_level=Level.STAGE.value,
@@ -2603,6 +2644,7 @@ class StageExecutor:
                         git_commit=sha,
                     )
                     now = utc_now()
+                    _note_finding_recurrence(conn, stage.id, findings, auditor=role)
                     for finding in findings:
                         fdb.insert_finding(
                             conn,
@@ -3102,6 +3144,10 @@ class StageExecutor:
                 "escalation_id": last.id,
                 "resolution": last.resolution,
                 "rework_context": reason,
+                # D-0059: documentary path — _step_spec reads this off the SPEC
+                # entry payload and skips BUILD (→VALIDATE). Only true for the
+                # rework:SPEC_DOC verb; every other resolution flows normally.
+                "documentary": last.resolution == STAGE_SPEC_DOC_RESOLUTION,
             },
             coupled=coupled,
         )
@@ -3479,6 +3525,9 @@ class StageExecutor:
                 git_commit=sha,
             )
             now = utc_now()
+            _note_finding_recurrence(
+                conn, stage.id, findings, auditor="integration_validator"
+            )
             for finding in findings:
                 fdb.insert_finding(
                     conn,
@@ -3585,6 +3634,15 @@ class StageExecutor:
         rework_context = entry_payload.get("rework_context")
         if rework_context:
             context = f"\nRework context: {rework_context}."
+        if entry_payload.get("documentary"):
+            context += (
+                " This is a DOCUMENTARY amendment (rework:SPEC_DOC): change ONLY the"
+                " wording the rework context names so the spec matches the EXISTING"
+                " code — do NOT add, remove, or alter any requirement. The code is NOT"
+                " rebuilt; VALIDATE + AUDIT re-check the amended spec against the"
+                " unchanged code, so a substantive (non-text) change WILL be caught"
+                " and bounced back."
+            )
         extras = []
         if (Path(worktree) / unit_rel / "validation-report.md").is_file():
             extras.append(f"{unit_rel}/validation-report.md")

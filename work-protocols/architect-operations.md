@@ -19,9 +19,15 @@ resolution — never overrule-and-defer:
 
 - **The artifact is genuinely wrong** — the SPEC/contract asserts something the
   code correctly does NOT do (the text lies about the code). → Amend the text now
-  (`rework:SPEC`). It MUST change. If the amendment is purely documentary (it
-  changes no code), route it down the documentary path so it does not force a
-  needless rebuild.
+  (`rework:SPEC`). It MUST change. If the amendment is purely DOCUMENTARY (changes
+  no code), resolve with **`rework:SPEC_DOC`** (D-0059): it amends the spec text
+  then skips BUILD straight to VALIDATE, so the wasteful code re-generation is
+  avoided while VALIDATE + AUDIT still verify the amended spec against the UNCHANGED
+  code — a misclassified (actually-substantive) TIGHTENING is mechanically caught
+  there and bounced back, never trusted on your word. (Caveat: LOOSENING/removing a
+  requirement is NOT mechanically caught — the validator only tests what the spec
+  says — exactly as for plain `rework:SPEC`; that direction stays your judgment +
+  the §9 human gate.)
 
 - **The finding is accurate but warrants no action** — code and spec are both
   fine; the observation is true but the behavior is accepted (e.g. a
@@ -31,9 +37,13 @@ resolution — never overrule-and-defer:
   records it as settled, so later audits do not re-raise it — avoiding both the
   regeneration loop and an unnecessary rebuild.
 
-The mechanical recurrence flag on the dashboard is the backstop: if a finding you
-settled or overruled reappears, that is the signal the root was not actually
-fixed — return to the generating artifact, do not overrule again.
+The mechanical recurrence backstop (D-0059) is the **`finding_recurrence` event** —
+emitted when an audit re-raises a `finding_ref` the SAME auditor already `settled`
+or `overruled` on that stage, surfaced on the dashboard Puls line and your session
+monitor's exit-14 grep. If it fires, the root was not actually fixed — return to the
+generating artifact, do not overrule again. (It fires on `settled`/`overruled` only,
+NOT `sustained`: a sustained finding is expected to be re-raisable while the fix
+lands.)
 
 ## 2. Carry the WHY into the re-entered role
 

@@ -609,6 +609,37 @@ def test_health_strip_capacity_hold_line(denv) -> None:
     assert expected not in dash.render_page(view, denv.cfg)
 
 
+def test_health_strip_finding_recurrence_line(denv) -> None:
+    """D-0059: a finding_recurrence event on an ACTIVE (non-terminal) stage renders
+    a Puls warning line (the recurrence backstop, architect-operations §1); once the
+    stage is DONE the line clears (a recurrence on a finished stage is history)."""
+    from sf_factory.models import Level
+
+    _seed_unit(denv)  # stage ph.s1
+    with denv.db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "AUDIT")  # active
+    assert "recurență" not in dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    with denv.db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id="ph.s1",
+            event_type="finding_recurrence",
+            actor="control_plane",
+            payload={
+                "auditor": "auditor_cross_model",
+                "recurred": [{"ref": "CE-1", "prior_disposition": "settled"}],
+            },
+        )
+    view = dash.build_view(denv.cfg)
+    assert view.health.finding_recurrence_display == dash.RO["finding_recurrence"].format(n=1)
+    assert "recurență" in dash.render_page(view, denv.cfg)
+    # a recurrence on a DONE stage is history -> the line clears
+    with denv.db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "DONE")
+    assert dash.build_view(denv.cfg).health.finding_recurrence_display is None
+
+
 def test_plan_section_groups_and_footer(denv) -> None:
     _seed_unit(denv)
     now = utc_now()
