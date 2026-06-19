@@ -1,0 +1,10 @@
+[Unit]
+Description=SF-F5 architect auto-resume — wake a stuck Main-Architect session after a limit reset (D-0059)
+Documentation=file:///home/artur/projects/SF-F5/docs/decision-log.md
+
+[Service]
+Type=oneshot
+User=artur
+# --act performs the wake (send-keys to the architect's tmux session, or a founder page if it
+# died). A bare run is dry-run. The script is INERT whenever the orchestrator is not running.
+ExecStart=/home/artur/projects/SF-F5/deploy/sf-architect-resume.sh --act

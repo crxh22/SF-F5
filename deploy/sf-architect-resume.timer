@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the SF-F5 architect auto-resume check every 5 min (D-0059)
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=300
+AccuracySec=15
+
+[Install]
+WantedBy=timers.target

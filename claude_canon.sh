@@ -91,6 +91,9 @@ if [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
 # inside a tmux pane (interactive + $TMUX) and wants claude in that pane. NEVER direct
 # for a non-interactive launch — that is the headless trap.
 if [ -n "${SFF5_NO_TMUX:-}" ] || { [ -n "${TMUX:-}" ] && [ "$INTERACTIVE" = 1 ]; }; then
+  # D-0059: record the architect's tmux session name for the auto-resume watchdog. Here the
+  # session is the EXISTING one ($TMUX); NO_TMUX has none, so skip. Never abort the launch.
+  [ -n "${TMUX:-}" ] && { tmux display-message -p '#S' > "$HOME/.claude/sf-architect-tmux" 2>/dev/null || true; }
   exec "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@"
 fi
 
@@ -99,6 +102,10 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
+# D-0059: record the architect's tmux session name (this is the session about to be created,
+# interactive -A or programmatic -d) so the auto-resume watchdog can send-keys to it. The
+# `|| true` keeps a write failure from aborting the launch (set -e).
+printf '%s\n' "$TMUX_SESSION" > "$HOME/.claude/sf-architect-tmux" 2>/dev/null || true
 CMD="$(printf '%q ' "$CLAUDE_BIN" --append-system-prompt-file "$CANONFILE" --model "$SFF5_MODEL" --effort "${SFF5_EFFORT:-max}" "${RC_ARGS[@]}" "$@")"
 if [ "$INTERACTIVE" = 1 ]; then
   # Human at a terminal: attach-or-create (they want to SEE the session).
