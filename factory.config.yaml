@@ -71,10 +71,14 @@ budgets:
                             # RUNAWAYS, not honest rework; max_fix_iterations/churn are the loop guards. BOUNDED:
                             # split a structural stage that exceeds 250M (do NOT extend again).
                             # (History: D-0039 75→120 for document-engine; D-0045 120→200.) Revisit downward once split.
-    critical: 280000000   # D-0058: 250M→280M ONE-TIME for warehouse-issue completion (founder-approved 18-06-2026:
-                          # core stock stage hit the 250M cap with a trivial low fix left). REVERT to 250M after
-                          # warehouse-issue is DONE — the cap stays 250M + the split-discipline stands for ALL
-                          # other/future critical stages (founder's "pentru etapa asta" = this stage only).
+    critical: 364000000   # D-0060 (founder-directed 19-06-2026, ETAPA-5n): 280M→364M (+30%) — stocktaking (~260M)
+                          # and warehouse-issue (~274M) are at the wall and need headroom to clear AUDIT/§9/merge-gate
+                          # ("altfel nu vor trece de gate integrare"). SUPERSEDES the planned 280M→250M revert.
+                          # Applied as the shared critical cap (no per-stage override exists), harmless to the
+                          # under-cap criticals (returns-supplier-client ~174M, supplier-fiscal-invoice ~156M).
+                          # Takes effect on the NEXT orchestrator restart (config is load-once). NOTE: this EXTENDS
+                          # rather than splits — the split-discipline still stands for FUTURE critical stages (plan
+                          # them finer; do not keep raising the ceiling). (Prior: D-0058 250M→280M ONE-TIME for warehouse-issue.)
                           # --- prior rationale (cap history) ---
                           # D-0045: 220M→250M (founder-approved 15-06-2026). auth-access PASSED everything
                           # (validate + dual-audit + human re-confirm + merge-gate Tier-1/Tier-2 green) but the
