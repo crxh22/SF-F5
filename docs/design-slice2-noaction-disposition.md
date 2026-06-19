@@ -1,6 +1,6 @@
 # Design — finding-regeneration slice 2: the `settled` (no-action) disposition + triage write-isolation
 
-**Status:** DESIGNED (14-06-2026, ETAPA-5c), code-grounded via a Plan agent. NOT yet built. Build in 2 verified units (A then B), batch into the next consolidated deploy. Supersedes the loose "4th triage verb" framing in the D-0040 handoff — `architect-operations.md §1` (no-action is the architect's call) governs.
+**Status:** ✅ BUILT + MERGED (D-0043/D-0044) — the `settled` no-action disposition is in use (e.g. [21], [72]). [Header corrected 19-06-2026 — D-0059 inventory.] ⚠️ SIBLING slices from the same D-0040 finding-regeneration program remain NOT built: **slice 3** (the dashboard recurrence flag) and **slice 4** (the documentary spec-amendment path) — both are still REFERENCED as live in `architect-operations.md §1`; see the D-0059 factory-management inventory for the build-or-amend decision. ~~DESIGNED (14-06-2026, ETAPA-5c), code-grounded via a Plan agent. NOT yet built.~~ Build in 2 verified units (A then B), batch into the next consolidated deploy. Supersedes the loose "4th triage verb" framing in the D-0040 handoff — `architect-operations.md §1` (no-action is the architect's call) governs.
 
 ## Root being fixed
 Accurate audit findings REGENERATE every round (CE-AUDIT-1 ×3, AA-A2 ×2+): the auditor runs in CLEAN context each round and `_audit_prompt` (scheduler.py ~3270) feeds it NO memory of prior adjudications, so it re-raises; the triage vocab {comply,contest,duplicate} has no "accurate·acknowledged·no-action·closed" disposition.
