@@ -61,7 +61,7 @@ if [ -f "$LIVENESS" ]; then
   [ "$lage" -lt "$STALENESS_S" ] && orch=1
 fi
 if [ "$orch" -eq 1 ]; then
-  pid=$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null || true)
+  pid=$(head -1 "$PIDFILE" 2>/dev/null | tr -dc '0-9' || true)
   if [ -z "$pid" ] || ! grep -qaE 'sf_factory|sf-factory' "/proc/$pid/cmdline" 2>/dev/null; then orch=0; fi
 fi
 
