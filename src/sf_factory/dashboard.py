@@ -174,9 +174,14 @@ RO: Mapping[str, str] = {
     "col_step": "Pas atins",
     "col_risk": "Clasă de risc",
     "col_tokens": "Tokeni (mii)",
-    "col_burn": "Consum (mii)",
+    "col_effective": "Efectiv (mii)",
+    "col_total_tok": "Total (mii)",
     "col_cap": "Plafon (mii)",
     "col_pct": "%",
+    "budget_effective_note": (
+        "Efectiv = Total − tokenii rulărilor picate / omorâte / expirate "
+        "(acelea nu se numără la buget). Bugetul se declanșează pe Efectiv."
+    ),
     "col_kind": "Tip",
     "col_file": "Fișier",
     "col_when": "Când",
@@ -1068,7 +1073,8 @@ class BudgetRow:
     stage_id: str
     name: str
     risk_class: str
-    tokens: int
+    tokens: int  # TOTAL spend (incl failed runs)
+    effective_tokens: int  # total − failed-run spend (the §2 budget trigger basis)
     budget: int | None
 
 
@@ -1479,6 +1485,11 @@ def _build_health(
             if state in active_states
             else 0
         )
+        effective = (
+            fdb.effective_token_sum(conn, Level.STAGE.value, srow["id"])
+            if state in active_states
+            else 0
+        )
         if category is SchedCategory.RUNNING:
             running.append(
                 RunningStage(
@@ -1501,6 +1512,7 @@ def _build_health(
                     name=srow["name"],
                     risk_class=srow["risk_class"],
                     tokens=tokens,
+                    effective_tokens=effective,
                     budget=cfg.budgets.per_stage.get(srow["risk_class"]),
                 )
             )
@@ -2339,7 +2351,8 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     budget_rows = []
     for row in health.budgets:
         if row.budget:
-            pct_cell = f"{int(round(100 * row.tokens / row.budget))}%"
+            # § the budget triggers on EFFECTIVE (founder 20-06) -> % on effective.
+            pct_cell = f"{int(round(100 * row.effective_tokens / row.budget))}%"
             cap_cell = _fmt_ktok(row.budget)
         else:
             pct_cell = "—"
@@ -2347,10 +2360,18 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         budget_rows.append(
             f"<tr><td>{esc(row.name)}<span class='token'>({esc(row.stage_id)} ·"
             f" {esc(_glossed(row.risk_class))})</span></td>"
+            f"<td class='num'>{esc(_fmt_ktok(row.effective_tokens))}</td>"
             f"<td class='num'>{esc(_fmt_ktok(row.tokens))}</td>"
             f"<td class='num'>{esc(cap_cell)}</td>"
             f"<td class='num'>{esc(pct_cell)}</td></tr>"
         )
+    # The Efectiv/Total note renders ONLY when some stage actually has wasted
+    # failed-run spend (effective != total) — otherwise it is noise.
+    budget_effective_note = (
+        f"<p class='meta'>{esc(RO['budget_effective_note'])}</p>"
+        if any(b.effective_tokens != b.tokens for b in health.budgets)
+        else ""
+    )
     estimated_part = (
         f" · {esc(RO['budget_estimated_part'])}:"
         f" {esc(_fmt_ktok(health.total_estimated_tokens))} ({esc(RO['estimated_mark'])})"
@@ -2375,7 +2396,9 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     legend = f"<p class='meta'>{esc(RO['cost_legend'])}</p>" if costs_present else ""
     budget_table = (
         _table(
-            f"<th>{esc(RO['col_stage'])}</th><th class='num'>{esc(RO['col_burn'])}</th>"
+            f"<th>{esc(RO['col_stage'])}</th>"
+            f"<th class='num'>{esc(RO['col_effective'])}</th>"
+            f"<th class='num'>{esc(RO['col_total_tok'])}</th>"
             f"<th class='num'>{esc(RO['col_cap'])}</th>"
             f"<th class='num'>{esc(RO['col_pct'])}</th>",
             "".join(budget_rows),
@@ -2386,7 +2409,7 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     blocks.append(
         _bloc(
             RO["budget_label"],
-            f"{budget_table}"
+            f"{budget_table}{budget_effective_note}"
             f"<p class='meta'>{esc(RO['budget_total'])}:"
             f" {esc(_fmt_ktok(health.total_tokens))} {esc(RO['budget_tokens'])}"
             f"{estimated_part}{cost_part}</p>"

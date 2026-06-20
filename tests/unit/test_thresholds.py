@@ -574,12 +574,46 @@ def test_context_budget_fires_at_exactly_the_budget(db, evaluator, factory_confi
     firings = evaluator.evaluate(stage)
     assert _triggers(firings) == [Trigger.CONTEXT_BUDGET]
     assert firings[0].evidence == {
+        "effective_tokens": budget,  # all spend on a successful run -> effective == total
         "total_tokens": budget,
         "budget": budget,
         "risk_class": "routine",
         "context_resets": 0,
         "max_context_resets": factory_config.escalation.max_context_resets,
     }
+
+
+def test_context_budget_excludes_failed_run_spend(db, evaluator, factory_config):
+    """Founder 20-06: the budget triggers on EFFECTIVE consumption — tokens spent
+    by a run that FAILED and delivered nothing (killed/timed_out/non-zero exit) do
+    NOT count. A stage whose TOTAL is over budget but whose EFFECTIVE is under must
+    NOT fire; once effective crosses, the evidence reports both (gap = wasted spend)."""
+    budget = factory_config.budgets.per_stage["routine"]
+    stage = _seed_stage(db, "st-eff", risk_class="routine")
+    # A FAILED run (OOM-killed) burns 2x the budget, delivering nothing.
+    with db.transaction() as conn:
+        failed_pid = insert_process(
+            conn,
+            ProcessRecord(
+                id=None, unit_level="stage", unit_id="st-eff", kind="agent",
+                role="builder_routine", cp_id=None, session_id=None, pid=None,
+                cmdline="stub --scenario oom", cwd=None, state="killed",
+                exit_code=None, ndjson_log_path=None, spawned_at=utc_now(),
+                heartbeat_at=None, ended_at=utc_now(),
+            ),
+        )
+    _seed_usage(db, failed_pid, "st-eff", budget, budget)  # 2*budget, all wasted
+    # A SUCCESSFUL run one token under the cap -> EFFECTIVE under budget.
+    ok_pid = _seed_process(db, "st-eff")
+    _seed_usage(db, ok_pid, "st-eff", budget - 1, 0)
+    assert evaluator.evaluate(stage) == []  # total=3*budget-1 but effective=budget-1: NO fire
+    _seed_usage(db, ok_pid, "st-eff", None, 1)  # +1 effective token crosses the cap
+    firings = evaluator.evaluate(stage)
+    assert _triggers(firings) == [Trigger.CONTEXT_BUDGET]
+    ev = firings[0].evidence
+    assert ev["effective_tokens"] == budget  # the successful run only
+    assert ev["total_tokens"] == 3 * budget  # incl the failed run's 2*budget
+    assert ev["effective_tokens"] < ev["total_tokens"]  # gap = wasted failed-run spend
 
 
 def test_all_null_usage_reads_zero_not_null(db, evaluator):

@@ -25,6 +25,7 @@ from sf_factory.config import FactoryConfig
 from sf_factory.db import (
     Database,
     bump_churn,
+    effective_token_sum,
     insert_fix_iteration,
     open_escalation,
 )
@@ -339,14 +340,17 @@ class ThresholdEvaluator:
         return {"event_seqs": seqs, "event_seq": seqs[-1]}
 
     def _check_context_budget(self, conn: sqlite3.Connection, stage: Stage) -> dict | None:
-        """§2: per-aggregate COALESCE token sum >= budgets.per_stage[risk_class].
+        """§2: per-aggregate EFFECTIVE token sum >= budgets.per_stage[risk_class].
 
-        Estimated rows count toward the total (they are ordinary ledger rows);
-        ``role='decision_session'`` rows are EXCLUDED (CCR-3/D-0017, OPEN-D4):
-        founder conversation must never push a blocked stage into a spurious
-        context reset. The evidence carries context_resets vs
-        escalation.max_context_resets so the caller can apply the §2
-        reset-then-escalate rule mechanically.
+        EFFECTIVE (founder 20-06, [[dashboard-mandate]]) = the COALESCE sum MINUS
+        the spend of agent runs that FAILED and delivered nothing (db._FAILED_RUN_SQL):
+        an infra failure (OOM-kill, timeout) must not push a stage toward a
+        spurious context reset/escalation. Estimated rows count (ordinary ledger
+        rows); ``role='decision_session'`` rows are EXCLUDED (CCR-3/D-0017, OPEN-D4):
+        founder conversation must never count against the conveyor cap. The
+        evidence carries effective + total (the gap = failed-run spend) and
+        context_resets vs escalation.max_context_resets so the caller can apply the
+        §2 reset-then-escalate rule mechanically.
         """
         budget = self._cfg.budgets.per_stage.get(stage.risk_class)
         if budget is None:
@@ -354,16 +358,22 @@ class ThresholdEvaluator:
                 f"stage {stage.id!r} has risk_class {stage.risk_class!r} with no "
                 "budgets.per_stage entry — config/DB drift, cannot evaluate context_budget"
             )
+        effective = effective_token_sum(
+            conn, "stage", stage.id, exclude_role=_DECISION_SESSION_ROLE
+        )
+        if effective < budget:
+            return None
+        # Budget hit: compute the total (excl decision_session, INCL failed runs)
+        # for the evidence — its gap to effective is the wasted failed-run spend.
         total = int(
             conn.execute(
                 _CONTEXT_BUDGET_TOKENS_SQL,
                 {"s": stage.id, "excluded_role": _DECISION_SESSION_ROLE},
             ).fetchone()[0]
         )
-        if total < budget:
-            return None
         resets = int(conn.execute(_CONTEXT_RESETS_SQL, {"s": stage.id}).fetchone()[0])
         return {
+            "effective_tokens": effective,
             "total_tokens": total,
             "budget": budget,
             "risk_class": stage.risk_class,

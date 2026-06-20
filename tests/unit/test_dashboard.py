@@ -590,7 +590,7 @@ def test_health_strip_budget_and_incident(denv) -> None:
     liveness.write_text("tick\n", encoding="utf-8")
     page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
     assert "142 mii tokeni" in page  # tokens in THOUSANDS: 142_000 -> "142" (founder 20-06)
-    assert "Consum (mii)" in page  # burn column relabeled to thousands
+    assert "Efectiv (mii)" in page and "Total (mii)" in page  # budget table: effective vs total
     assert "%" in page
     assert dash.RO["pulse_stale"] not in page
     assert "consum de tokeni neraportat (usage_missing)" in page  # Ultimul incident
@@ -1991,7 +1991,8 @@ def test_tables_structure_chips_and_plan_groups(denv) -> None:
     # Health-strip tables: Faze / Etape în lucru / Buget headers + numeric cells.
     assert dash.RO["col_phase"] in page and dash.RO["col_progress"] in page
     assert dash.RO["running_label"] in page and dash.RO["col_step"] in page
-    assert dash.RO["col_burn"] in page and dash.RO["col_cap"] in page
+    assert dash.RO["col_effective"] in page and dash.RO["col_total_tok"] in page
+    assert dash.RO["col_cap"] in page
     assert "class='num'" in page
     # Chips: color supplementary, gloss text always inside.
     assert _re.search(r"<span class='chip chip-accent'>[^<]*\(BUILD\)</span>", page)

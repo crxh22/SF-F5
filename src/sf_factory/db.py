@@ -673,6 +673,48 @@ def unit_token_total(conn: sqlite3.Connection, unit_level: str, unit_id: str) ->
     return int(row[0])
 
 
+#: A process run that FAILED and delivered nothing — its token spend is EXCLUDED
+#: from EFFECTIVE consumption (founder 20-06: the budget applies to effective,
+#: not total). Maps the founder's own words: „picat” = exit_code != 0; „omorât” =
+#: killed; „expirat” = timed_out (+ orphaned). An exit-0 declared-failure run is
+#: treated as DELIVERED — not DB-distinguishable, rarer, and visible per-run in
+#: /costuri. Running/spawned (in-flight) and clean exit-0 rows COUNT — a live
+#: runaway must still reach its cap. The SINGLE source of the predicate (§9).
+_FAILED_RUN_SQL = (
+    "(pr.state IN ('timed_out', 'killed', 'orphaned')"
+    " OR (pr.state = 'exited' AND COALESCE(pr.exit_code, 0) <> 0))"
+)
+
+
+def effective_token_sum(
+    conn: sqlite3.Connection,
+    unit_level: str,
+    unit_id: str,
+    *,
+    exclude_role: str | None = None,
+) -> int:
+    """EFFECTIVE token consumption for one unit (founder 20-06): the per-aggregate
+    COALESCE sum (§2) MINUS the spend of agent runs that FAILED and delivered
+    nothing (``_FAILED_RUN_SQL``). INNER JOIN process_registry on the NOT-NULL
+    ``token_ledger.process_id`` FK. ``exclude_role`` drops a role (the §2
+    context-budget decision_session carve-out). Counterpart of
+    ``unit_token_total`` (the TOTAL): the two render side by side (never merged)
+    and the §2 budget trigger sums EFFECTIVE."""
+    params: list = [unit_level, unit_id]
+    role_clause = ""
+    if exclude_role is not None:
+        role_clause = " AND tl.role <> ?"
+        params.append(exclude_role)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(tl.tokens_in), 0) + COALESCE(SUM(tl.tokens_out), 0)"
+        " FROM token_ledger tl JOIN process_registry pr ON pr.id = tl.process_id"
+        f" WHERE tl.unit_level = ? AND tl.unit_id = ?{role_clause}"
+        f" AND NOT {_FAILED_RUN_SQL}",
+        params,
+    ).fetchone()
+    return int(row[0])
+
+
 def list_token_ledger(
     conn: sqlite3.Connection, unit_level: str, unit_id: str
 ) -> list[sqlite3.Row]:
