@@ -182,6 +182,9 @@ RO: Mapping[str, str] = {
     "col_when": "Când",
     "col_cost": "Cost",
     "col_agent": "Agent",
+    "col_started": "Pornit",
+    "col_duration": "Durată",
+    "duration_running": "în lucru",
     "col_model": "Model",
     "col_tokens_in": "Tokeni intrare (mii)",
     "col_tokens_out": "Tokeni ieșire (mii)",
@@ -463,6 +466,23 @@ def _fmt_mem(value: int | None) -> str:
     return f"{round(value / (1024**2))} MB"
 
 
+def _fmt_dur(start: str | None, end: str | None) -> str:
+    """Agent run duration start->end (founder per-agent timing, 20-06):
+    'Xs' / 'X min' / 'Xh Ym'. 'în lucru' when started but not yet ended;
+    '—' when no start time is recorded."""
+    if start is None:
+        return "—"
+    if end is None:
+        return RO["duration_running"]
+    seconds = _age_seconds(start, end)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours}h {minutes}min" if minutes else f"{hours}h"
+
+
 _THIN_SPACE = " "  # §11.2 _fmt_usd: thin space before the '$'
 
 
@@ -729,6 +749,14 @@ class AgentCostRow:
     cost_usd: float | None
     estimated: bool  # token counts estimated (bytes/4 fallback) -> keeps `~`
     recorded_at: str
+    #: process_registry timing/outcome via process_id (defaulted None when the
+    #: run predates the join or the FK is unset). spawned_at/ended_at feed the
+    #: founder per-agent start/finish/duration; state/exit_code mark a run that
+    #: FAILED and delivered nothing (effective-tokens display).
+    spawned_at: str | None = None
+    ended_at: str | None = None
+    proc_state: str | None = None
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1614,6 +1642,10 @@ def _ledger_rows(
             cost_usd=row["cost_usd"],
             estimated=bool(row["estimated"]),
             recorded_at=row["recorded_at"],
+            spawned_at=row["proc_spawned_at"],
+            ended_at=row["proc_ended_at"],
+            proc_state=row["proc_state"],
+            exit_code=row["proc_exit_code"],
         )
         for row in fdb.list_token_ledger(conn, unit_level, unit_id)
     )
@@ -2246,15 +2278,19 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
 
 
 def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> str:
-    """One §11.2 per-agent table: rol (glossed) · model (glossed) · tokeni
-    intrare · tokeni ieșire · cost — one row per ledger entry in ledger-id
-    order (F7; recorded_at displayed as small print), a re-run role appearing
-    twice is the truth of what was spent; the total row last renders the PAIR."""
+    """One §11.2 per-agent table: rol (glossed) · pornit · durată · model
+    (glossed) · tokeni intrare · tokeni ieșire · cost — one row per ledger
+    entry in ledger-id order (F7; recorded_at = finish, small print under the
+    role; pornit/durată from process_registry, founder 20-06), a re-run role
+    appearing twice is the truth of what was spent; total row renders the PAIR."""
+    tz = cfg.factory.timezone_founder
     body: list[str] = []
     sum_in = 0
     sum_out = 0
     for row in rows:
-        when = fmt_founder_ts(row.recorded_at, cfg.factory.timezone_founder)
+        when = fmt_founder_ts(row.recorded_at, tz)
+        started = fmt_founder_ts(row.spawned_at, tz) if row.spawned_at else "—"
+        duration = _fmt_dur(row.spawned_at, row.ended_at)
         sum_in += row.tokens_in or 0
         sum_out += row.tokens_out or 0
         in_cell = _fmt_ktok(row.tokens_in) if row.tokens_in is not None else "—"
@@ -2262,6 +2298,8 @@ def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> st
         body.append(
             f"<tr><td>{esc(_glossed(row.role))}"
             f"<span class='token'>{esc(when)}</span></td>"
+            f"<td class='num'>{esc(started)}</td>"
+            f"<td class='num'>{esc(duration)}</td>"
             f"<td>{esc(_glossed(row.model))}</td>"
             f"<td class='num'>{esc(in_cell)}</td>"
             f"<td class='num'>{esc(out_cell)}</td>"
@@ -2269,13 +2307,17 @@ def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> st
         )
     total = _summary_from_rows(cfg, rows)
     body.append(
-        f"<tr class='grup'><th>{esc(RO['cost_total_row'])}</th><th></th>"
+        f"<tr class='grup'><th>{esc(RO['cost_total_row'])}</th>"
+        f"<th></th><th></th><th></th>"
         f"<th class='num'>{esc(_fmt_ktok(sum_in))}</th>"
         f"<th class='num'>{esc(_fmt_ktok(sum_out))}</th>"
         f"<th class='num'>{esc(_fmt_cost_pair(total))}</th></tr>"
     )
     return _table(
-        f"<th>{esc(RO['col_agent'])}</th><th>{esc(RO['col_model'])}</th>"
+        f"<th>{esc(RO['col_agent'])}</th>"
+        f"<th class='num'>{esc(RO['col_started'])}</th>"
+        f"<th class='num'>{esc(RO['col_duration'])}</th>"
+        f"<th>{esc(RO['col_model'])}</th>"
         f"<th class='num'>{esc(RO['col_tokens_in'])}</th>"
         f"<th class='num'>{esc(RO['col_tokens_out'])}</th>"
         f"<th class='num'>{esc(RO['col_cost'])}</th>",

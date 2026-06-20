@@ -365,6 +365,33 @@ def test_romanian_number_grouping() -> None:
     assert dash._fmt_int(999) == "999"
 
 
+def test_fmt_ktok_thousands_no_decimals() -> None:
+    """Founder 20-06: token counts in THOUSANDS, rounded, no decimals."""
+    assert dash._fmt_ktok(12_547_709) == "12.548"  # the founder's golden example
+    assert dash._fmt_ktok(364_000_000) == "364.000"
+    assert dash._fmt_ktok(499) == "0"  # rounds down below 500
+    assert dash._fmt_ktok(1500) == "2"  # 1.5 -> 2
+    assert dash._fmt_ktok(0) == "0"
+
+
+def test_fmt_mem_gb_mb_boundary() -> None:
+    """Founder memory panel: >=1 GiB in GB (Romanian comma), below in MB; None -> '—'."""
+    assert dash._fmt_mem(23_622_320_128) == "22,0 GB"  # the 22 GiB leash
+    assert dash._fmt_mem(2_147_483_648) == "2,0 GB"  # 2 GiB swap
+    assert dash._fmt_mem(680_000_000) == "648 MB"  # sub-GiB -> MB
+    assert dash._fmt_mem(None) == "—"
+
+
+def test_fmt_dur_founder_per_agent_timing() -> None:
+    """Founder 20-06 per-agent duration: s / min / h Ym; 'în lucru'/'—' edges."""
+    assert dash._fmt_dur("2026-06-20T10:00:00Z", "2026-06-20T10:00:45Z") == "45s"
+    assert dash._fmt_dur("2026-06-20T10:00:00Z", "2026-06-20T10:18:00Z") == "18 min"
+    assert dash._fmt_dur("2026-06-20T10:00:00Z", "2026-06-20T12:30:00Z") == "2h 30min"
+    assert dash._fmt_dur("2026-06-20T10:00:00Z", "2026-06-20T12:00:00Z") == "2h"
+    assert dash._fmt_dur("2026-06-20T10:00:00Z", None) == dash.RO["duration_running"]
+    assert dash._fmt_dur(None, None) == "—"
+
+
 # ------------------------------------------------------------ R3 recommendation
 
 
@@ -2340,9 +2367,13 @@ def test_costuri_per_agent_rows_id_order_glossed_and_recorded_at(denv) -> None:
     costs_page = dash.render_costs_page(dash.build_costs_view(denv.cfg), denv.cfg)
     # Anchor = the «detalii →» landing.
     assert "id='ph.b'" in costs_page
-    # Header row: glossed columns, numerics right-aligned.
+    # Header row: glossed columns, numerics right-aligned. Pornit + Durată
+    # (founder per-agent timing, 20-06) sit between Agent and Model.
     assert (
-        f"<th>{dash.RO['col_agent']}</th><th>{dash.RO['col_model']}</th>"
+        f"<th>{dash.RO['col_agent']}</th>"
+        f"<th class='num'>{dash.RO['col_started']}</th>"
+        f"<th class='num'>{dash.RO['col_duration']}</th>"
+        f"<th>{dash.RO['col_model']}</th>"
         f"<th class='num'>{dash.RO['col_tokens_in']}</th>"
         f"<th class='num'>{dash.RO['col_tokens_out']}</th>"
         f"<th class='num'>{dash.RO['col_cost']}</th>" in costs_page

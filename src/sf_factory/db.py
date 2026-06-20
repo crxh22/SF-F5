@@ -679,11 +679,18 @@ def list_token_ledger(
     """All ledger rows for one unit — the §11 per-agent cost table source
     (dashboard design §11.3.2, CCR-10). Ordered by ledger ``id`` (insertion
     order): ``recorded_at`` is second-precision and ties are real (review F7) —
-    ``recorded_at`` is displayed, ``id`` orders. Pure SQL, no business rules."""
+    ``recorded_at`` is displayed, ``id`` orders. LEFT JOINs process_registry on
+    process_id for the run's timing (proc_spawned_at/proc_ended_at — founder
+    per-agent start/finish/duration, 20-06) and outcome (proc_state/exit_code —
+    the effective-tokens 'failed, delivered nothing' marker). Pure SQL."""
     return conn.execute(
-        "SELECT id, process_id, role, model, tokens_in, tokens_out, cost_usd,"
-        " estimated, recorded_at FROM token_ledger"
-        " WHERE unit_level = ? AND unit_id = ? ORDER BY id",
+        "SELECT tl.id, tl.process_id, tl.role, tl.model, tl.tokens_in,"
+        " tl.tokens_out, tl.cost_usd, tl.estimated, tl.recorded_at,"
+        " pr.spawned_at AS proc_spawned_at, pr.ended_at AS proc_ended_at,"
+        " pr.state AS proc_state, pr.exit_code AS proc_exit_code"
+        " FROM token_ledger tl"
+        " LEFT JOIN process_registry pr ON pr.id = tl.process_id"
+        " WHERE tl.unit_level = ? AND tl.unit_id = ? ORDER BY tl.id",
         (unit_level, unit_id),
     ).fetchall()
 
