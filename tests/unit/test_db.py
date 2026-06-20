@@ -150,11 +150,12 @@ def seeded_stage(db: Database):
 class TestMigrations:
     def test_fresh_migrate_applies_all_packaged(self, db_path: Path):
         # The packaged dir now ships 0001 (init) + 0002 (settled disposition) +
-        # 0003 (runtime_settings); a fresh migrate applies every pending version in order.
+        # 0003 (runtime_settings) + 0004 (decision published_at); a fresh migrate
+        # applies every pending version in order.
         database = Database(db_path, busy_timeout_ms=5000)
         database.open()
         try:
-            assert database.migrate(MIGRATIONS_DIR) == [1, 2, 3]
+            assert database.migrate(MIGRATIONS_DIR) == [1, 2, 3, 4]
         finally:
             database.close()
 
@@ -183,10 +184,11 @@ class TestMigrations:
             "SELECT version, description, applied_at FROM schema_migrations"
             " ORDER BY version"
         ).fetchall()
-        assert [r["version"] for r in rows] == [1, 2, 3]
+        assert [r["version"] for r in rows] == [1, 2, 3, 4]
         assert rows[0]["description"] == "init"
         assert rows[1]["description"] == "settled_finding_disposition"
         assert rows[2]["description"] == "runtime_settings"
+        assert rows[3]["description"] == "decision_published_at"
         assert all(r["applied_at"] for r in rows)  # ISO timestamp written
 
     def test_failed_migration_rolls_back_whole_file(self, db_path: Path, tmp_path: Path):
@@ -241,23 +243,23 @@ class TestMigrations:
             db.migrate(stale_dir)
 
     def test_followup_migration_applies_in_order(self, db: Database, tmp_path: Path):
-        # The `db` fixture already applied every packaged migration (1 + 2 + 3); an
-        # additional dir adds the next free version on top, in order.
+        # The `db` fixture already applied every packaged migration (1 + 2 + 3 + 4);
+        # an additional dir adds the next free version on top, in order.
         two_dir = tmp_path / "migs"
         two_dir.mkdir()
         for f in MIGRATIONS_DIR.glob("*.sql"):
             (two_dir / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
-        (two_dir / "0004_extra.sql").write_text(
+        (two_dir / "0005_extra.sql").write_text(
             "CREATE TABLE extra (id INTEGER PRIMARY KEY);", encoding="utf-8"
         )
-        assert db.migrate(two_dir) == [4]
+        assert db.migrate(two_dir) == [5]
         versions = [
             r[0]
             for r in db.read().execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        assert versions == [1, 2, 3, 4]
+        assert versions == [1, 2, 3, 4, 5]
 
     def test_migrate_read_only_rejected(self, db: Database, db_path: Path):
         ro = Database(db_path, busy_timeout_ms=5000)
@@ -309,7 +311,7 @@ class TestSettledFindingMigration:
                 fid = insert_finding(
                     conn, make_finding(report_artifact_id=report, status="overruled")
                 )
-            assert database.migrate(MIGRATIONS_DIR) == [2, 3]  # 0002 + 0003 now apply
+            assert database.migrate(MIGRATIONS_DIR) == [2, 3, 4]  # 0002 + 0003 + 0004 now apply
             # Pre-existing row carried across the rebuild unchanged.
             rows = findings(database.read(), "st-1")
             assert [f.id for f in rows] == [fid]

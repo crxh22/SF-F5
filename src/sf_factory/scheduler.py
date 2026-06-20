@@ -2930,8 +2930,12 @@ class StageExecutor:
         )
 
     async def _publish_decision(self, request_id: int | None, title: str) -> None:
-        """Publish a decision request (priority_decision); delivery failure =
-        'alert_delivery_failed' event, state unchanged (§6 NotifyError row)."""
+        """Publish a decision request (priority_decision). On SUCCESS, stamp
+        published_at so the per-tick backstop (_publish_pending_decisions) never
+        re-pages a delivered gate. On failure: 'alert_delivery_failed' event, state
+        unchanged (§6) — published_at stays NULL so the backstop retries every tick
+        until the page lands (founder 20-06: a transient ntfy 429 no longer loses
+        the gate until the 24h latency alert)."""
         link = dashboard_link(self._cfg, f"decision/{request_id}")
         try:
             await self._notify.publish(
@@ -2947,6 +2951,10 @@ class StageExecutor:
                     actor=_ACTOR,
                     payload={"decision_request_id": request_id, "error": str(exc)},
                 )
+            return
+        if request_id is not None:
+            with self._db.transaction() as conn:
+                fdb.mark_decision_published(conn, request_id, utc_now())
 
     async def _publish_alert(
         self, title: str, fragment: str, *, context: dict
@@ -4974,6 +4982,8 @@ class PhaseExecutor:
             )
 
     async def _publish_signoff_decision(self, request_id: int, title: str) -> None:
+        """Phase-signoff decision publish — same published_at delivered-signal +
+        per-tick retry backstop as ``_publish_decision`` (founder 20-06)."""
         try:
             await self._notify.publish(
                 title,
@@ -4990,6 +5000,9 @@ class PhaseExecutor:
                     actor=_ACTOR,
                     payload={"decision_request_id": request_id, "error": str(exc)},
                 )
+            return
+        with self._db.transaction() as conn:
+            fdb.mark_decision_published(conn, request_id, utc_now())
 
     # ----------------------------------------------------------------- prompts
 
@@ -5478,6 +5491,7 @@ class Scheduler:
                     self._reap()
                     scan = self._scan_units()
                     await self._stall_detector(scan)
+                    await self._publish_pending_decisions()
                     await self._decision_latency_alerts()
                     await self._stuck_escalation_detector(scan)
                     if self._governor is not None:
@@ -5783,6 +5797,48 @@ class Scheduler:
                         "alert_after_h": self._cfg.escalation.decision_latency_alert_h,
                     },
                 )
+
+    async def _publish_pending_decisions(self) -> None:
+        """Per-tick re-publish backstop (founder 20-06): page every pending decision
+        whose published_at IS NULL — those whose immediate publish hit a transient
+        ntfy 429 (or that predate this code / a restart). DB-backed (published_at),
+        so the retry survives a restart. On success, stamp published_at (drops it
+        from the set); on failure, log ONE 'alert_delivery_failed' per consecutive-
+        failure streak and leave it unpublished for the next tick — the exact
+        _decision_latency_alerts contract, on a DISTINCT signal (published_at, NOT
+        the 24h alerted_at latch). The happy path never reaches here: _publish_decision
+        stamps published_at on its own successful publish, so a delivered gate is
+        skipped; only a failed/never-attempted page lands in this worklist."""
+        pending = fdb.pending_unpublished_decisions(self._db.read())
+        for decision in pending:
+            assert decision.id is not None
+            streak_key = ("decision_publish", decision.id)
+            try:
+                await self._notify.publish(
+                    f"Decizie necesară: {decision.unit_level} {decision.unit_id}",
+                    link=dashboard_link(self._cfg, f"decision/{decision.id}"),
+                    priority=self._notify.priority_decision,
+                )
+            except NotifyError as exc:
+                if streak_key not in self._delivery_failed_logged:
+                    self._delivery_failed_logged.add(streak_key)
+                    with self._db.transaction() as conn:
+                        fdb.insert_event(
+                            conn,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="alert_delivery_failed",
+                            actor=_ACTOR,
+                            payload={
+                                "kind": "decision_publish",
+                                "decision_request_id": decision.id,
+                                "error": str(exc),
+                            },
+                        )
+                continue  # unpublished -> retried next tick until delivered
+            self._delivery_failed_logged.discard(streak_key)
+            with self._db.transaction() as conn:
+                fdb.mark_decision_published(conn, decision.id, utc_now())
 
     async def _notify_architect(
         self, title: str, *, link: str | None, streak_key: object, context: dict

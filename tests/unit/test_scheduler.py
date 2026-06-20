@@ -884,7 +884,7 @@ async def test_no_stall_alert_when_a_decision_is_pending(db, config_dict) -> Non
                 created_at=utc_now(),
             ),
         )
-        fdb.insert_decision_request(
+        rid = fdb.insert_decision_request(
             conn,
             DecisionRequest(
                 id=None,
@@ -900,6 +900,9 @@ async def test_no_stall_alert_when_a_decision_is_pending(db, config_dict) -> Non
                 answered_at=None,
             ),
         )
+        # The request was already delivered (item 6 published_at): a fresh,
+        # published, pending gate must draw NO stall/latency page AND no re-publish.
+        fdb.mark_decision_published(conn, rid, utc_now())
     sm = StateMachine(db)
     scheduler, notify = make_scheduler(
         db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
@@ -907,7 +910,7 @@ async def test_no_stall_alert_when_a_decision_is_pending(db, config_dict) -> Non
     await run_blocked(scheduler)
 
     assert stage_state(db, "s1") is StageState.AWAITING_HUMAN
-    assert notify.published == []  # no stall page, no latency alert (fresh request)
+    assert notify.published == []  # no stall page, no latency alert, no re-publish
 
 
 async def test_blocked_unit_redispatched_after_answer(db, config_dict) -> None:
@@ -1008,7 +1011,7 @@ async def test_delivery_failure_logged_and_unmarked(db, config_dict) -> None:
     insert_stage(db, "s1", "ph", StageState.AWAITING_HUMAN)
     old = (datetime.now(UTC) - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with db.transaction() as conn:
-        fdb.insert_decision_request(
+        rid = fdb.insert_decision_request(
             conn,
             DecisionRequest(
                 id=None,
@@ -1024,6 +1027,9 @@ async def test_delivery_failure_logged_and_unmarked(db, config_dict) -> None:
                 answered_at=None,
             ),
         )
+        # Delivered when created 25h ago (item 6): isolate the LATENCY-alert failure
+        # from the re-publish backstop, which skips an already-published gate.
+        fdb.mark_decision_published(conn, rid, old)
     sm = StateMachine(db)
     scheduler, _ = make_scheduler(
         db,
@@ -1041,6 +1047,116 @@ async def test_delivery_failure_logged_and_unmarked(db, config_dict) -> None:
         .fetchall()
     )
     assert len(failures) == 1  # one event per failure streak, not per tick
+
+
+# ------------------------------ item 6: decision-publish retry backstop (published_at)
+
+
+def _seed_pending_decision(db, unit_id: str = "s1", *, created_at: str | None = None) -> int:
+    """A pending decision with published_at NULL (the migration default) — the
+    re-publish backstop's input. Returns the request id."""
+    with db.transaction() as conn:
+        return fdb.insert_decision_request(
+            conn,
+            DecisionRequest(
+                id=None,
+                unit_level="stage",
+                unit_id=unit_id,
+                gate_kind="critical_stage",
+                request_artifact_id=_seed_artifact(conn, unit_id),
+                status="pending",
+                answer=None,
+                answer_artifact_id=None,
+                created_at=created_at or utc_now(),
+                alerted_at=None,
+                answered_at=None,
+            ),
+        )
+
+
+async def test_publish_backstop_pages_unpublished_pending_decision(db, config_dict) -> None:
+    """Item 6 (wiring): the per-tick backstop pages a pending decision whose
+    published_at is NULL (priority_decision), stamps published_at, and never
+    re-pages it once delivered. A FRESH decision (< latency window) isolates the
+    backstop from the 24h latency alert."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.AWAITING_HUMAN)
+    _seed_pending_decision(db, "s1")
+    sm = StateMachine(db)
+    scheduler, notify = make_scheduler(
+        db, cfg, {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm, respect_blocked=True)}
+    )
+    await run_blocked(scheduler)
+
+    pages = [p for p in notify.published if "Decizie necesară" in p[0]]
+    assert len(pages) == 1 and pages[0][2] == notify.priority_decision
+    row = db.read().execute("SELECT published_at FROM decision_requests WHERE id=1").fetchone()
+    assert row["published_at"] is not None
+    await run_blocked(scheduler)  # delivered -> never re-pages
+    assert len([p for p in notify.published if "Decizie necesară" in p[0]]) == 1
+
+
+async def test_publish_decision_marks_published_on_success(db, config_dict, tmp_path) -> None:
+    """Item 6: a successful immediate _publish_decision (StageExecutor) stamps
+    published_at, so the backstop skips the already-delivered gate — no double page
+    in the happy path."""
+    env = make_governor_env(db, config_dict, tmp_path)
+    rid = _seed_pending_decision(db, "s1")
+    await env.executor._publish_decision(rid, "Decizie necesară: etapa test")
+    assert any("etapa test" in p[0] for p in env.notify.published)
+    row = db.read().execute(
+        "SELECT published_at FROM decision_requests WHERE id=?", (rid,)
+    ).fetchone()
+    assert row["published_at"] is not None
+
+
+async def test_publish_decision_failure_leaves_unpublished_for_backstop(
+    db, config_dict, tmp_path
+) -> None:
+    """Item 6 (the bug fixed): a transient ntfy 429 on the immediate publish leaves
+    published_at NULL — the gate is NOT lost. It then lands in the backstop's
+    pending_unpublished_decisions worklist (re-paged + delivered by the wiring test
+    test_publish_backstop_pages_unpublished_pending_decision)."""
+    env = make_governor_env(db, config_dict, tmp_path)
+    rid = _seed_pending_decision(db, "s1")
+    env.notify.fail = True  # ntfy 429 at exactly the publish moment
+    await env.executor._publish_decision(rid, "Decizie necesară: etapa test")
+    row = db.read().execute(
+        "SELECT published_at FROM decision_requests WHERE id=?", (rid,)
+    ).fetchone()
+    assert row["published_at"] is None  # unpublished, NOT lost
+    assert [d.id for d in fdb.pending_unpublished_decisions(db.read())] == [rid]
+
+
+async def test_publish_backstop_logs_one_failure_per_streak(db, config_dict) -> None:
+    """Item 6: a persistently-failing publish logs ONE alert_delivery_failed per
+    streak (not per tick) and leaves the decision unpublished for the next retry —
+    mirroring the _decision_latency_alerts streak contract on the published_at signal."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph")
+    insert_stage(db, "s1", "ph", StageState.AWAITING_HUMAN)
+    _seed_pending_decision(db, "s1")
+    sm = StateMachine(db)
+    scheduler, _ = make_scheduler(
+        db,
+        cfg,
+        {Level.STAGE: ScriptedExecutor(Level.STAGE, db, sm)},
+        notify=FakeNotify(fail=True),
+    )
+    await scheduler._publish_pending_decisions()
+    await scheduler._publish_pending_decisions()  # second failing tick: no new event
+    failures = (
+        db.read()
+        .execute(
+            "SELECT * FROM events WHERE event_type='alert_delivery_failed'"
+            " AND payload_json LIKE '%decision_publish%'"
+        )
+        .fetchall()
+    )
+    assert len(failures) == 1
+    row = db.read().execute("SELECT published_at FROM decision_requests WHERE id=1").fetchone()
+    assert row["published_at"] is None  # still unpublished -> retried next tick
 
 
 # ----------------------------------- robustness UNIT 2: stuck-escalation detector

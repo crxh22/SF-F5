@@ -1163,6 +1163,31 @@ def mark_decision_alerted(conn: sqlite3.Connection, request_id: int, at: str) ->
         raise FactoryError(f"unknown decision request id: {request_id}")
 
 
+def mark_decision_published(conn: sqlite3.Connection, request_id: int, at: str) -> None:
+    """Set published_at after a SUCCESSFUL decision publish (founder 20-06): a
+    published row stops matching ``pending_unpublished_decisions``, so the per-tick
+    re-publish backstop never re-pages a delivered decision. DISTINCT from
+    ``mark_decision_alerted`` (the 24h latency latch) — the two are independent.
+    Marking a nonexistent request is a control-plane bug."""
+    cur = conn.execute(
+        "UPDATE decision_requests SET published_at = ? WHERE id = ?", (at, request_id)
+    )
+    if cur.rowcount != 1:
+        raise FactoryError(f"unknown decision request id: {request_id}")
+
+
+def pending_unpublished_decisions(conn: sqlite3.Connection) -> list[DecisionRequest]:
+    """Pending decisions whose page was never delivered (published_at IS NULL) —
+    the per-tick re-publish backstop's worklist (founder 20-06). A transient ntfy
+    429 leaves published_at NULL, so the page is retried each tick until it lands;
+    a successful publish sets published_at and drops the row from this set."""
+    rows = conn.execute(
+        "SELECT * FROM decision_requests WHERE status = 'pending'"
+        " AND published_at IS NULL ORDER BY id"
+    ).fetchall()
+    return [_decision_from_row(row) for row in rows]
+
+
 def pending_decisions(
     conn: sqlite3.Connection, *, unalerted_older_than_h: int | None = None
 ) -> list[DecisionRequest]:

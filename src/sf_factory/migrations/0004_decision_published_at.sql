@@ -1,0 +1,12 @@
+-- ntfy decision-page delivery signal (founder 20-06-2026). The decision publish
+-- was ONE-SHOT: a transient ntfy 429 (rate limit) lost the page entirely — the
+-- founder only learned of the gate from the 24h decision-latency alert (alerted_at)
+-- or by happening to watch the dashboard. published_at is the SEPARATE delivered-
+-- signal: set on a SUCCESSFUL decision publish; the scheduler re-publishes every
+-- pending decision whose published_at IS NULL on each tick until it is delivered
+-- (mirroring the alerted_at latency-retry, but DB-backed so the retry survives a
+-- restart). DISTINCT from alerted_at (the 24h latency latch, scheduler.py
+-- _decision_latency_alerts) — the two signals are independent and never share a
+-- column. Nullable: every pre-existing pending row starts unpublished and is
+-- re-published on the next tick after this migration deploys.
+ALTER TABLE decision_requests ADD COLUMN published_at TEXT;
