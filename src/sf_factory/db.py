@@ -715,6 +715,33 @@ def effective_token_sum(
     return int(row[0])
 
 
+def get_runtime_settings(conn: sqlite3.Connection) -> dict[str, object]:
+    """All live runtime overrides as key -> decoded JSON value (founder dashboard,
+    20-06; empty when unset). The dashboard writes via ``set_runtime_setting``; the
+    scheduler reads this each tick and wraps it in ``runtime_settings.EffectiveConfig``
+    to layer the founder's live edits over the load-once config."""
+    return {
+        row["key"]: json.loads(row["value"])
+        for row in conn.execute("SELECT key, value FROM runtime_settings").fetchall()
+    }
+
+
+def set_runtime_setting(
+    conn: sqlite3.Connection, key: str, value: object, *, updated_by: str, at: str
+) -> None:
+    """Upsert one runtime override (``value`` JSON-encoded). Pure SQL — the caller
+    records the audit event (``runtime_setting_changed``), keeping the business
+    rule out of the storage layer."""
+    conn.execute(
+        "INSERT INTO runtime_settings (key, value, updated_at, updated_by)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET"
+        " value = excluded.value, updated_at = excluded.updated_at,"
+        " updated_by = excluded.updated_by",
+        (key, json.dumps(value), at, updated_by),
+    )
+
+
 def list_token_ledger(
     conn: sqlite3.Connection, unit_level: str, unit_id: str
 ) -> list[sqlite3.Row]:
