@@ -370,12 +370,11 @@ async def test_health_strip_liveness_and_budget(make_env) -> None:
         assert status == 200
         assert dash.RO["pulse_stale"] not in page  # fresh liveness
         # Seeded ledger vs conftest routine budget — §10.3 (v1.2) renders the
-        # budget as a TABLE (etapă · consum · plafon · %), so the old
-        # "5.000 / 10.000 tokeni · 50%" single-line shape is gone; the same
-        # three figures must land in numeric cells. [AMENDED: old-HTML-shape
-        # assertion, §10.8 carve-out — enumerated in the build report.]
-        assert "<td class='num'>5.000</td>" in page
-        assert "<td class='num'>10.000</td>" in page
+        # budget as a TABLE (etapă · consum · plafon · %). Tokens now shown in
+        # THOUSANDS (founder 20-06): burn 5_000 -> "5", cap 10_000 -> "10"; the
+        # % is unchanged. [AMENDED: old-HTML-shape assertion, §10.8 carve-out.]
+        assert "<td class='num'>5</td>" in page  # burn 5_000 in thousands
+        assert "<td class='num'>10</td>" in page  # cap 10_000 in thousands
         assert "<td class='num'>50%</td>" in page
 
         import os

@@ -118,7 +118,7 @@ RO: Mapping[str, str] = {
     "queue_none_running": "nicio etapă în lucru",
     "budget_label": "Buget",
     "budget_total": "Total fabrică",
-    "budget_tokens": "tokeni",
+    "budget_tokens": "mii tokeni",
     "budget_estimated_part": "din care estimat",
     "budget_cost": "cost",
     "budget_today": "Astăzi",
@@ -166,9 +166,9 @@ RO: Mapping[str, str] = {
     "col_stage": "Etapă",
     "col_step": "Pas atins",
     "col_risk": "Clasă de risc",
-    "col_tokens": "Tokeni",
-    "col_burn": "Consum",
-    "col_cap": "Plafon",
+    "col_tokens": "Tokeni (mii)",
+    "col_burn": "Consum (mii)",
+    "col_cap": "Plafon (mii)",
     "col_pct": "%",
     "col_kind": "Tip",
     "col_file": "Fișier",
@@ -176,8 +176,8 @@ RO: Mapping[str, str] = {
     "col_cost": "Cost",
     "col_agent": "Agent",
     "col_model": "Model",
-    "col_tokens_in": "Tokeni intrare",
-    "col_tokens_out": "Tokeni ieșire",
+    "col_tokens_in": "Tokeni intrare (mii)",
+    "col_tokens_out": "Tokeni ieșire (mii)",
     "no_buttons_notice": (
         "Acest tip de decizie nu are încă butoane de răspuns în panou — "
         "răspunde din terminal cu comanda de urgență „cli decide” "
@@ -434,6 +434,14 @@ def fmt_founder_ts(utc_iso: str, tz: str) -> str:
 def _fmt_int(value: int) -> str:
     """Numbers grouped Romanian-style: 300000 -> '300.000' (R4)."""
     return f"{int(value):,}".replace(",", ".")
+
+
+def _fmt_ktok(value: int) -> str:
+    """Token counts shown in THOUSANDS, no decimals (founder, 20-06-2026):
+    12_547_709 -> '12.548'. Always paired with a '(mii)' / 'mii tokeni' unit
+    label at the call site so the magnitude is unambiguous. Money ($) is NEVER
+    routed through here — only token counts."""
+    return _fmt_int(round(int(value) / 1000))
 
 
 _THIN_SPACE = " "  # §11.2 _fmt_usd: thin space before the '$'
@@ -1829,7 +1837,7 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
             f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
             f"<td>{_chip(st.state)}</td>"
             f"<td>{esc(_glossed(st.risk_class))}</td>"
-            f"<td class='num'>{esc(_fmt_int(st.tokens))}</td>"
+            f"<td class='num'>{esc(_fmt_ktok(st.tokens))}</td>"
             f"<td class='num'>{esc(_fmt_cost_pair(st.cost))}</td></tr>"
             for st in health.running_stages
         )
@@ -1860,20 +1868,20 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     for row in health.budgets:
         if row.budget:
             pct_cell = f"{int(round(100 * row.tokens / row.budget))}%"
-            cap_cell = _fmt_int(row.budget)
+            cap_cell = _fmt_ktok(row.budget)
         else:
             pct_cell = "—"
             cap_cell = "—"
         budget_rows.append(
             f"<tr><td>{esc(row.name)}<span class='token'>({esc(row.stage_id)} ·"
             f" {esc(_glossed(row.risk_class))})</span></td>"
-            f"<td class='num'>{esc(_fmt_int(row.tokens))}</td>"
+            f"<td class='num'>{esc(_fmt_ktok(row.tokens))}</td>"
             f"<td class='num'>{esc(cap_cell)}</td>"
             f"<td class='num'>{esc(pct_cell)}</td></tr>"
         )
     estimated_part = (
         f" · {esc(RO['budget_estimated_part'])}:"
-        f" {esc(_fmt_int(health.total_estimated_tokens))} ({esc(RO['estimated_mark'])})"
+        f" {esc(_fmt_ktok(health.total_estimated_tokens))} ({esc(RO['estimated_mark'])})"
         if health.total_estimated_tokens
         else ""
     )
@@ -1908,7 +1916,7 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
             RO["budget_label"],
             f"{budget_table}"
             f"<p class='meta'>{esc(RO['budget_total'])}:"
-            f" {esc(_fmt_int(health.total_tokens))} {esc(RO['budget_tokens'])}"
+            f" {esc(_fmt_ktok(health.total_tokens))} {esc(RO['budget_tokens'])}"
             f"{estimated_part}{cost_part}</p>"
             f"{today_line}{legend}",
         )
@@ -2052,8 +2060,8 @@ def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> st
         when = fmt_founder_ts(row.recorded_at, cfg.factory.timezone_founder)
         sum_in += row.tokens_in or 0
         sum_out += row.tokens_out or 0
-        in_cell = _fmt_int(row.tokens_in) if row.tokens_in is not None else "—"
-        out_cell = _fmt_int(row.tokens_out) if row.tokens_out is not None else "—"
+        in_cell = _fmt_ktok(row.tokens_in) if row.tokens_in is not None else "—"
+        out_cell = _fmt_ktok(row.tokens_out) if row.tokens_out is not None else "—"
         body.append(
             f"<tr><td>{esc(_glossed(row.role))}"
             f"<span class='token'>{esc(when)}</span></td>"
@@ -2065,8 +2073,8 @@ def _render_cost_table(rows: tuple[AgentCostRow, ...], cfg: FactoryConfig) -> st
     total = _summary_from_rows(cfg, rows)
     body.append(
         f"<tr class='grup'><th>{esc(RO['cost_total_row'])}</th><th></th>"
-        f"<th class='num'>{esc(_fmt_int(sum_in))}</th>"
-        f"<th class='num'>{esc(_fmt_int(sum_out))}</th>"
+        f"<th class='num'>{esc(_fmt_ktok(sum_in))}</th>"
+        f"<th class='num'>{esc(_fmt_ktok(sum_out))}</th>"
         f"<th class='num'>{esc(_fmt_cost_pair(total))}</th></tr>"
     )
     return _table(

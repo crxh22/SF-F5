@@ -562,7 +562,8 @@ def test_health_strip_budget_and_incident(denv) -> None:
     liveness.parent.mkdir(parents=True, exist_ok=True)
     liveness.write_text("tick\n", encoding="utf-8")
     page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
-    assert "142.000" in page  # Romanian grouping of the stage burn (R4)
+    assert "142 mii tokeni" in page  # tokens in THOUSANDS: 142_000 -> "142" (founder 20-06)
+    assert "Consum (mii)" in page  # burn column relabeled to thousands
     assert "%" in page
     assert dash.RO["pulse_stale"] not in page
     assert "consum de tokeni neraportat (usage_missing)" in page  # Ultimul incident
