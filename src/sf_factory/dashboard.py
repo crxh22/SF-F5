@@ -52,6 +52,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from sf_factory import db as fdb
+from sf_factory import runtime_settings as rs
 from sf_factory.artifacts import register_artifact, unit_artifact_dir
 from sf_factory.config import FactoryConfig
 from sf_factory.db import Database
@@ -100,6 +101,74 @@ RO: Mapping[str, str] = {
     "section_now": "Acum în lucru",
     "section_decisions": "Decizii așteptate",
     "section_plan": "Plan & istoric",
+    # --- ⚙ Configurare tab (live-editable settings; founder 20-06, items 4+5) ---
+    "cfg_nav": "⚙ Configurare",
+    "cfg_back": "← Înapoi la panou",
+    "cfg_title": "SF-F5 — Configurare",
+    "cfg_heading": "⚙ Configurare",
+    "cfg_intro": (
+        "Modifici aici parametrii fabricii «la viu» — fără restart. Se salvează în "
+        "baza de date, se aplică în câteva secunde și supraviețuiesc unui restart. "
+        "Parametrii de structură (ce model rulează fiecare rol, prețuri, portul "
+        "panoului) NU se editează aici — doar din fișier, pe restart."
+    ),
+    "cfg_sec_regim": "Regim de lucru",
+    "cfg_sec_bugete": "Bugete tokeni / etapă",
+    "cfg_sec_paralelism": "Paralelism & timpi",
+    "cfg_sec_praguri": "Praguri limită API",
+    "cfg_drain_label": "Drenaj manual",
+    "cfg_drain_help": (
+        "DRENAJ = nu mai pornesc agenți noi; cei în lucru termină liniștit. "
+        "Oprirea e mereu sigură."
+    ),
+    "cfg_drain_normal": "NORMAL",
+    "cfg_drain_drenaj": "DRENAJ",
+    "cfg_autodrenaj_label": "Autodrenaj la limită",
+    "cfg_autodrenaj_help": (
+        "Când e pornit: oprește singur agenții noi când te apropii de limita API "
+        "(5h peste pragul de mai jos, sau 7 zile peste pragul de mai jos)."
+    ),
+    "cfg_autodrenaj_on": "pornit",
+    "cfg_autodrenaj_off": "oprit",
+    "cfg_bugete_help": (
+        "Se aplică ȘI etapei în lucru, la următoarea verificare de buget (~secunde). "
+        "Gardă: nu poți seta sub cât a consumat deja o etapă în lucru."
+    ),
+    "cfg_maxpar_label": "Max agenți simultan",
+    "cfg_timeout_label": "Timeout agent (secunde)",
+    "cfg_5h_label": "Prag 5h (%)",
+    "cfg_7d_label": "Prag 7 zile (%)",
+    "cfg_apply_now": "se aplică imediat (la următorul tact)",
+    "cfg_apply_next_agent": "se aplică la următorul agent pornit",
+    "cfg_apply_running_stage": "se aplică și etapei în lucru, la următoarea verificare",
+    "cfg_guard_maxpar": "gardă: nu sub câți agenți rulează acum (acum: {running})",
+    "cfg_overridden": "modificat la viu",
+    "cfg_default_note": "implicit (din config): {value}",
+    "cfg_ktok_suffix": "= {ktok} k",
+    "cfg_col_param": "Parametru",
+    "cfg_col_value": "Valoare",
+    "cfg_col_info": "Când se aplică / gardă",
+    "cfg_save": "Salvează",
+    "cfg_last_change": "ultima modificare: {when}, de {who}",
+    "cfg_last_change_none": "ultima modificare: —",
+    "cfg_saved_ok": "Setări salvate — se aplică în câteva secunde.",
+    "cfg_saved_none": "Nicio modificare — valorile erau deja cele trimise.",
+    "cfg_err_title": "Nimic nu s-a salvat — corectează și retrimite:",
+    "cfg_err_maxpar_below": (
+        "«Max agenți simultan» = {new}: acum rulează {running} agenți. "
+        "Oprește unii întâi, sau setează cel puțin {running}."
+    ),
+    "cfg_err_budget_below": (
+        "Buget «{rc}» = {new} tokeni: etapa «{etapa}» a consumat deja {consumed}. "
+        "Setează cel puțin {consumed}, altfel etapa ar escalada imediat."
+    ),
+    "cfg_err_positive_int": (
+        "«{label}» trebuie să fie un număr întreg pozitiv (ai trimis: «{raw}»)."
+    ),
+    "cfg_err_pct": (
+        "«{label}» trebuie să fie un procent între 0 și 100 (ai trimis: «{raw}»)."
+    ),
+    "cfg_err_unknown_key": "Cheie necunoscută sau needitabilă: «{key}».",
     "plan_footer": (
         "Vedere generată din planurile în git + stările din baza de date — "
         "nu este sursă canonică"
@@ -2535,10 +2604,278 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
         f"<title>{esc(RO['page_title'])}</title>"
         f"<style>{_CSS}</style></head><body>"
         f"<h1>{esc(RO['page_heading'])}</h1>"
+        f"<nav class='meta'><a href='/configurare'>{esc(RO['cfg_nav'])}</a></nav>"
         f"{banner}"
         f"{_render_health(view, cfg)}"
         f"<section id='decizii'><h2>{esc(RO['section_decisions'])}</h2>{cards_html}</section>"
         f"{_render_plan(view)}"
+        "</body></html>"
+    )
+
+
+# ----------------------------------------------------- ⚙ Configurare (items 4+5)
+#
+# The founder's live-settings tab: a refresh-FREE page (it renders a form — the
+# meta-refresh would wipe a half-typed field, S3/A-1) that reads the effective
+# config (DB overrides over the load-once cfg) and POSTs edits back. The write
+# path is DashboardServer.update_settings (loop-confined, all-or-nothing).
+
+
+@dataclass(frozen=True)
+class _Setting:
+    """One Configurare row: the EFFECTIVE value, the config baseline, and whether
+    a live override is in force (so the render marks «modificat la viu»)."""
+
+    value: object
+    baseline: object
+    overridden: bool
+
+
+@dataclass(frozen=True)
+class ConfigureView:
+    """Pure render input of GET /configurare (read-only, refresh-free)."""
+
+    drain_manual: _Setting
+    autodrenaj: _Setting
+    budgets: tuple[tuple[str, _Setting], ...]  # (risk_class, setting)
+    max_parallel: _Setting
+    agent_timeout_s: _Setting
+    gov_5h: _Setting
+    gov_7d: _Setting
+    running_agents: int
+    last_change: tuple[str, str] | None  # (updated_at, updated_by) or None
+
+
+@dataclass(frozen=True)
+class SettingsResult:
+    """Outcome of a Configurare POST (founder live-settings write): how many
+    overrides were written + any validation/guard errors (founder-facing Romanian).
+    Empty ``errors`` == success; ``changed`` may be 0 when nothing differed."""
+
+    changed: int
+    errors: tuple[str, ...]
+
+
+def _parse_positive_int(raw: str | None) -> int | None:
+    """A strictly-positive int from a form field, or None if absent/invalid."""
+    if raw is None:
+        return None
+    try:
+        value = int(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+    return value if value > 0 else None
+
+
+def _parse_pct(raw: str | None) -> float | None:
+    """A percent in (0, 100] from a form field, or None if absent/invalid."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+    return value if 0 < value <= 100 else None
+
+
+def _max_running_stage_spend(
+    conn: sqlite3.Connection, risk_class: str
+) -> tuple[str | None, int | None]:
+    """The non-terminal stage of ``risk_class`` that has consumed the most
+    EFFECTIVE tokens, and that amount — the live floor for the class's budget
+    (lowering it under would escalate the stage at its next §2 check). 'Running' =
+    any stage NOT in DONE/CANCELLED/PENDING; ``decision_session`` spend excluded to
+    match the budget trigger's EFFECTIVE view exactly. (None, None) when none."""
+    rows = conn.execute(
+        "SELECT id FROM stages WHERE risk_class = ?"
+        " AND state NOT IN ('DONE', 'CANCELLED', 'PENDING')",
+        (risk_class,),
+    ).fetchall()
+    worst_id: str | None = None
+    worst: int | None = None
+    for row in rows:
+        spent = fdb.effective_token_sum(conn, "stage", row["id"], exclude_role=_SESSION_ROLE)
+        if worst is None or spent > worst:
+            worst, worst_id = spent, row["id"]
+    return worst_id, worst
+
+
+def build_configure_view(cfg: FactoryConfig) -> ConfigureView:
+    """Assemble GET /configurare from a fresh mode=ro connection: the effective
+    value of every governed parameter (override over cfg), whether each is
+    overridden, the live running-agent count (the max-parallel guard denominator),
+    and the most-recent override stamp. Pure reads; never blocks the loop."""
+    db = _open_ro(cfg)
+    try:
+        conn = db.read()
+        overrides = fdb.get_runtime_settings(conn)
+        eff = rs.EffectiveConfig(overrides, cfg)
+
+        def setting(key: str, value: object, baseline: object) -> _Setting:
+            return _Setting(value=value, baseline=baseline, overridden=key in overrides)
+
+        budgets = tuple(
+            (rc, setting(rs.budget_key(rc), eff.budget(rc), base))
+            for rc, base in cfg.budgets.per_stage.items()
+        )
+        running = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM process_registry"
+                " WHERE state IN ('running', 'spawned') AND kind = 'agent'"
+            ).fetchone()[0]
+        )
+        row = conn.execute(
+            "SELECT updated_at, updated_by FROM runtime_settings"
+            " ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        last_change = (row["updated_at"], row["updated_by"]) if row else None
+        return ConfigureView(
+            drain_manual=setting(rs.KEY_DRAIN_MANUAL, eff.drain_manual, False),
+            autodrenaj=setting(
+                rs.KEY_GOV_AUTODRENAJ,
+                eff.autodrenaj,
+                cfg.capacity_governor.proactive_enabled,
+            ),
+            budgets=budgets,
+            max_parallel=setting(
+                rs.KEY_MAX_PARALLEL,
+                eff.max_parallel_agents,
+                cfg.process.max_parallel_agents,
+            ),
+            agent_timeout_s=setting(
+                rs.KEY_AGENT_TIMEOUT, eff.agent_timeout_s, cfg.process.agent_timeout_s
+            ),
+            gov_5h=setting(
+                rs.KEY_GOV_5H,
+                eff.gov_five_hour_pct,
+                cfg.capacity_governor.five_hour_threshold_pct,
+            ),
+            gov_7d=setting(
+                rs.KEY_GOV_7D,
+                eff.gov_seven_day_pct,
+                cfg.capacity_governor.seven_day_threshold_pct,
+            ),
+            running_agents=running,
+            last_change=last_change,
+        )
+    finally:
+        db.close()
+
+
+def _cfg_info_cell(setting: _Setting, apply_ro: str, guard_ro: str = "") -> str:
+    """The 3rd column of a Configurare row: when-it-applies + guard + the override
+    mark (founder req b — every field says live?/when/guard right beside it)."""
+    parts = [esc(apply_ro)]
+    if guard_ro:
+        parts.append(esc(guard_ro))
+    if setting.overridden:
+        parts.append(esc(RO["cfg_overridden"]))
+    else:
+        parts.append(esc(RO["cfg_default_note"].format(value=setting.baseline)))
+    return " · ".join(parts)
+
+
+def render_configure_page(
+    view: ConfigureView,
+    cfg: FactoryConfig,
+    *,
+    notice: str = "",
+    errors: tuple[str, ...] = (),
+) -> str:
+    """GET/POST /configurare: the founder live-settings form. Refresh-FREE (a
+    meta-refresh would wipe a half-typed field). All dynamic text via esc()."""
+    drain_on = bool(view.drain_manual.value)
+    regim_rows = [
+        f"<tr><td>{esc(RO['cfg_drain_label'])}</td><td>"
+        f"<label><input type='radio' name='drain_manual' value='normal'"
+        f"{'' if drain_on else ' checked'}> {esc(RO['cfg_drain_normal'])}</label> "
+        f"<label><input type='radio' name='drain_manual' value='drenaj'"
+        f"{' checked' if drain_on else ''}> {esc(RO['cfg_drain_drenaj'])}</label>"
+        f"</td><td class='meta'>{esc(RO['cfg_apply_now'])} · {esc(RO['cfg_drain_help'])}</td></tr>",
+        f"<tr><td>{esc(RO['cfg_autodrenaj_label'])}</td><td>"
+        "<input type='hidden' name='autodrenaj_submitted' value='1'>"
+        f"<label><input type='checkbox' name='autodrenaj'"
+        f"{' checked' if view.autodrenaj.value else ''}> "
+        f"{esc(RO['cfg_autodrenaj_on'] if view.autodrenaj.value else RO['cfg_autodrenaj_off'])}"
+        f"</label></td><td class='meta'>"
+        f"{_cfg_info_cell(view.autodrenaj, RO['cfg_apply_now'])} · "
+        f"{esc(RO['cfg_autodrenaj_help'])}</td></tr>",
+    ]
+
+    budget_rows = []
+    for rc, st in view.budgets:
+        ktok = RO["cfg_ktok_suffix"].format(ktok=_fmt_ktok(int(st.value)))
+        budget_rows.append(
+            f"<tr><td>{esc(rc)}</td><td>"
+            f"<input type='number' name='budget_{esc(rc)}' min='1'"
+            f" value='{esc(str(st.value))}'> <span class='meta'>{esc(ktok)}</span>"
+            f"</td><td class='meta'>{_cfg_info_cell(st, RO['cfg_apply_running_stage'])}</td></tr>"
+        )
+
+    guard_maxpar = RO["cfg_guard_maxpar"].format(running=view.running_agents)
+    paralelism_rows = [
+        f"<tr><td>{esc(RO['cfg_maxpar_label'])}</td><td>"
+        f"<input type='number' name='max_parallel' min='1'"
+        f" value='{esc(str(view.max_parallel.value))}'></td><td class='meta'>"
+        f"{_cfg_info_cell(view.max_parallel, RO['cfg_apply_now'], guard_maxpar)}"
+        f"</td></tr>",
+        f"<tr><td>{esc(RO['cfg_timeout_label'])}</td><td>"
+        f"<input type='number' name='agent_timeout' min='1'"
+        f" value='{esc(str(view.agent_timeout_s.value))}'></td><td class='meta'>"
+        f"{_cfg_info_cell(view.agent_timeout_s, RO['cfg_apply_next_agent'])}</td></tr>",
+    ]
+
+    praguri_rows = [
+        f"<tr><td>{esc(RO['cfg_5h_label'])}</td><td>"
+        f"<input type='number' name='gov_5h' min='0' max='100' step='0.1'"
+        f" value='{esc(str(view.gov_5h.value))}'></td><td class='meta'>"
+        f"{_cfg_info_cell(view.gov_5h, RO['cfg_apply_now'])}</td></tr>",
+        f"<tr><td>{esc(RO['cfg_7d_label'])}</td><td>"
+        f"<input type='number' name='gov_7d' min='0' max='100' step='0.1'"
+        f" value='{esc(str(view.gov_7d.value))}'></td><td class='meta'>"
+        f"{_cfg_info_cell(view.gov_7d, RO['cfg_apply_now'])}</td></tr>",
+    ]
+
+    head = (
+        f"<th>{esc(RO['cfg_col_param'])}</th>"
+        f"<th>{esc(RO['cfg_col_value'])}</th>"
+        f"<th>{esc(RO['cfg_col_info'])}</th>"
+    )
+    budget_help = f"<p class='meta'>{esc(RO['cfg_bugete_help'])}</p>"
+    blocs = [
+        _bloc(RO["cfg_sec_regim"], _table(head, "".join(regim_rows))),
+        _bloc(RO["cfg_sec_bugete"], _table(head, "".join(budget_rows)) + budget_help),
+        _bloc(RO["cfg_sec_paralelism"], _table(head, "".join(paralelism_rows))),
+        _bloc(RO["cfg_sec_praguri"], _table(head, "".join(praguri_rows))),
+    ]
+
+    feedback = ""
+    if errors:
+        items = "".join(f"<li>{esc(e)}</li>" for e in errors)
+        feedback = f"<div class='bloc'><h3>{esc(RO['cfg_err_title'])}</h3><ul>{items}</ul></div>"
+    elif notice:
+        feedback = f"<p class='banner'>{esc(notice)}</p>"
+
+    if view.last_change is not None:
+        when, who = view.last_change
+        last_line = esc(RO["cfg_last_change"].format(when=when, who=who))
+    else:
+        last_line = esc(RO["cfg_last_change_none"])
+
+    return (
+        "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{esc(RO['cfg_title'])}</title>"
+        f"<style>{_CSS}</style></head><body>"
+        f"<h1>{esc(RO['cfg_heading'])}</h1>"
+        f"<p class='meta'>{esc(RO['cfg_intro'])}</p>"
+        f"{feedback}"
+        "<form method='post' action='/configurare'>"
+        f"{''.join(blocs)}"
+        f"<p><button>{esc(RO['cfg_save'])}</button> "
+        f"<span class='meta'>{last_line}</span></p>"
+        "</form>"
+        f"<p><a href='/'>{esc(RO['cfg_back'])}</a></p>"
         "</body></html>"
     )
 
@@ -3348,6 +3685,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # §11.2 (CCR-10): read-only, refresh-free, same mode=ro read path.
             self._send(200, render_costs_page(build_costs_view(cfg), cfg))
             return
+        if path == "/configurare":
+            # Founder live-settings tab (items 4+5): read-only render, refresh-FREE
+            # (a meta-refresh would wipe a half-typed field).
+            self._send(200, render_configure_page(build_configure_view(cfg), cfg))
+            return
         if match := _STAGE_RE.match(path):
             # Per-stage „Detalii” page (founder 20-06): read-only, refresh-free.
             self._stage_page(cfg, match.group(1))
@@ -3509,6 +3851,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 location=f"/decision/{request_id}/session",
             )
             return
+        if path == "/configurare":
+            # Founder live-settings write (items 4+5): all-or-nothing validate +
+            # guard on the loop, then re-render with a notice or the errors.
+            form = self._read_form()
+            if form is None:
+                return
+            ok, result = self._marshal(
+                dashboard.update_settings(form, via="founder"),
+                cfg.founder_channel.dashboard.answer_timeout_s,
+            )
+            if not ok:
+                return
+            view = build_configure_view(cfg)
+            if result.errors:
+                self._send(400, render_configure_page(view, cfg, errors=result.errors))
+            else:
+                notice = RO["cfg_saved_ok"] if result.changed else RO["cfg_saved_none"]
+                self._send(200, render_configure_page(view, cfg, notice=notice))
+            return
         self._page(404, RO["not_found"])
 
     def _answer_response(self, cfg: FactoryConfig, result: AnswerResult) -> None:
@@ -3613,6 +3974,136 @@ class DashboardServer:
         server.server_close()
 
     # ----------------------------------------------------------- write path
+
+    async def update_settings(
+        self, form: Mapping[str, str], *, via: str
+    ) -> SettingsResult:
+        """Live-settings write path (founder Configurare tab, items 4+5).
+        ALL-OR-NOTHING: validate every SUBMITTED field against its type + guard
+        first; if any fails, write nothing and return the errors. Else write only
+        the CHANGED keys (those differing from the current effective value — no
+        event spam for unchanged fields) in ONE transaction, each with a
+        ``runtime_setting_changed`` audit event. Lock-serialized + loop-confined,
+        like ``answer`` (§3/§7); a field is processed ONLY if its control was
+        actually submitted, so a partial POST never silently flips an absent one."""
+        async with self._lock:
+            conn = self._db.read()
+            overrides = fdb.get_runtime_settings(conn)
+            eff = rs.EffectiveConfig(overrides, self._cfg)
+            errors: list[str] = []
+            writes: dict[str, object] = {}
+
+            # --- Regim de lucru — both switches are always safe to flip. ---
+            if "drain_manual" in form:
+                new_drain = form["drain_manual"] == "drenaj"
+                if new_drain != eff.drain_manual:
+                    writes[rs.KEY_DRAIN_MANUAL] = new_drain
+            if "autodrenaj_submitted" in form:  # the hidden render marker
+                new_auto = "autodrenaj" in form  # checkbox present == ON
+                if new_auto != eff.autodrenaj:
+                    writes[rs.KEY_GOV_AUTODRENAJ] = new_auto
+
+            # --- Max agenți simultan — positive int, guarded >= live running. ---
+            if "max_parallel" in form:
+                running = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM process_registry"
+                        " WHERE state IN ('running', 'spawned') AND kind = 'agent'"
+                    ).fetchone()[0]
+                )
+                value = _parse_positive_int(form["max_parallel"])
+                if value is None:
+                    errors.append(
+                        RO["cfg_err_positive_int"].format(
+                            label=RO["cfg_maxpar_label"], raw=form["max_parallel"]
+                        )
+                    )
+                elif value < running:
+                    errors.append(
+                        RO["cfg_err_maxpar_below"].format(new=value, running=running)
+                    )
+                elif value != eff.max_parallel_agents:
+                    writes[rs.KEY_MAX_PARALLEL] = value
+
+            # --- Timeout agent — positive int, no guard (applies next agent). ---
+            if "agent_timeout" in form:
+                value = _parse_positive_int(form["agent_timeout"])
+                if value is None:
+                    errors.append(
+                        RO["cfg_err_positive_int"].format(
+                            label=RO["cfg_timeout_label"], raw=form["agent_timeout"]
+                        )
+                    )
+                elif value != eff.agent_timeout_s:
+                    writes[rs.KEY_AGENT_TIMEOUT] = value
+
+            # --- Bugete/etapă — positive int, guarded >= the most a RUNNING stage
+            # of the class has already consumed (lowering it under would escalate
+            # that stage at its next §2 check). ---
+            for rc in self._cfg.budgets.per_stage:
+                field = f"budget_{rc}"
+                if field not in form:
+                    continue
+                value = _parse_positive_int(form[field])
+                if value is None:
+                    errors.append(
+                        RO["cfg_err_positive_int"].format(
+                            label=f"{RO['cfg_sec_bugete']} «{rc}»", raw=form[field]
+                        )
+                    )
+                    continue
+                stage_id, consumed = _max_running_stage_spend(conn, rc)
+                if consumed is not None and value < consumed:
+                    errors.append(
+                        RO["cfg_err_budget_below"].format(
+                            rc=rc, new=value, etapa=stage_id, consumed=consumed
+                        )
+                    )
+                    continue
+                if value != eff.budget(rc):
+                    writes[rs.budget_key(rc)] = value
+
+            # --- Praguri API — percent in (0, 100]. ---
+            for field, key, label, current in (
+                ("gov_5h", rs.KEY_GOV_5H, RO["cfg_5h_label"], eff.gov_five_hour_pct),
+                ("gov_7d", rs.KEY_GOV_7D, RO["cfg_7d_label"], eff.gov_seven_day_pct),
+            ):
+                if field not in form:
+                    continue
+                value = _parse_pct(form[field])
+                if value is None:
+                    errors.append(RO["cfg_err_pct"].format(label=label, raw=form[field]))
+                elif value != current:
+                    writes[key] = value
+
+            # Allow-list backstop (§0): never write a structural/unknown key — the
+            # form only emits writable keys, but the boundary enforces the spine's
+            # promise regardless of what was POSTed.
+            for key in list(writes):
+                if not rs.is_writable_key(key):
+                    errors.append(RO["cfg_err_unknown_key"].format(key=key))
+
+            if errors:
+                return SettingsResult(changed=0, errors=tuple(errors))
+            if writes:
+                at = utc_now()
+                with self._db.transaction() as tx:
+                    for key, value in writes.items():
+                        fdb.set_runtime_setting(tx, key, value, updated_by=via, at=at)
+                        fdb.insert_event(
+                            tx,
+                            unit_level="factory",
+                            unit_id=None,
+                            event_type="runtime_setting_changed",
+                            actor="founder",
+                            payload={
+                                "key": key,
+                                "old": overrides.get(key),
+                                "new": value,
+                                "via": via,
+                            },
+                        )
+            return SettingsResult(changed=len(writes), errors=())
 
     async def answer(self, request_id: int, option: str, *, via: str) -> AnswerResult:
         """THE single write path (§3): loop-confined, lock-serialized; validate

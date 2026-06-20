@@ -36,6 +36,7 @@ import pytest
 
 from sf_factory import dashboard as dash
 from sf_factory import db as fdb
+from sf_factory import runtime_settings as rs
 from sf_factory import scheduler as sched_mod
 from sf_factory.artifacts import verify_integrity
 from sf_factory.config import FactoryConfig, load_config
@@ -2825,3 +2826,138 @@ async def test_stage_route_serves_page_and_unknown_404s(denv) -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ----------------------------------------------- ⚙ Configurare (items 4+5)
+
+_CFG_AT = "2026-06-20T12:00:00Z"
+
+
+def _full_form(cfg, eff, **changes) -> dict[str, str]:
+    """A COMPLETE Configurare form at the current effective values (exactly what the
+    rendered page submits); **changes overrides individual fields the founder edits."""
+    form = {
+        "drain_manual": "drenaj" if eff.drain_manual else "normal",
+        "autodrenaj_submitted": "1",
+        "max_parallel": str(eff.max_parallel_agents),
+        "agent_timeout": str(eff.agent_timeout_s),
+        "gov_5h": str(eff.gov_five_hour_pct),
+        "gov_7d": str(eff.gov_seven_day_pct),
+    }
+    if eff.autodrenaj:
+        form["autodrenaj"] = "on"
+    for rc in cfg.budgets.per_stage:
+        form[f"budget_{rc}"] = str(eff.budget(rc))
+    form.update(changes)
+    return form
+
+
+def test_configure_view_baseline_no_overrides(denv) -> None:
+    """GET /configurare with no overrides shows the cfg baselines, nothing marked
+    «modificat», and renders every editable field."""
+    view = dash.build_configure_view(denv.cfg)
+    assert view.drain_manual.value is False and view.drain_manual.overridden is False
+    assert view.max_parallel.value == denv.cfg.process.max_parallel_agents
+    assert view.agent_timeout_s.value == denv.cfg.process.agent_timeout_s
+    assert view.autodrenaj.value == denv.cfg.capacity_governor.proactive_enabled
+    html = dash.render_configure_page(view, denv.cfg)
+    assert dash.RO["cfg_heading"] in html
+    for name in ("drain_manual", "autodrenaj", "max_parallel", "agent_timeout", "gov_5h", "gov_7d"):
+        assert f"name='{name}'" in html
+    for rc in denv.cfg.budgets.per_stage:
+        assert f"name='budget_{rc}'" in html
+    assert dash.RO["cfg_overridden"] not in html  # nothing overridden yet
+
+
+def test_configure_view_reflects_overrides(denv) -> None:
+    """An override wins over cfg and is marked «modificat la viu»; the DRENAJ radio
+    renders checked."""
+    with denv.db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_MAX_PARALLEL, 1, updated_by="founder", at=_CFG_AT)
+        fdb.set_runtime_setting(conn, rs.KEY_DRAIN_MANUAL, True, updated_by="founder", at=_CFG_AT)
+    view = dash.build_configure_view(denv.cfg)
+    assert view.max_parallel.value == 1 and view.max_parallel.overridden is True
+    assert view.drain_manual.value is True
+    assert view.last_change == (_CFG_AT, "founder")
+    html = dash.render_configure_page(view, denv.cfg)
+    assert dash.RO["cfg_overridden"] in html
+    assert "value='drenaj' checked" in html
+
+
+async def test_update_settings_writes_changed_only(denv) -> None:
+    """A POST writes ONLY the changed keys (one runtime_setting_changed event each);
+    fields left at their current value produce no write/event."""
+    server = _server(denv)
+    eff = rs.EffectiveConfig(fdb.get_runtime_settings(denv.db.read()), denv.cfg)
+    form = _full_form(denv.cfg, eff)
+    form["drain_manual"] = "drenaj"  # the only change
+    result = await server.update_settings(form, via="founder")
+    assert result.errors == () and result.changed == 1
+    assert fdb.get_runtime_settings(denv.db.read()) == {rs.KEY_DRAIN_MANUAL: True}
+    events = denv.db.read().execute(
+        "SELECT COUNT(*) FROM events WHERE event_type='runtime_setting_changed'"
+    ).fetchone()[0]
+    assert events == 1
+
+
+async def test_update_settings_max_parallel_guard_rejects_below_running(denv) -> None:
+    """The max-parallel guard rejects a value below the live running-agent count;
+    NOTHING is written (all-or-nothing)."""
+    _seed_unit(denv, stage_id="ph.s1", risk="routine")
+    for _ in range(3):
+        _seed_proc(denv, unit_id="ph.s1", state="running", exit_code=None)
+    server = _server(denv)
+    form = _full_form(denv.cfg, rs.EffectiveConfig({}, denv.cfg), max_parallel="2")
+    result = await server.update_settings(form, via="founder")
+    assert result.changed == 0
+    assert any("rulează 3" in e for e in result.errors)
+    assert fdb.get_runtime_settings(denv.db.read()) == {}
+
+
+async def test_update_settings_budget_guard_rejects_below_consumed(denv) -> None:
+    """The budget guard rejects a per-class budget below what a RUNNING stage of
+    that class has already consumed (else it would escalate at once)."""
+    _seed_unit(denv, stage_id="ph.s1", risk="routine")  # AWAITING_HUMAN: non-terminal
+    _seed_proc(denv, unit_id="ph.s1", state="exited", exit_code=0, tokens=(6000, 0))
+    server = _server(denv)
+    form = _full_form(denv.cfg, rs.EffectiveConfig({}, denv.cfg))
+    form["budget_routine"] = "5000"  # below the 6000 already consumed
+    result = await server.update_settings(form, via="founder")
+    assert result.changed == 0
+    assert any("consumat deja 6000" in e for e in result.errors)
+    assert rs.budget_key("routine") not in fdb.get_runtime_settings(denv.db.read())
+
+
+async def test_update_settings_all_or_nothing(denv) -> None:
+    """A valid edit alongside an invalid one writes NOTHING — the valid drain flip
+    must not land while the bad timeout is rejected."""
+    server = _server(denv)
+    form = _full_form(denv.cfg, rs.EffectiveConfig({}, denv.cfg))
+    form["drain_manual"] = "drenaj"  # valid
+    form["agent_timeout"] = "-5"  # invalid (not positive)
+    result = await server.update_settings(form, via="founder")
+    assert result.changed == 0 and result.errors
+    assert fdb.get_runtime_settings(denv.db.read()) == {}
+
+
+async def test_update_settings_pct_out_of_range_rejected(denv) -> None:
+    """A threshold outside (0, 100] is rejected; nothing written."""
+    server = _server(denv)
+    form = _full_form(denv.cfg, rs.EffectiveConfig({}, denv.cfg))
+    form["gov_5h"] = "150"
+    result = await server.update_settings(form, via="founder")
+    assert result.changed == 0 and result.errors
+    assert fdb.get_runtime_settings(denv.db.read()) == {}
+
+
+async def test_update_settings_budget_edit_above_consumed_succeeds(denv) -> None:
+    """Raising a budget above the running stage's consumption is allowed and lands
+    as a budget.<rc> override with its audit event."""
+    _seed_unit(denv, stage_id="ph.s1", risk="routine")
+    _seed_proc(denv, unit_id="ph.s1", state="exited", exit_code=0, tokens=(6000, 0))
+    server = _server(denv)
+    form = _full_form(denv.cfg, rs.EffectiveConfig({}, denv.cfg))
+    form["budget_routine"] = "9000"  # above 6000 consumed, below the 10000 baseline
+    result = await server.update_settings(form, via="founder")
+    assert result.errors == () and result.changed == 1
+    assert fdb.get_runtime_settings(denv.db.read()) == {rs.budget_key("routine"): 9000}
