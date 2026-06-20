@@ -254,6 +254,33 @@ RO: Mapping[str, str] = {
     "artifact_title": "Artefact",
     "artifact_missing": "Artefactul cerut nu există sau nu a putut fi citit.",
     "back_to_dashboard": "Înapoi la panou",
+    # per-stage „Detalii” page (founder 20-06): a focused read-only view of one
+    # running stage — history, agent results, audit findings (+ inline reports).
+    "stage_detail_link": "Detalii →",
+    "stage_detail_title": "Detalii etapă",
+    "stage_unknown": "Această etapă nu există.",
+    "detail_history": "Istoric",
+    "detail_history_none": "nicio schimbare de stare înregistrată încă",
+    "detail_agents": "Agenți și rezultate",
+    "detail_agents_none": "niciun agent rulat încă pe această etapă",
+    "detail_findings": "Constatări audit",
+    "detail_findings_none": "nicio constatare de audit",
+    "col_from_state": "De la",
+    "col_to_state": "La",
+    "col_outcome": "Rezultat",
+    "col_finding": "Constatare",
+    "col_severity": "Gravitate",
+    "col_auditor": "Auditor",
+    "detail_report": "Raport",
+    "detail_contest": "Contestare",
+    "outcome_running": "în lucru",
+    "outcome_success": "reușit",
+    "outcome_failure": "eșuat",
+    "finding_status_closed": "acceptat/închis",
+    "finding_status_contested": "contestat",
+    "finding_status_open": "deschis",
+    "artifact_truncated": "… (trunchiat)",
+    "artifact_full": "vezi artefactul complet →",
     "missing_gloss": "etichetă lipsă",
     "progress_of": "din",
     "progress_done": "etape gata",
@@ -788,6 +815,77 @@ class CostsView:
 
     generated_at: str
     phases: tuple[PhaseCosts, ...]
+
+
+# ----------------------------------------------------- per-stage detail shapes
+# A focused read-only view of ONE running stage (founder 20-06): state history,
+# one result row per agent run, audit findings with the report (+ contest)
+# content rendered inline. Pure render input — assembled from a fresh mode=ro
+# connection, exactly like build_view/build_costs_view.
+
+#: Inline artifact content is capped so a huge report never blows the page; the
+#: full text stays one tap away via the /artifact/<id> link (founder 20-06).
+_ARTIFACT_INLINE_CAP = 8000
+
+
+@dataclass(frozen=True)
+class StageEvent:
+    """One state-transition row in the stage's Istoric (events, oldest→newest)."""
+
+    from_state: str | None
+    to_state: str | None
+    when: str  # founder format (pre-rendered, R4)
+
+
+@dataclass(frozen=True)
+class AgentRunRow:
+    """One process_registry kind='agent' run — a result row in „Agenți și
+    rezultate”. outcome is the founder-clear Romanian verdict; running marks the
+    CURRENT agent (visually distinct); tokens is the run's ledger sum in mii."""
+
+    role: str
+    started: str  # founder format or '—'
+    duration: str
+    outcome: str
+    running: bool
+    tokens: str  # _fmt_ktok of the run's ledger sum, or '—' when no rows
+
+
+@dataclass(frozen=True)
+class FindingArtifact:
+    """Inline-rendered artifact content (report or contest) for a finding: the
+    resolved text (already truncated to the cap), whether it was truncated, and
+    the ref id for the full-artifact link."""
+
+    ref_id: int
+    content: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class FindingRow:
+    """One audit_findings row for the stage, with its report (+ optional
+    contest) content resolved inline (§ Constatări audit)."""
+
+    finding_ref: str
+    severity: str | None
+    auditor_role: str
+    status: str  # founder-clear gloss (pre-rendered)
+    report: FindingArtifact
+    contest: FindingArtifact | None
+
+
+@dataclass(frozen=True)
+class StageDetail:
+    """Pure render input of GET /stage/<stage_id> (read-only, refresh-free)."""
+
+    stage_id: str
+    name: str
+    state: str
+    risk_class: str
+    events: tuple[StageEvent, ...]
+    runs: tuple[AgentRunRow, ...]
+    findings: tuple[FindingRow, ...]
 
 
 def _estimate_usd(
@@ -1705,6 +1803,148 @@ def build_costs_view(cfg: FactoryConfig, *, now: str | None = None) -> CostsView
     return CostsView(generated_at=moment, phases=tuple(phases))
 
 
+# --------------------------------------------------------- build_stage_detail
+
+#: status -> founder-clear RO key (the page never renders the raw DB token bare;
+#: an unknown future status falls back to the raw token, never a KeyError).
+_FINDING_STATUS_GLOSS: Mapping[str, str] = {
+    "complied": "finding_status_closed",
+    "settled": "finding_status_closed",
+    "overruled": "finding_status_closed",
+    "duplicate": "finding_status_closed",
+    "contested": "finding_status_contested",
+    "sustained": "finding_status_contested",
+    "open": "finding_status_open",
+}
+
+
+def _agent_outcome(state: str | None, exit_code: int | None) -> tuple[str, bool]:
+    """Founder-clear result of one agent run + a 'running' flag (the CURRENT
+    agent). spawned/running -> „în lucru” (running=True); exited & exit_code=0
+    -> „reușit”; everything else -> „eșuat (<state>[ cod <exit_code>])”."""
+    if state in ("spawned", "running"):
+        return RO["outcome_running"], True
+    if state == "exited" and exit_code == 0:
+        return RO["outcome_success"], False
+    detail = state or "—"
+    if exit_code is not None:
+        detail = f"{detail} cod {exit_code}"
+    return f"{RO['outcome_failure']} ({detail})", False
+
+
+def _run_token_total(conn: sqlite3.Connection, process_id: int) -> str:
+    """The run's token_ledger sum (in mii) for one process_id; '—' when the
+    process has no ledger rows (a run may record none — §2 usage_missing)."""
+    row = conn.execute(
+        "SELECT SUM(tokens_in) AS ti, SUM(tokens_out) AS to_,"
+        " COUNT(*) AS n FROM token_ledger WHERE process_id = ?",
+        (process_id,),
+    ).fetchone()
+    if row is None or not row["n"]:
+        return "—"
+    return _fmt_ktok((row["ti"] or 0) + (row["to_"] or 0))
+
+
+def _finding_artifact(
+    cfg: FactoryConfig, conn: sqlite3.Connection, ref_id: int
+) -> FindingArtifact:
+    """Resolve an artifact_refs id to inline content via the SAME helper the
+    /artifact/<id> route uses (_artifact_text); truncate to the cap. An
+    unresolvable artifact degrades to a marker line — the page never dies."""
+    row = _artifact_row(conn, ref_id)
+    if row is None:
+        return FindingArtifact(ref_id=ref_id, content=RO["artifact_missing"], truncated=False)
+    try:
+        text = _artifact_text(cfg, conn, row)
+    except DashboardError:
+        return FindingArtifact(ref_id=ref_id, content=RO["artifact_missing"], truncated=False)
+    truncated = len(text) > _ARTIFACT_INLINE_CAP
+    return FindingArtifact(
+        ref_id=ref_id, content=text[:_ARTIFACT_INLINE_CAP], truncated=truncated
+    )
+
+
+def build_stage_detail(cfg: FactoryConfig, stage_id: str) -> StageDetail | None:
+    """Assemble GET /stage/<stage_id> from a fresh mode=ro connection (same read
+    path as build_view, never the orchestrator's rw connection, never writes).
+    Returns None when the stage id is unknown (the route renders a 404)."""
+    db = _open_ro(cfg)
+    try:
+        conn = db.read()
+        srow = conn.execute(
+            "SELECT * FROM stages WHERE id = ?", (stage_id,)
+        ).fetchone()
+        if srow is None:
+            return None
+        tz = cfg.factory.timezone_founder
+        events = tuple(
+            StageEvent(
+                from_state=erow["from_state"],
+                to_state=erow["to_state"],
+                when=fmt_founder_ts(erow["created_at"], tz),
+            )
+            for erow in conn.execute(
+                "SELECT from_state, to_state, created_at FROM events"
+                " WHERE unit_level = 'stage' AND unit_id = ?"
+                " AND event_type = 'transition' ORDER BY seq",
+                (stage_id,),
+            ).fetchall()
+        )
+        runs: list[AgentRunRow] = []
+        for prow in conn.execute(
+            "SELECT id, role, state, exit_code, spawned_at, ended_at"
+            " FROM process_registry WHERE unit_level = 'stage' AND unit_id = ?"
+            " AND kind = 'agent' ORDER BY spawned_at, id",
+            (stage_id,),
+        ).fetchall():
+            outcome, running = _agent_outcome(prow["state"], prow["exit_code"])
+            runs.append(
+                AgentRunRow(
+                    role=prow["role"],
+                    started=fmt_founder_ts(prow["spawned_at"], tz)
+                    if prow["spawned_at"]
+                    else "—",
+                    duration=_fmt_dur(prow["spawned_at"], prow["ended_at"]),
+                    outcome=outcome,
+                    running=running,
+                    tokens=_run_token_total(conn, int(prow["id"])),
+                )
+            )
+        findings: list[FindingRow] = []
+        for frow in conn.execute(
+            "SELECT * FROM audit_findings WHERE stage_id = ? ORDER BY id",
+            (stage_id,),
+        ).fetchall():
+            status_key = _FINDING_STATUS_GLOSS.get(frow["status"])
+            status_text = RO[status_key] if status_key else frow["status"]
+            contest = (
+                _finding_artifact(cfg, conn, int(frow["contest_artifact_id"]))
+                if frow["contest_artifact_id"] is not None
+                else None
+            )
+            findings.append(
+                FindingRow(
+                    finding_ref=frow["finding_ref"],
+                    severity=frow["severity"],
+                    auditor_role=frow["auditor_role"],
+                    status=status_text,
+                    report=_finding_artifact(cfg, conn, int(frow["report_artifact_id"])),
+                    contest=contest,
+                )
+            )
+        return StageDetail(
+            stage_id=srow["id"],
+            name=srow["name"],
+            state=srow["state"],
+            risk_class=srow["risk_class"],
+            events=events,
+            runs=tuple(runs),
+            findings=tuple(findings),
+        )
+    finally:
+        db.close()
+
+
 # -------------------------------------------------------------------- render
 
 # §10.2 visual system: CSS custom properties in :root are the SINGLE token
@@ -2061,19 +2301,22 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
 
     if health.running_stages:
         # §11.2: the cost column (right-aligned, after tokens) carries the
-        # exact/estimated pair; empty when the stage has no ledger rows.
+        # exact/estimated pair; empty when the stage has no ledger rows. The
+        # trailing column links to the per-stage „Detalii” page (founder 20-06).
         running_rows = "".join(
             f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
             f"<td>{_chip(st.state)}</td>"
             f"<td>{esc(_glossed(st.risk_class))}</td>"
             f"<td class='num'>{esc(_fmt_ktok(st.tokens))}</td>"
-            f"<td class='num'>{esc(_fmt_cost_pair(st.cost))}</td></tr>"
+            f"<td class='num'>{esc(_fmt_cost_pair(st.cost))}</td>"
+            f"<td><a href='/stage/{esc(st.stage_id)}'>"
+            f"{esc(RO['stage_detail_link'])}</a></td></tr>"
             for st in health.running_stages
         )
         running_body = _table(
             f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_step'])}</th>"
             f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_tokens'])}</th>"
-            f"<th class='num'>{esc(RO['col_cost'])}</th>",
+            f"<th class='num'>{esc(RO['col_cost'])}</th><th></th>",
             running_rows,
         )
     else:
@@ -2363,6 +2606,114 @@ def render_costs_page(view: CostsView, cfg: FactoryConfig) -> str:
         f"<title>{esc(RO['costs_title'])} — {esc(RO['page_title'])}</title>"
         f"<style>{_CSS}</style></head><body>"
         f"{''.join(parts)}"
+        "</body></html>"
+    )
+
+
+def _render_finding_artifact(label: str, art: FindingArtifact) -> str:
+    """One inline report/contest body: label + escaped <pre> of the (already
+    capped) content, the „… (trunchiat)” marker + a link to the full artifact
+    when truncated; the /artifact/<id> link always present (R5: esc into <pre>,
+    markdown never interpreted)."""
+    marker = (
+        f"<p class='meta'>{esc(RO['artifact_truncated'])}</p>" if art.truncated else ""
+    )
+    return (
+        f"<p><strong>{esc(label)}</strong> —"
+        f" <a href='/artifact/{art.ref_id}'>{esc(RO['artifact_full'])}</a></p>"
+        f"<pre>{esc(art.content)}</pre>{marker}"
+    )
+
+
+def render_stage_page(detail: StageDetail, cfg: FactoryConfig) -> str:
+    """GET /stage/<stage_id> (founder 20-06): read-only, refresh-free, zero JS,
+    NO inputs — a focused detail page for ONE running stage. Four blocs: header
+    (name+id+chip+risk gloss), Istoric (state transitions), Agenți și rezultate
+    (one result row per agent run, the running agent visually distinct), and
+    Constatări audit (findings + the report/contest content rendered inline).
+    NO meta-refresh (it has no inputs — the §10.5 session/costs precedent)."""
+    # 1. Header bloc.
+    header_body = (
+        f"<p>{_chip(detail.state)} · {esc(_glossed(detail.risk_class))}</p>"
+    )
+    blocs = [_bloc(f"{detail.name} ({detail.stage_id})", header_body)]
+
+    # 2. Istoric (state history) — oldest→newest transitions.
+    if detail.events:
+        history_rows = "".join(
+            f"<tr><td>{_chip(ev.from_state) if ev.from_state else '—'}</td>"
+            f"<td>{_chip(ev.to_state) if ev.to_state else '—'}</td>"
+            f"<td class='num'>{esc(ev.when)}</td></tr>"
+            for ev in detail.events
+        )
+        history_body = _table(
+            f"<th>{esc(RO['col_from_state'])}</th><th>{esc(RO['col_to_state'])}</th>"
+            f"<th class='num'>{esc(RO['col_when'])}</th>",
+            history_rows,
+        )
+    else:
+        history_body = f"<p class='meta'>{esc(RO['detail_history_none'])}</p>"
+    blocs.append(_bloc(RO["detail_history"], history_body))
+
+    # 3. Agenți și rezultate — one result row per agent run; the CURRENT agent
+    # (running) carries the accent chip so it reads as visually distinct.
+    if detail.runs:
+        run_rows: list[str] = []
+        for run in detail.runs:
+            outcome_cell = (
+                f"<span class='chip chip-accent'>{esc(run.outcome)}</span>"
+                if run.running
+                else esc(run.outcome)
+            )
+            run_rows.append(
+                f"<tr><td>{esc(_glossed(run.role))}</td>"
+                f"<td class='num'>{esc(run.started)}</td>"
+                f"<td class='num'>{esc(run.duration)}</td>"
+                f"<td>{outcome_cell}</td>"
+                f"<td class='num'>{esc(run.tokens)}</td></tr>"
+            )
+        runs_body = _table(
+            f"<th>{esc(RO['col_agent'])}</th>"
+            f"<th class='num'>{esc(RO['col_started'])}</th>"
+            f"<th class='num'>{esc(RO['col_duration'])}</th>"
+            f"<th>{esc(RO['col_outcome'])}</th>"
+            f"<th class='num'>{esc(RO['col_tokens'])}</th>",
+            "".join(run_rows),
+        )
+    else:
+        runs_body = f"<p class='meta'>{esc(RO['detail_agents_none'])}</p>"
+    blocs.append(_bloc(RO["detail_agents"], runs_body))
+
+    # 4. Constatări audit — per finding: ref/severity/auditor/status table, then
+    # the report (+ optional contest) content rendered INLINE under it.
+    if detail.findings:
+        findings_parts: list[str] = []
+        for fnd in detail.findings:
+            meta_row = _table(
+                f"<th>{esc(RO['col_finding'])}</th><th>{esc(RO['col_severity'])}</th>"
+                f"<th>{esc(RO['col_auditor'])}</th><th>{esc(RO['col_state'])}</th>",
+                f"<tr><td>{esc(fnd.finding_ref)}</td>"
+                f"<td>{esc(fnd.severity if fnd.severity is not None else '—')}</td>"
+                f"<td>{esc(_glossed(fnd.auditor_role))}</td>"
+                f"<td>{esc(fnd.status)}</td></tr>",
+            )
+            content = _render_finding_artifact(RO["detail_report"], fnd.report)
+            if fnd.contest is not None:
+                content += _render_finding_artifact(RO["detail_contest"], fnd.contest)
+            findings_parts.append(meta_row + content)
+        findings_body = "".join(findings_parts)
+    else:
+        findings_body = f"<p class='meta'>{esc(RO['detail_findings_none'])}</p>"
+    blocs.append(_bloc(RO["detail_findings"], findings_body))
+
+    return (
+        "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{esc(RO['stage_detail_title'])} — {esc(detail.name)}</title>"
+        f"<style>{_CSS}</style></head><body>"
+        f"<h1>{esc(RO['stage_detail_title'])}</h1>"
+        f"{''.join(blocs)}"
+        f"<p><a href='/'>{esc(RO['back_to_dashboard'])}</a></p>"
         "</body></html>"
     )
 
@@ -2851,6 +3202,8 @@ _SESSION_PAGE_RE = re.compile(r"^/decision/(\d+)/session$")
 _SESSION_POLL_RE = re.compile(r"^/decision/(\d+)/session/poll$")
 _SESSION_MESSAGE_RE = re.compile(r"^/decision/(\d+)/session/message$")
 _ARTIFACT_RE = re.compile(r"^/artifact/(\d+)$")
+#: stage ids carry dots and hyphens (e.g. inventory-procurement.stocktaking).
+_STAGE_RE = re.compile(r"^/stage/([\w.\-]+)$")
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -2972,6 +3325,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # §11.2 (CCR-10): read-only, refresh-free, same mode=ro read path.
             self._send(200, render_costs_page(build_costs_view(cfg), cfg))
             return
+        if match := _STAGE_RE.match(path):
+            # Per-stage „Detalii” page (founder 20-06): read-only, refresh-free.
+            self._stage_page(cfg, match.group(1))
+            return
         if match := _ARTIFACT_RE.match(path):
             self._artifact_page(cfg, int(match.group(1)))
             return
@@ -2987,6 +3344,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._session_poll(cfg, int(match.group(1)), after)
             return
         self._page(404, RO["not_found"])
+
+    def _stage_page(self, cfg: FactoryConfig, stage_id: str) -> None:
+        detail = build_stage_detail(cfg, stage_id)
+        if detail is None:
+            self._page(404, RO["stage_unknown"])
+            return
+        self._send(200, render_stage_page(detail, cfg))
 
     def _artifact_page(self, cfg: FactoryConfig, ref_id: int) -> None:
         db = _open_ro(cfg)

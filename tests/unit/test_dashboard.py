@@ -2515,3 +2515,312 @@ def test_gloss_closure_role_keys_and_model_tokens(real_config_path) -> None:
     assert dash.GLOSS["agent_run_failed"] == (
         "agentul a eșuat la rulare (oprire fără rezultat)"
     )
+
+
+# --------------------------------------------- per-stage „Detalii” page (20-06)
+# A focused read-only detail page for ONE running stage: state history, one
+# result row per agent run (the running agent visually distinct), and audit
+# findings with the report/contest content rendered inline. Local seed helpers
+# (the frozen-conftest convention); reuse _seed_unit/_seed_build_stage above.
+
+
+def _seed_proc(
+    env,
+    *,
+    unit_id: str = "ph.s1",
+    role: str = "builder_routine",
+    state: str = "exited",
+    exit_code: int | None = 0,
+    spawned_at: str | None = None,
+    ended_at: str | None = None,
+    tokens: tuple[int, int] | None = None,
+) -> int:
+    """One process_registry kind='agent' run for a stage (+ an optional ledger
+    row so the run's token sum is non-empty). Returns the process id."""
+    from sf_factory.models import ProcessRecord
+
+    now = utc_now()
+    with env.db.transaction() as conn:
+        pid = fdb.insert_process(
+            conn,
+            ProcessRecord(
+                id=None,
+                unit_level="stage",
+                unit_id=unit_id,
+                kind="agent",
+                role=role,
+                cp_id=None,
+                session_id=None,
+                pid=None,
+                cmdline="stub",
+                cwd=None,
+                state=state,
+                exit_code=exit_code,
+                ndjson_log_path=None,
+                spawned_at=spawned_at or now,
+                heartbeat_at=None,
+                ended_at=ended_at,
+            ),
+        )
+        if tokens is not None:
+            fdb.insert_token_usage(
+                conn,
+                process_id=pid,
+                unit_level="stage",
+                unit_id=unit_id,
+                role=role,
+                model="sonnet",
+                tokens_in=tokens[0],
+                tokens_out=tokens[1],
+                cost_usd=None,
+            )
+        return pid
+
+
+def _seed_transition(env, *, unit_id: str, from_state: str, to_state: str) -> None:
+    with env.db.transaction() as conn:
+        fdb.insert_event(
+            conn,
+            unit_level="stage",
+            unit_id=unit_id,
+            event_type="transition",
+            actor="state_machine",
+            from_state=from_state,
+            to_state=to_state,
+        )
+
+
+def _seed_finding(
+    env,
+    *,
+    unit_id: str = "ph.s1",
+    finding_ref: str = "F-1",
+    severity: str | None = "major",
+    auditor_role: str = "auditor_cross_model",
+    status: str = "open",
+    report_body: str = "# Raport de audit\n\nProblema constatată.\n",
+    contest_body: str | None = None,
+) -> None:
+    """One audit_findings row whose report (and optional contest) artifact is a
+    real factory-repo file resolvable by the /artifact content helper."""
+    from sf_factory.artifacts import register_artifact
+    from sf_factory.models import Finding
+
+    unit_dir = env.home / "_factory" / "stages" / unit_id / "audit"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    report_path = unit_dir / f"{finding_ref}-report.md"
+    report_path.write_text(report_body, encoding="utf-8")
+    now = utc_now()
+    with env.db.transaction() as conn:
+        report_ref = register_artifact(
+            conn,
+            unit_level="stage",
+            unit_id=unit_id,
+            kind="audit_report",
+            repo="factory",
+            repo_root=env.home,
+            path=report_path,
+            git_commit=None,
+        )
+        contest_id = None
+        if contest_body is not None:
+            contest_path = unit_dir / f"{finding_ref}-contest.md"
+            contest_path.write_text(contest_body, encoding="utf-8")
+            contest_ref = register_artifact(
+                conn,
+                unit_level="stage",
+                unit_id=unit_id,
+                kind="contest_rationale",
+                repo="factory",
+                repo_root=env.home,
+                path=contest_path,
+                git_commit=None,
+            )
+            contest_id = contest_ref.id
+        fdb.insert_finding(
+            conn,
+            Finding(
+                id=None,
+                stage_id=unit_id,
+                auditor_role=auditor_role,
+                finding_ref=finding_ref,
+                severity=severity,
+                report_artifact_id=report_ref.id,
+                status=status,
+                contest_artifact_id=contest_id,
+                resolved_by=None,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+
+def test_stage_detail_renders_four_sections(denv) -> None:
+    """build_stage_detail + render_stage_page show, as _bloc sections: the
+    header (name+id+state chip+risk gloss), Istoric (transitions oldest→newest),
+    Agenți și rezultate (one result row per run), Constatări audit (+ inline
+    report content). No meta-refresh (it has no inputs)."""
+    _seed_unit(denv)  # phase ph (+ stage ph.s1)
+    _seed_build_stage(denv)  # ph.b, BUILD (RUNNING category)
+    _seed_transition(denv, unit_id="ph.b", from_state="SPEC", to_state="BUILD")
+    _seed_proc(
+        denv,
+        unit_id="ph.b",
+        role="builder_routine",
+        state="exited",
+        exit_code=0,
+        spawned_at="2026-06-20T10:00:00Z",
+        ended_at="2026-06-20T10:18:00Z",
+        tokens=(120000, 22000),
+    )
+    _seed_finding(
+        denv,
+        unit_id="ph.b",
+        finding_ref="F-7",
+        severity="major",
+        status="open",
+        report_body="Constatare detaliată în raport.\n",
+    )
+    detail = dash.build_stage_detail(denv.cfg, "ph.b")
+    assert detail is not None
+    page = dash.render_stage_page(detail, denv.cfg)
+
+    # No meta-refresh on a no-input page (the costs/session precedent).
+    assert "http-equiv='refresh'" not in page
+    # Header: name + id + state chip + glossed risk class.
+    assert "Etapa activă (ph.b)" in page
+    assert "construcție în lucru (BUILD)" in page  # state chip gloss (StageState.BUILD)
+    assert "risc de rutină (routine)" in page
+    # Istoric: the transition row with both chips + founder timestamp.
+    assert dash.RO["detail_history"] in page
+    assert "specificare în lucru (SPEC)" in page
+    # Agenți și rezultate: glossed role, founder start, duration, outcome, tokens.
+    assert dash.RO["detail_agents"] in page
+    assert "constructor (etape ușoare) (builder_routine)" in page
+    assert "20-06-2026 13:00" in page  # spawned_at 10:00Z -> 13:00 Chisinau (EEST)
+    assert "18 min" in page  # _fmt_dur 10:00->10:18
+    assert dash.RO["outcome_success"] in page  # exited + exit_code 0 -> reușit
+    assert "142" in page  # _fmt_ktok(120000+22000) -> "142"
+    # Constatări audit: ref, severity, glossed auditor, status gloss, inline report.
+    assert dash.RO["detail_findings"] in page
+    assert "F-7" in page
+    assert "auditor încrucișat (codex) (auditor_cross_model)" in page
+    assert dash.RO["finding_status_open"] in page
+    assert "Constatare detaliată în raport." in page  # report content inline
+
+
+def test_stage_detail_outcomes_and_running_agent_distinct(denv) -> None:
+    """OUTCOME mapping: running/spawned -> „în lucru” (current agent, visually
+    distinct chip); exited+0 -> „reușit”; otherwise „eșuat (<state>[ cod N])”.
+    A run with no ledger rows shows „—” for tokens."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    # A failed run (non-zero exit), an old success, and the CURRENT running agent.
+    _seed_proc(denv, unit_id="ph.b", role="validator", state="exited", exit_code=2,
+               spawned_at="2026-06-20T09:00:00Z", ended_at="2026-06-20T09:05:00Z")
+    _seed_proc(denv, unit_id="ph.b", role="builder_routine", state="running",
+               exit_code=None, spawned_at="2026-06-20T10:00:00Z", ended_at=None)
+    detail = dash.build_stage_detail(denv.cfg, "ph.b")
+    assert detail is not None
+    page = dash.render_stage_page(detail, denv.cfg)
+    # Failed run names the state + code; never a silent success.
+    assert f"{dash.RO['outcome_failure']} (exited cod 2)" in page
+    # The running agent: „în lucru” inside the accent chip (visually distinct).
+    assert f"<span class='chip chip-accent'>{dash.RO['outcome_running']}</span>" in page
+    # Neither run has ledger rows -> tokens render the em dash, not "0".
+    assert "<td class='num'>—</td>" in page
+    # Order is oldest→newest: the 09:00 failed run precedes the 10:00 running one.
+    assert page.index("validator") < page.index("builder_routine")
+
+
+def test_stage_detail_audit_content_truncated_with_link(denv) -> None:
+    """Audit report/contest content renders INLINE in an escaped <pre>; content
+    over the cap is truncated with the „… (trunchiat)” marker; the full-artifact
+    link to /artifact/<id> is always present. The contest artifact renders too."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    long_body = "X" * (dash._ARTIFACT_INLINE_CAP + 500)
+    _seed_finding(
+        denv,
+        unit_id="ph.b",
+        finding_ref="F-9",
+        status="contested",
+        report_body=long_body,
+        contest_body="Motivația executorului.\n",
+    )
+    detail = dash.build_stage_detail(denv.cfg, "ph.b")
+    assert detail is not None
+    page = dash.render_stage_page(detail, denv.cfg)
+    # Truncation: capped content + the marker; the over-cap tail is NOT present.
+    assert "X" * dash._ARTIFACT_INLINE_CAP in page
+    assert "X" * (dash._ARTIFACT_INLINE_CAP + 1) not in page
+    assert dash.RO["artifact_truncated"] in page
+    # The full-artifact link is rendered (resolve the report ref id from the DB).
+    report_id = (
+        denv.db.read()
+        .execute("SELECT report_artifact_id FROM audit_findings WHERE finding_ref='F-9'")
+        .fetchone()[0]
+    )
+    assert f"/artifact/{report_id}" in page
+    # The contest content + its label render inline.
+    assert dash.RO["detail_contest"] in page
+    assert "Motivația executorului." in page
+    # Contested status maps to the founder-clear „contestat”.
+    assert dash.RO["finding_status_contested"] in page
+
+
+def test_stage_detail_empty_sections_show_notices(denv) -> None:
+    """A stage with no transitions / runs / findings still renders all four
+    blocs — each empty section shows its explicit RO notice, never a blank."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)
+    detail = dash.build_stage_detail(denv.cfg, "ph.b")
+    assert detail is not None
+    page = dash.render_stage_page(detail, denv.cfg)
+    assert dash.RO["detail_history_none"] in page
+    assert dash.RO["detail_agents_none"] in page
+    assert dash.RO["detail_findings_none"] in page
+
+
+def test_running_stage_row_links_to_detail_page(denv) -> None:
+    """The „Acum în lucru” running-stages table carries a „Detalii →” link to
+    /stage/<stage_id> per running row (founder asked for it on running only)."""
+    _seed_unit(denv)
+    _seed_build_stage(denv)  # ph.b is RUNNING category
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert f"<a href='/stage/ph.b'>{dash.RO['stage_detail_link']}</a>" in page
+
+
+async def test_stage_route_serves_page_and_unknown_404s(denv) -> None:
+    """GET /stage/<id> returns the page for a seeded stage; an unknown id 404s
+    via the existing _page error path. The regex admits dotted/hyphened ids."""
+    _seed_unit(denv)
+    _seed_build_stage(denv, "inventory-procurement.stocktaking")
+    _seed_transition(
+        denv,
+        unit_id="inventory-procurement.stocktaking",
+        from_state="SPEC",
+        to_state="BUILD",
+    )
+    server = _server(denv)
+    task = await _serving(server)
+    try:
+        host, port = server.bound_address
+        base = f"http://{host}:{port}"
+        # Dotted + hyphened stage id resolves (the [\w.\-]+ route regex).
+        status, _, body = await asyncio.to_thread(
+            _http, "GET", f"{base}/stage/inventory-procurement.stocktaking"
+        )
+        assert status == 200
+        assert "(inventory-procurement.stocktaking)" in body
+        assert dash.RO["detail_history"] in body
+        # Unknown stage id -> 404 with the RO notice (existing _page path).
+        status, _, body = await asyncio.to_thread(
+            _http, "GET", f"{base}/stage/nu.exista"
+        )
+        assert status == 404
+        assert dash.RO["stage_unknown"] in body
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
