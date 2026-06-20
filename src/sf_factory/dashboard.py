@@ -134,6 +134,13 @@ RO: Mapping[str, str] = {
     "costs_title": "Costuri pe agenți",
     "costs_phase_agents": "agenți de fază",
     "costs_none": "nicio cheltuială înregistrată încă",
+    "memory_label": "Memorie",
+    "mem_host_free": "RAM server liber",
+    "mem_leash": "Lesă fabrică (folosit / plafon)",
+    "mem_no_leash": "fără lesă (nelimitat)",
+    "mem_col_value": "Valoare",
+    "mem_col_rss": "Memorie (RSS)",
+    "mem_agents_none": "niciun agent în lucru",
     "incident_label": "Ultimul incident",
     "incident_none": "niciun incident înregistrat",
     "decisions_none": "Nicio decizie în așteptare — fabrica merge singură.",
@@ -442,6 +449,18 @@ def _fmt_ktok(value: int) -> str:
     label at the call site so the magnitude is unambiguous. Money ($) is NEVER
     routed through here — only token counts."""
     return _fmt_int(round(int(value) / 1000))
+
+
+def _fmt_mem(value: int | None) -> str:
+    """Bytes -> founder-facing memory size: 'X,Y GB' at >=1 GiB, 'N MB' below
+    (Romanian decimal comma); '—' when unknown (None). Keeps the leash figures
+    (GB) and small per-agent RSS (MB) both readable (founder memory panel, 20-06)."""
+    if value is None:
+        return "—"
+    gib = value / (1024**3)
+    if gib >= 1:
+        return f"{gib:.1f}".replace(".", ",") + " GB"
+    return f"{round(value / (1024**2))} MB"
 
 
 _THIN_SPACE = " "  # §11.2 _fmt_usd: thin space before the '$'
@@ -928,6 +947,32 @@ class BudgetRow:
 
 
 @dataclass(frozen=True)
+class AgentMem:
+    """One running agent's resident memory (founder memory panel, 20-06)."""
+
+    role: str
+    unit_id: str | None
+    pid: int
+    rss_bytes: int
+
+
+@dataclass(frozen=True)
+class MemoryInfo:
+    """Founder memory panel (20-06): host free RAM, the factory cgroup leash
+    (max / swap / current) and per-running-agent RSS. Every field is
+    best-effort — None when /proc or the cgroup is unreadable (e.g. the
+    dashboard rendered outside a leashed scope, as in unit tests). Surfaces the
+    19/20-06 OOM finding mechanically (Doctrine §20)."""
+
+    host_avail_bytes: int | None
+    host_total_bytes: int | None
+    leash_max_bytes: int | None  # cgroup memory.max ('max' / unreadable -> None)
+    leash_swap_max_bytes: int | None  # cgroup memory.swap.max
+    leash_current_bytes: int | None  # cgroup memory.current
+    agents: tuple[AgentMem, ...]
+
+
+@dataclass(frozen=True)
 class Incident:
     """§2b 'Ultimul incident' (newest INCIDENT_EVENT_TYPES event)."""
 
@@ -971,6 +1016,9 @@ class HealthStrip:
     #: D-0059: set when ≥1 ACTIVE (non-terminal) stage carries a finding_recurrence
     #: event — a settled/overruled finding reappeared (architect-operations §1).
     finding_recurrence_display: str | None = None
+    #: Founder memory panel (20-06): host RAM + cgroup leash + per-agent RSS.
+    #: Optional/defaulted so direct HealthStrip constructors stay valid.
+    memory: MemoryInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -1150,6 +1198,101 @@ def _cost_buckets(
     for group in fdb.sum_token_cost(conn):
         grouped.setdefault((group["unit_level"], group["unit_id"]), []).append(group)
     return {key: _summary_from_groups(cfg, groups) for key, groups in grouped.items()}
+
+
+def _read_meminfo() -> tuple[int | None, int | None]:
+    """(MemAvailable, MemTotal) in bytes from /proc/meminfo; (None, None) on
+    any read failure (non-Linux / restricted)."""
+    avail: int | None = None
+    total: int | None = None
+    try:
+        text = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            avail = int(line.split()[1]) * 1024
+        elif line.startswith("MemTotal:"):
+            total = int(line.split()[1]) * 1024
+    return avail, total
+
+
+def _cgroup_leash() -> tuple[int | None, int | None, int | None]:
+    """(memory.max, memory.swap.max, memory.current) in bytes for the factory's
+    OWN cgroup scope. The dashboard runs inside the orchestrator process, so
+    /proc/self/cgroup IS the leashed run-*.scope; walk UP from the leaf until a
+    memory.max != 'max' is found (the leash sits on the scope, verified 5o).
+    All None when uncapped/unreadable — e.g. tests outside any leash."""
+    root = Path("/sys/fs/cgroup")
+
+    def _rd(p: Path) -> int | None:
+        try:
+            s = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return None if s == "max" else int(s)
+
+    try:
+        rel = ""
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if line.startswith("0::"):
+                rel = line[3:].strip()
+                break
+    except OSError:
+        return None, None, None
+    d = root / rel.lstrip("/") if rel not in ("", "/") else root
+    while True:
+        m = _rd(d / "memory.max")
+        if m is not None:
+            return m, _rd(d / "memory.swap.max"), _rd(d / "memory.current")
+        if d == root:
+            return None, None, None
+        d = d.parent
+
+
+def _agent_rss(conn: sqlite3.Connection) -> tuple[AgentMem, ...]:
+    """RSS of every running/spawned agent from /proc/<pid>/status VmRSS.
+    Best-effort: a pid that died between the query and the read is skipped (the
+    panel reflects what is alive right now)."""
+    out: list[AgentMem] = []
+    rows = conn.execute(
+        "SELECT pid, role, unit_id FROM process_registry "
+        "WHERE state IN ('running', 'spawned') AND pid IS NOT NULL "
+        "ORDER BY spawned_at"
+    ).fetchall()
+    for row in rows:
+        pid = int(row["pid"])
+        try:
+            status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                out.append(
+                    AgentMem(
+                        role=row["role"],
+                        unit_id=row["unit_id"],
+                        pid=pid,
+                        rss_bytes=int(line.split()[1]) * 1024,
+                    )
+                )
+                break
+    return tuple(out)
+
+
+def _build_memory(conn: sqlite3.Connection) -> MemoryInfo:
+    """Assemble the founder memory panel — host RAM + cgroup leash + per-agent
+    RSS (read path only; never blocks the loop — pure sysfs/proc reads)."""
+    avail, total = _read_meminfo()
+    lmax, lswap, lcur = _cgroup_leash()
+    return MemoryInfo(
+        host_avail_bytes=avail,
+        host_total_bytes=total,
+        leash_max_bytes=lmax,
+        leash_swap_max_bytes=lswap,
+        leash_current_bytes=lcur,
+        agents=_agent_rss(conn),
+    )
 
 
 def _build_health(
@@ -1382,6 +1525,7 @@ def _build_health(
         capacity_hold_display=capacity_hold_display,
         proactive_limit_hold_display=proactive_limit_hold_display,
         finding_recurrence_display=finding_recurrence_display,
+        memory=_build_memory(conn),
     )
 
 
@@ -1769,6 +1913,54 @@ def _render_escalations(view: DashboardView, cfg: FactoryConfig) -> str:
     return _bloc(RO["escalations_label"], body, anchor="escaladari")
 
 
+def _render_memory(mem: MemoryInfo) -> str:
+    """Founder memory panel (20-06): host free RAM, the factory leash
+    (used / cap [+ swap]) and per-running-agent RSS — the OOM risk surfaced
+    mechanically (Doctrine §20). Best-effort fields render '—' when unreadable."""
+    rows = [
+        f"<tr><td>{esc(RO['mem_host_free'])}</td>"
+        f"<td class='num'>{esc(_fmt_mem(mem.host_avail_bytes))}"
+        f" / {esc(_fmt_mem(mem.host_total_bytes))}</td></tr>"
+    ]
+    if mem.leash_max_bytes is not None:
+        swap = (
+            f" + {esc(_fmt_mem(mem.leash_swap_max_bytes))} swap"
+            if mem.leash_swap_max_bytes
+            else ""
+        )
+        leash_cell = (
+            f"{esc(_fmt_mem(mem.leash_current_bytes))}"
+            f" / {esc(_fmt_mem(mem.leash_max_bytes))}{swap}"
+        )
+    else:
+        leash_cell = esc(RO["mem_no_leash"])
+    rows.append(
+        f"<tr><td>{esc(RO['mem_leash'])}</td><td class='num'>{leash_cell}</td></tr>"
+    )
+    body = _table(
+        f"<th>{esc(RO['col_kind'])}</th><th class='num'>{esc(RO['mem_col_value'])}</th>",
+        "".join(rows),
+    )
+    if mem.agents:
+        agent_rows = "".join(
+            f"<tr><td>{esc(_glossed(a.role))}"
+            f"<span class='token'>({esc(a.unit_id or RO['factory_word'])})</span></td>"
+            f"<td class='num'>{esc(_fmt_mem(a.rss_bytes))}</td></tr>"
+            for a in mem.agents
+        )
+        total_rss = sum(a.rss_bytes for a in mem.agents)
+        agent_rows += (
+            f"<tr class='grup'><th>{esc(RO['cost_total_row'])} ({len(mem.agents)})</th>"
+            f"<th class='num'>{esc(_fmt_mem(total_rss))}</th></tr>"
+        )
+        body += _table(
+            f"<th>{esc(RO['col_agent'])}</th>"
+            f"<th class='num'>{esc(RO['mem_col_rss'])}</th>",
+            agent_rows,
+        )
+    return _bloc(RO["memory_label"], body)
+
+
 def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
     """§2b health strip, §10.3 shape: each data group its own sub-block (h3 +
     table); 'Escaladări deschise' FIRST when non-empty (exceptional state
@@ -1810,6 +2002,11 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
             f"{hold_line}{proactive_hold_line}{recurrence_line}",
         )
     )
+
+    # Founder memory panel (20-06) — right after Puls (his #1 ask): host RAM,
+    # the leash, per-agent RSS. Surfaces the OOM risk mechanically.
+    if health.memory is not None:
+        blocks.append(_render_memory(health.memory))
 
     if health.phases:
         phase_rows = "".join(
