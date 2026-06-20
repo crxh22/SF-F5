@@ -21,6 +21,7 @@ import json
 
 import pytest
 
+from sf_factory import runtime_settings as rs
 from sf_factory.config import FactoryConfig
 from sf_factory.db import (
     Database,
@@ -30,6 +31,7 @@ from sf_factory.db import (
     insert_process,
     insert_stage,
     insert_token_usage,
+    set_runtime_setting,
 )
 from sf_factory.models import (
     ConfigError,
@@ -48,6 +50,9 @@ from sf_factory.models import (
 from sf_factory.thresholds import ThresholdEvaluator
 
 # ------------------------------------------------------------------ local helpers
+
+
+_RS_AT = "2026-06-20T12:00:00Z"  # founder dashboard write timestamp (runtime_settings)
 
 
 def _ts(seconds: int) -> str:
@@ -614,6 +619,26 @@ def test_context_budget_excludes_failed_run_spend(db, evaluator, factory_config)
     assert ev["effective_tokens"] == budget  # the successful run only
     assert ev["total_tokens"] == 3 * budget  # incl the failed run's 2*budget
     assert ev["effective_tokens"] < ev["total_tokens"]  # gap = wasted failed-run spend
+
+
+def test_context_budget_uses_live_budget_override(db, evaluator, factory_config):
+    """Item 4a (live per-class budget): a runtime_settings budget override changes
+    the firing threshold for the RUNNING stage at its NEXT check, no restart. YAML
+    routine budget is 10000; the founder lowers it to 5000 -> a stage at 6000
+    effective tokens (under YAML, over the override) now fires, and the evidence
+    reports the live budget. Proves _check_context_budget reads it via EffectiveConfig."""
+    assert factory_config.budgets.per_stage["routine"] == 10000  # YAML baseline
+    stage = _seed_stage(db, "st-livebudget", risk_class="routine")
+    pid = _seed_process(db, "st-livebudget")
+    _seed_usage(db, pid, "st-livebudget", 6000, 0)  # 6000 effective tokens
+    assert evaluator.evaluate(stage) == []  # under YAML 10000: no firing
+    with db.transaction() as conn:
+        set_runtime_setting(
+            conn, rs.budget_key("routine"), 5000, updated_by="founder", at=_RS_AT
+        )
+    firings = evaluator.evaluate(stage)
+    assert _triggers(firings) == [Trigger.CONTEXT_BUDGET]
+    assert firings[0].evidence["budget"] == 5000  # the live override, not YAML's 10000
 
 
 def test_all_null_usage_reads_zero_not_null(db, evaluator):

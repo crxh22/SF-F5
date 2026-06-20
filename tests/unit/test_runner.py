@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from sf_factory import db as fdb
+from sf_factory import runtime_settings as rs
 from sf_factory.config import FactoryConfig, ModelRoute, load_config
 from sf_factory.models import (
     ConsultationBreachError,
@@ -40,6 +41,7 @@ from sf_factory.runner import (
 CANON_DOCTRINE = "doctrine body marker-D\n"
 CANON_CONVENTIONS = "conventions body marker-C\n"
 CANON_FOUNDER = "founder protocol body marker-F\n"
+_RS_AT = "2026-06-20T12:00:00Z"  # founder dashboard write timestamp (runtime_settings)
 CANON_ARCHITECT = "architect operations body marker-A\n"  # D-0040
 
 
@@ -795,6 +797,25 @@ async def test_timeout_sigterm_within_grace(
     assert row["state"] == "timed_out"
     (event,) = _events(renv.db, "timeout")
     assert json.loads(event["payload_json"])["killed"] is False
+
+
+async def test_run_agent_uses_live_agent_timeout_override(
+    renv: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4 (live agent timeout): with NO explicit timeout_s, run_agent's default
+    is the LIVE agent_timeout_s (EffectiveConfig), not the load-once cfg. cfg says
+    30s; the founder's override says 1s; the stub sleeps 5s -> the 1s live timeout
+    fires (the 30s default would let the 5s stub finish cleanly). The 1<5<30 split
+    makes the override the ONLY thing that can produce a timeout here."""
+    monkeypatch.setenv("SF_STUB_SCENARIO", "timeout")
+    monkeypatch.setenv("SF_STUB_SLEEP_S", "5")
+    with renv.db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_AGENT_TIMEOUT, 1, updated_by="founder", at=_RS_AT)
+    result = await renv.runner.run_agent(
+        "builder_routine", "p", unit_level="stage", unit_id="stg-1", cwd=renv.cwd,
+    )  # NO timeout_s -> falls through to the live agent_timeout_s default
+    assert result.timed_out is True  # the 1s live override fired before the 5s stub
+    assert _proc_rows(renv.db)[0]["state"] == "timed_out"
 
 
 async def test_timeout_sigkill_kills_whole_group(

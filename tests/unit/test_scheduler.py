@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 from sf_factory import db as fdb
+from sf_factory import runtime_settings as rs
 from sf_factory import scheduler as sched_mod
 from sf_factory.config import FactoryConfig
 from sf_factory.models import (
@@ -56,6 +57,9 @@ from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
 
 # --------------------------------------------------------------------- helpers
+
+
+_RS_AT = "2026-06-20T12:00:00Z"  # founder dashboard write timestamp (runtime_settings)
 
 
 def make_config(config_dict: dict[str, Any], **process_overrides: Any) -> FactoryConfig:
@@ -509,6 +513,52 @@ async def test_parallel_cap_bounds_concurrent_units(db, config_dict) -> None:
 
     assert stage_exec.max_concurrent == cfg.process.max_parallel_agents == 2
     assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2", "s3", "s4"))
+
+
+async def test_max_parallel_override_lowers_cap_live(db, config_dict) -> None:
+    """Item 4 (live config): a runtime_settings max_parallel_agents override lowers
+    the dispatch cap WITHOUT a restart. cfg says 2; the founder's DB override says 1
+    -> at most ONE stage runs concurrently. Proves _dispatch reads the cap through
+    EffectiveConfig per-tick, not from the load-once cfg."""
+    cfg = make_config(config_dict)  # conftest: max_parallel_agents = 2
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_MAX_PARALLEL, 1, updated_by="founder", at=_RS_AT)
+    insert_phase(db, "ph")
+    for sid in ("s1", "s2", "s3"):
+        insert_stage(db, sid, "ph", StageState.PENDING)
+    stage_exec = ScriptedExecutor(Level.STAGE, db, StateMachine(db), hold_s=0.08)
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+    await run_blocked(scheduler)
+
+    assert stage_exec.max_concurrent == 1  # the live override, NOT cfg's 2
+    assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2", "s3"))
+
+
+async def test_drain_manual_override_holds_new_spawns_then_lifts(db, config_dict) -> None:
+    """Item 5 (the founder's manual brake): drain.manual=True holds EVERY new agent
+    spawn — PENDING stages never dispatch and the scheduler idles (dispatched==0,
+    no tasks -> run_until_blocked returns; no busy-spin). Flipping it back to NORMAL
+    lets the same stages run to completion. Proves the 5e drain gate in _dispatch
+    and that drain is a clean wind-down, not a stall."""
+    cfg = make_config(config_dict)
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_DRAIN_MANUAL, True, updated_by="founder", at=_RS_AT)
+    insert_phase(db, "ph")
+    for sid in ("s1", "s2"):
+        insert_stage(db, sid, "ph", StageState.PENDING)
+    stage_exec = ScriptedExecutor(Level.STAGE, db, StateMachine(db), hold_s=0.08)
+    scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
+    await run_blocked(scheduler)
+
+    # Under DRAIN: nothing spawned, both stages still PENDING.
+    assert stage_exec.max_concurrent == 0
+    assert all(stage_state(db, s) is StageState.PENDING for s in ("s1", "s2"))
+
+    # Founder flips the switch back to NORMAL -> the held stages now run.
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_DRAIN_MANUAL, False, updated_by="founder", at=_RS_AT)
+    await run_blocked(scheduler)
+    assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2"))
 
 
 def _resolve_escalation_for(db, level: Level, unit_id: str, resolution: str) -> int:
@@ -5268,6 +5318,60 @@ async def test_proactive_no_hold_below_both_thresholds(db, config_dict) -> None:
     assert env.governor.blocks(["capacity_probe"]) is False
     assert _factory_events(db, "proactive_limit_hold_started") == []
     assert env.notify.published == []
+
+
+async def test_proactive_autodrenaj_override_off_suppresses_hold(db, config_dict) -> None:
+    """Item 5f (founder turns auto-drain OFF from the panel): a governor.autodrenaj
+    = False override beats the YAML proactive_enabled=True, so even a far-over-
+    threshold poll does NOT enter the proactive hold. Proves _proactive_limit_tick
+    gates on the LIVE flag (the founder's hand on the automatic brake)."""
+    env = _proactive_governor(db, config_dict)  # YAML proactive_enabled = True
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_GOV_AUTODRENAJ, False, updated_by="founder", at=_RS_AT)
+    env.governor._query_usage = lambda: (95.0, 95.0)  # both WAY over threshold
+    await env.governor.tick()
+    assert env.governor.held is False
+    assert _factory_events(db, "proactive_limit_hold_started") == []
+
+
+async def test_proactive_autodrenaj_override_on_holds_when_yaml_disabled(
+    db, config_dict
+) -> None:
+    """Item 5f (founder turns auto-drain ON): with YAML proactive_enabled=False the
+    governor would never proactively hold; a governor.autodrenaj=True override
+    ENABLES it live -> an over-threshold poll now holds. Proves the override is the
+    live replacement for proactive_enabled (the design-doc 'off by default, founder
+    flips it on' path), not merely an extra AND-gate."""
+    _enable_governor(config_dict)
+    cg = config_dict["capacity_governor"]
+    cg["proactive_enabled"] = False  # YAML: proactive auto-drain OFF
+    cg["proactive_poll_interval_s"] = 0.001
+    cg["five_hour_threshold_pct"] = 80
+    cg["seven_day_threshold_pct"] = 90
+    cfg = make_config(config_dict)
+    notify = FakeNotify()
+    governor = CapacityGovernor(db, cfg, FakeRunner(db), notify)
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_GOV_AUTODRENAJ, True, updated_by="founder", at=_RS_AT)
+    governor._query_usage = lambda: (85.0, 40.0)  # 5h over threshold
+    await governor.tick()
+    assert governor.held is True
+    (started,) = _factory_events(db, "proactive_limit_hold_started")
+    assert json.loads(started["payload_json"])["five_hour"] == 85.0
+
+
+async def test_proactive_thresholds_override_live(db, config_dict) -> None:
+    """Item 4 (live thresholds): a governor.five_hour_threshold_pct override (80 ->
+    70) makes the governor hold at a 5h utilization the YAML threshold would allow.
+    Proves gov_five_hour_pct is read live and the recorded threshold is the override."""
+    env = _proactive_governor(db, config_dict)  # YAML 5h threshold = 80
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(conn, rs.KEY_GOV_5H, 70.0, updated_by="founder", at=_RS_AT)
+    env.governor._query_usage = lambda: (75.0, 40.0)  # under YAML 80, OVER live 70
+    await env.governor.tick()
+    assert env.governor.held is True
+    (started,) = _factory_events(db, "proactive_limit_hold_started")
+    assert json.loads(started["payload_json"])["five_hour_threshold"] == 70.0
 
 
 async def test_proactive_hold_lifts_only_when_back_under_both(db, config_dict) -> None:

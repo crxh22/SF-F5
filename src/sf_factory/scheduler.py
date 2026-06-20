@@ -95,6 +95,7 @@ from sf_factory.models import (
 )
 from sf_factory.notify import NtfyPublisher, dashboard_link
 from sf_factory.runner import AgentResult, AgentRunner, cmdline_matches
+from sf_factory.runtime_settings import EffectiveConfig
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
 from sf_factory.worktrees import (
@@ -1215,7 +1216,13 @@ class CapacityGovernor:
         reset); the canary probe NEVER lifts a proactive hold (it would succeed
         at 80% and defeat the purpose)."""
         cg = self._cfg.capacity_governor
-        if not (self.enabled and cg.proactive_enabled):
+        # Live overrides (founder dashboard, 5f/item 4): `autodrenaj` is the live
+        # replacement for cfg.proactive_enabled — it DEFAULTS to that YAML value
+        # (byte-identical when unset), so the founder can flip the proactive
+        # auto-drain ON/OFF from the panel without a restart. The thresholds are
+        # likewise live (gov_*_pct default to the YAML thresholds).
+        eff = EffectiveConfig(fdb.get_runtime_settings(self._db.read()), self._cfg)
+        if not (self.enabled and eff.autodrenaj):
             return
         now = asyncio.get_running_loop().time()
         if now < self._next_limit_poll_at:
@@ -1228,11 +1235,16 @@ class CapacityGovernor:
         self._limit_poll_failed_logged = False  # streak cleared on a good poll
         five_hour, seven_day = usage
         over = (
-            five_hour >= cg.five_hour_threshold_pct
-            or seven_day >= cg.seven_day_threshold_pct
+            five_hour >= eff.gov_five_hour_pct
+            or seven_day >= eff.gov_seven_day_pct
         )
         if over and not self._proactive_held:
-            await self._enter_proactive_hold(five_hour, seven_day)
+            await self._enter_proactive_hold(
+                five_hour,
+                seven_day,
+                five_hour_threshold=eff.gov_five_hour_pct,
+                seven_day_threshold=eff.gov_seven_day_pct,
+            )
         elif not over and self._proactive_held:
             await self._lift_proactive_hold(five_hour, seven_day)
 
@@ -1270,13 +1282,19 @@ class CapacityGovernor:
             return None
         return five_hour, seven_day
 
-    async def _enter_proactive_hold(self, five_hour: float, seven_day: float) -> None:
+    async def _enter_proactive_hold(
+        self,
+        five_hour: float,
+        seven_day: float,
+        *,
+        five_hour_threshold: float,
+        seven_day_threshold: float,
+    ) -> None:
         """Threshold crossed: hold new claude spawns (running agents finish via
         the SHARED ``blocks`` gate — exactly the founder's "termină în siguranță
         cei care lucrează"). ONE 'proactive_limit_hold_started' event + an
         informational founder page (the factory paused ITSELF — notable, but
         working-as-designed, so default priority, not an alert)."""
-        cg = self._cfg.capacity_governor
         self._proactive_held = True
         with self._db.transaction() as conn:
             fdb.insert_event(
@@ -1288,8 +1306,11 @@ class CapacityGovernor:
                 payload={
                     "five_hour": five_hour,
                     "seven_day": seven_day,
-                    "five_hour_threshold": cg.five_hour_threshold_pct,
-                    "seven_day_threshold": cg.seven_day_threshold_pct,
+                    # The thresholds the decision ACTUALLY used (effective/live),
+                    # not the YAML defaults — so the recorded evidence explains the
+                    # real reason this hold fired when the founder has edited them.
+                    "five_hour_threshold": five_hour_threshold,
+                    "seven_day_threshold": seven_day_threshold,
                 },
             )
         await self._page(
@@ -5533,7 +5554,11 @@ class Scheduler:
         whole walk. `continue`, not `break`: a later no-spawn unit in the scan
         must stay reachable behind a capped spawning one."""
         conn = self._db.read()
-        cap = self._cfg.process.max_parallel_agents
+        # Live overrides (founder dashboard, 5e/item 4): the cap and the manual
+        # DRAIN switch are read per-tick through EffectiveConfig. Empty overrides
+        # => byte-identical to the load-once cfg (the existing cap tests hold).
+        eff = EffectiveConfig(fdb.get_runtime_settings(conn), self._cfg)
+        cap = eff.max_parallel_agents
         seq = _max_event_seq(conn)
         dispatched = 0
         for level, unit_id, category, unit in scan:
@@ -5563,6 +5588,12 @@ class Scheduler:
             if not eligible:
                 continue
             spawns = self._drive_spawns(level, category, unit)
+            if spawns and eff.drain_manual:
+                continue  # founder manual DRAIN (5e): hold every NEW agent spawn —
+                # running drives finish on their own. Same `continue` discipline as
+                # the cap below: no-spawn control-plane work (ESCALATED resolution
+                # pickup, AWAITING gates) still proceeds, so the factory winds down
+                # cleanly instead of stalling mid-flight.
             if spawns and self._spawning_count() >= cap:
                 continue  # economics cap (§7): a SPAWNING drive waits for a free
                 # slot; keep scanning so no-spawn control-plane work still runs.

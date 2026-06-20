@@ -66,6 +66,7 @@ from sf_factory.models import (
     new_id,
     utc_now,
 )
+from sf_factory.runtime_settings import EffectiveConfig
 
 # --------------------------------------------------------------------- constants
 
@@ -655,7 +656,19 @@ class AgentRunner:
         feeder = asyncio.create_task(_feed_stdin(proc, prompt.encode("utf-8")))
         stdin_fed = False
         state = _StreamState()
-        timeout = float(timeout_s if timeout_s is not None else self._cfg.process.agent_timeout_s)
+        # The per-agent timeout default is the SINGLE point every conveyor spawn
+        # falls through (the stage/planning/integration call sites pass no
+        # timeout_s); reading it via EffectiveConfig makes the founder's live
+        # `agent_timeout_s` edit (item 4) apply to the NEXT agent started, with no
+        # restart. An explicit timeout_s (the canary _probe) still wins; empty
+        # overrides => byte-identical to cfg.process.agent_timeout_s.
+        timeout = float(
+            timeout_s
+            if timeout_s is not None
+            else EffectiveConfig(
+                db.get_runtime_settings(self._db.read()), self._cfg
+            ).agent_timeout_s
+        )
         try:
             # CCR-2 (§5.1): flip the registry row 'spawned'→'running' after exec —
             # persist the child pid (the §5.5a cross-restart orphan sweep kills by

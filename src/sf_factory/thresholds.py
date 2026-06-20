@@ -26,6 +26,7 @@ from sf_factory.db import (
     Database,
     bump_churn,
     effective_token_sum,
+    get_runtime_settings,
     insert_fix_iteration,
     open_escalation,
 )
@@ -38,6 +39,7 @@ from sf_factory.models import (
     TriggerFiring,
     ValidationSummary,
 )
+from sf_factory.runtime_settings import EffectiveConfig
 
 # ------------------------------------------------------------- §2 trigger SQL
 #
@@ -352,7 +354,12 @@ class ThresholdEvaluator:
         context_resets vs escalation.max_context_resets so the caller can apply the
         §2 reset-then-escalate rule mechanically.
         """
-        budget = self._cfg.budgets.per_stage.get(stage.risk_class)
+        # Live budget (founder dashboard, item 4/4a): the per-class token budget
+        # is read per-check through EffectiveConfig, so a founder edit applies to
+        # the RUNNING stage at its next budget check (~seconds). Empty overrides
+        # => the cfg.budgets.per_stage value, byte-identical to before.
+        eff = EffectiveConfig(get_runtime_settings(conn), self._cfg)
+        budget = eff.budget(stage.risk_class)
         if budget is None:
             raise ConfigError(
                 f"stage {stage.id!r} has risk_class {stage.risk_class!r} with no "
