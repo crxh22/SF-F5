@@ -7,6 +7,14 @@
 
 ---
 
+> **⚠️ EXECUTION CORRECTION (ETAPA-5v, 21-06-2026) — this DRAFT was superseded at execution; the authoritative instruction is the `rework:BUILD` `--reason` on escalation #99, `/tmp/sf-rework-99-reason.txt`.** 5v verified every pointer against the live stocktaking worktree before firing and found two stale items in the draft below — corrected here:
+> 1. **Migration is `0004_warehouse_code`, NOT `0003`** — `0003_specificpart_enrichment` already exists in the worktree, so the new migration is **0004** and **depends on `("nomenclature","0003_specificpart_enrichment")`** (the current leaf), NOT `0002_party_links`. §3.2 / §6 below are stale on this point. (Cause: the draft was audited against a branch without specificpart_enrichment.)
+> 2. **Factory code prefix must NOT be `dep-`** — `department()` in the same `factories.py` already uses `dep-`; use a distinct prefix (e.g. `wh-`). §3.3's `dep-{n}` example is wrong.
+> 3. **Execution shape:** the fix was **folded into `stocktaking`'s `rework:BUILD`** (escalation #99), NOT built as a standalone `warehouse-code` stage (adding a stage mid-phase needs risky DB/replan surgery; the rework path is proven and stocktaking needs the keying switch anyway). So §5/§6/§7's "this stage merges then stocktaking reworks" two-step is collapsed into one rework: the SAME builder adds `Warehouse.code` AND switches the keying (§5 of the `--reason`). The keying resolvers receive a depozit **pk** from the request and must **resolve pk→`Warehouse.code`** for the rights key (the draft's "return Warehouse.code" elides this); in-file precedent: `filter_by_rights(OwnPJ, ("own_pj","code"))` at `api.py:~418`.
+> Everything else in this draft (scope boundary, backfill design, acceptance tests §4, falsifiability §5) is sound and was carried into the `--reason`.
+
+---
+
 ## 1. Objective
 
 Give the `depozit` nomenclature table (`nomenclature.Warehouse`) a **stable opaque `code`**, exactly like its sibling nomenclature tables (Currency, Bank, ExpenseCategory, Direction, PaymentCategory), so that the `depozit` **rights dimension** can be keyed on a stable slug — as the F5 convention requires (`accounts/rights.py:10-11`: "Dimension keys are opaque stable codes/slugs, never auto-increment PKs ... OPEN-AA5 pins per-dimension formats at first consumption").
