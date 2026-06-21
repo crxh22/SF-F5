@@ -4,6 +4,28 @@
 
 ---
 
+> ## ⚠️ CORECȚIE (ETAPA-5x, 21-06-2026) — concluzia „eveniment dinspre Claude" de mai jos a fost INFIRMATĂ
+> Cauza reală a fost prinsă cert la un incident IDENTIC din aceeași zi (~18:55 UTC): în timpul
+> predării, sesiunea 5v a rulat `pkill -f 'sf-architect-monitor.sh'` ca să-și oprească monitorul.
+> `pkill -f` caută în TOATĂ linia de comandă, iar **prompt-ul de lansare al fiecărei sesiuni de
+> arhitect conține acel text** (instrucțiunea „actualizează monitorul") — așa că a omorât simultan
+> procesele `claude` ale tuturor sesiunilor active (5u, 5v ȘI 5w abia pornit). **Comanda exactă
+> apare în transcript** — deci mecanismul e DOVEDIT, nu presupus.
+>
+> Incidentul de la 04:25 are semnătura identică (mor doar sesiunile active, simultan; cele inactive
+> supraviețuiesc; zero urmă de memorie) → aproape sigur aceeași cauză (o comandă de oprire cu un
+> tipar care se potrivește în prompturi, rulată la o predare/curățenie), **NU un eveniment Claude /
+> Remote Control**. Comanda exactă de la 04:25 nu a fost fixată (eveniment vechi), dar mecanismul e
+> dovedit la incidentul geamăn.
+>
+> **Fixul durabil pe care l-ai cerut = REGULA MECANICĂ, deja în vigoare:** niciodată `pkill -f` /
+> `pgrep -f` cu un tipar ce poate apărea în prompturile sesiunilor; oprești task-uri doar prin PID
+> exact (verificat în `/proc/<pid>/cmdline`) sau le lași să moară odată cu sesiunea. E în header-ul
+> monitorului de sesiune, în handoff și în memoria agenților. Auto-restart-ul propus mai jos NU mai
+> e necesar ca fix principal — cel mult plasă de siguranță secundară.
+
+---
+
 ## Concluzia principală (citește doar asta dacă te grăbești)
 
 **NU a fost o problemă de memorie / OOM.** Handoff-ul anterior a presupus că serverul
