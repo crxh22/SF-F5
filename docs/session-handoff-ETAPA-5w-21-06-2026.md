@@ -1,7 +1,29 @@
-# Session handoff — ETAPA-5v → ETAPA-5w, 21-06-2026
+# Session handoff — ETAPA-5v → ETAPA-5w/5x, 21-06-2026
 
-**For ETAPA-5w (Main-Architect successor).** POINTER doc (Doctrine §9). 5v hit the context guard (~518k).
-Launch via `claude_canon.sh` (opus, effort max, RC ON, named ETAPA-5w — see succession runbook).
+**For the Main-Architect successor.** POINTER doc (Doctrine §9). 5v hit the context guard (~518k, then ~559k).
+Launch via `claude_canon.sh` (opus, effort max, RC ON — see succession runbook).
+
+> ## 🛑 INCIDENT (5v, ~18:55 UTC) — ROOT CAUSE of the shift-change deaths (READ THIS)
+> 5v launched ETAPA-5w, then ran `pkill -f 'sf-architect-monitor.sh'` to stop its own monitor. **DISASTER:**
+> `pkill -f` matches the FULL command line, and **every architect session's launch prompt contains the literal
+> string `sf-architect-monitor.sh`** (the "update the monitor header" instruction) — so it killed the claude
+> processes of 5u, 5v AND the just-launched 5w, and their tmux sessions (`etapa-5u/5v/5w`) died. Only `factory`
+> survived (its cmdline has no such string). **The factory/orchestrator was NEVER harmed** (alive throughout;
+> stock-views-backend kept building). 5v's conversation survived via harness resume (transcript `fcbaedae`).
+> **THIS IS ALMOST CERTAINLY THE REAL "04:25 INCIDENT" CAUSE** — not a "Claude/RC event" as
+> `docs/incident-cadere-arhitecti-0425-21-06-2026.md` concluded. A prior session's prompt-matching `pkill`/broad
+> kill took out the actively-working sessions at once; the idle ones (different/again-matching?) — re-investigate
+> + correct that report. (Open founder item: the "durable fix" he was asked for is now KNOWN — it's this rule, not auto-restart.)
+>
+> ### ABSOLUTE RULE (mechanical, never break)
+> **NEVER `pkill -f` / `pgrep -f` with a pattern that can appear in a session's prompt** — e.g. `sf-architect-monitor.sh`,
+> `sf-factory`, `sf-cap`, `orchestrator`, `stock-views`, any factory/stage word. The launch prompts embed these.
+> To stop a background task: use its EXACT PID (`kill <pid>` after confirming the pid IS the script via `/proc/<pid>/cmdline`),
+> or the harness task id, or **just let it die with the session** (the monitor/watchers are children of the architect
+> session — they exit when it does; you do NOT need to kill them before succession). Verify any `pkill` target list
+> with `pgrep -af <pat> | grep -v claude` FIRST and eyeball it.
+
+**FIRST duties (in order):** (1) write your session_id into `~/.claude/sf-architect-session` (replace 5v's `fcbaedae-a693-459d-a413-84d403b8e2ef`). Your id = newest `.jsonl` in `~/.claude/projects/-home-artur-projects-SF-F5/` containing your launch prompt. (2) Update `~/.claude/sf-architect-monitor.sh` header + relaunch via Bash `run_in_background:true`. (3) Verify your RC shows on the founder's phone. (4) Do NOT pkill anything (see incident above).
 
 **FIRST duties (in order):** (1) write your session_id into `~/.claude/sf-architect-session` (replace 5v's `fcbaedae-a693-459d-a413-84d403b8e2ef`). Your id = newest `.jsonl` in `~/.claude/projects/-home-artur-projects-SF-F5/` containing your launch prompt. (2) Update `~/.claude/sf-architect-monitor.sh` header (5v→5w) + relaunch via Bash `run_in_background:true` (5v's monitor dies with 5v — RELAUNCH it). (3) Verify your RC shows on the founder's phone before 5v goes silent.
 
