@@ -1925,8 +1925,13 @@ def test_escalations_block_rows_glossed_anchors_first_in_strip(denv) -> None:
     assert "id='escaladari'" in page
     assert f"id='escalation/{arch_id}'" in page
     assert f"id='escalation/{founder_id}'" in page
-    # FIRST in the strip when non-empty: exceptional state outranks telemetry.
+    # AMENDED 22-06 (ARH-01 founder dashboard reorder): the urgency rule is
+    # PRESERVED across the reorder — an OPEN escalation still surfaces at the
+    # VERY top, above the status strip (so still before Puls). It now renders
+    # ABOVE the status <section id='acum'> rather than as its first sub-block.
     assert page.index("id='escaladari'") < page.index(dash.RO["pulse_label"])
+    assert page.index("id='escaladari'") < page.index("id='acum'")
+    assert page.count("id='escaladari'") == 1  # rendered once, never duplicated
     # Unit + trigger glossed (R2).
     assert "Schema de bază" in page
     assert "prea multe încercări de reparare fără progres (max_fix_iterations)" in page
@@ -1961,8 +1966,163 @@ def test_escalations_empty_state_last_resolved_line_and_last_position(denv) -> N
     assert dash.RO["escalation_last_resolved"] in page
     assert "refă construcția (rework:BUILD)" in page
     assert "12-06-2026" in page  # R4 founder format
-    # Empty set does NOT outrank telemetry: the block renders last.
+    # AMENDED 22-06 (ARH-01 founder dashboard reorder): empty set still does NOT
+    # outrank telemetry — the block now lands in the bottom „Secundar” section
+    # (still AFTER Puls). The anchor renders exactly once.
     assert page.index(dash.RO["pulse_label"]) < page.index("id='escaladari'")
+    assert page.index("id='secundar'") < page.index("id='escaladari'")
+    assert page.count("id='escaladari'") == 1
+
+
+# ------------------------------ founder dashboard reorder (22-06, ARH-01)
+
+
+def test_founder_dashboard_reorder_block_and_section_order(denv) -> None:
+    """ADDED 22-06 (ARH-01): the founder-locked top→bottom layout —
+    Stare (Limite Claude · Puls · RAM) · Decizie · Operațional (În lucru ·
+    Coadă) · Roadmap (Faze · Plan & istoric) · Secundar (Buget · Incident ·
+    Escaladări). Pins each boundary so a future drift fails here."""
+    _seed_unit(denv)  # phase ph + stage ph.s1 (AWAITING_HUMAN -> a budget/running row)
+    _seed_decision(denv)  # a pending card -> the Decizie section is populated
+    _seed_build_stage(denv, "ph.b")  # an extra RUNNING stage
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+
+    # All five sections exist with their stable anchors (id='acum' is reused as
+    # the status strip — the watchdog notify deep link still lands there).
+    for anchor in ("acum", "decizii", "operational", "roadmap", "plan", "secundar"):
+        assert f"id='{anchor}'" in page, anchor
+
+    # 1. Status strip internal order: Limite Claude · Puls · RAM/Memory.
+    assert page.index("id='limite'") < page.index(dash.RO["pulse_label"])
+    assert page.index(dash.RO["pulse_label"]) < page.index(dash.RO["memory_label"])
+
+    # Section order top→bottom (the founder-locked sequence).
+    order = [
+        page.index("id='acum'"),
+        page.index("id='decizii'"),
+        page.index("id='operational'"),
+        page.index("id='roadmap'"),
+        page.index("id='plan'"),
+        page.index("id='secundar'"),
+    ]
+    assert order == sorted(order), order
+
+    # Operațional groups Running THEN Queue; Secundar groups Budget THEN Incident.
+    assert page.index(dash.RO["running_label"]) < page.index(dash.RO["queue_label"])
+    assert page.index(dash.RO["queue_label"]) < page.index("id='roadmap'")
+    assert page.index(dash.RO["budget_label"]) < page.index(dash.RO["incident_label"])
+    # Roadmap holds Faze, and the Plan & istoric section is its immediately-
+    # following sibling (its „Plan & istoric” h2 carries an esc()'d „&amp;”).
+    assert page.index(dash.RO["phases_label"]) < page.index("id='plan'")
+    assert "Plan &amp; istoric" in page
+    assert page.index("id='roadmap'") < page.index("id='plan'") < page.index("id='secundar'")
+    # No open escalation here: the block lands in Secundar, after Buget/Incident.
+    assert page.index(dash.RO["incident_label"]) < page.index("id='escaladari'")
+
+
+# ----------------------- Coadă „cu dependențe” (founder 22-06, ARH-01)
+
+
+def test_queue_lists_waiting_stage_blockers(denv) -> None:
+    """ADDED 22-06 (ARH-01): each WAITING stage names the unmet prerequisite
+    stages blocking it (dag_edges × stage states; a blocker = a prerequisite
+    whose state != DONE). The runnable count is kept; a satisfied prerequisite
+    is NOT listed; a stage with all-DONE prerequisites is RUNNABLE, not WAITING."""
+    from sf_factory.models import Level
+
+    _seed_unit(denv)  # ph.s1 AWAITING_HUMAN (not a prerequisite here)
+    _seed_build_stage(denv, "ph.dep")  # a BUILD (non-DONE) prerequisite
+    _seed_build_stage(denv, "ph.done", state=StageState.DONE)  # a satisfied prereq
+    _seed_build_stage(denv, "ph.wait", state=StageState.PENDING)  # -> WAITING
+    _seed_build_stage(denv, "ph.go", state=StageState.PENDING)  # -> RUNNABLE
+    with denv.db.transaction() as conn:
+        # ph.wait waits on a non-DONE (ph.dep) and a DONE (ph.done) prerequisite.
+        fdb.insert_dag_edge(conn, Level.STAGE, "ph.dep", "ph.wait")
+        fdb.insert_dag_edge(conn, Level.STAGE, "ph.done", "ph.wait")
+        # ph.go waits only on a DONE prerequisite -> deps satisfied -> RUNNABLE.
+        fdb.insert_dag_edge(conn, Level.STAGE, "ph.done", "ph.go")
+
+    view = dash.build_view(denv.cfg)
+    health = view.health
+    assert health.waiting_count == 1 and health.runnable_count == 1
+    (waiting,) = health.waiting_stages
+    assert waiting.stage_id == "ph.wait"
+    # Only the unmet prerequisite is a blocker; the DONE one is excluded.
+    assert waiting.blockers == ("ph.dep",)
+
+    page = dash.render_page(view, denv.cfg)
+    # The Coadă block keeps both counts AND renders the blockers table.
+    assert dash.RO["queue_runnable"] in page
+    assert dash.RO["queue_blocked_on"] in page
+    # The waiting stage row names its blocker stage id; the satisfied prereq
+    # never appears as a blocker token.
+    assert "ph.wait" in page
+    blocked_cell = page[page.index(dash.RO["queue_blocked_on"]):]
+    assert "<span class='token'>ph.dep</span>" in blocked_cell
+    assert "<span class='token'>ph.done</span>" not in blocked_cell
+
+
+def test_queue_no_waiting_stages_renders_placeholder(denv) -> None:
+    """ADDED 22-06 (ARH-01): with nothing WAITING, the Coadă block keeps the
+    counts and renders the explicit „none waiting” line (no empty table)."""
+    _seed_unit(denv)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["queue_waiting_none"] in page
+
+
+# ----------------------- Limite Claude block (founder 22-06, ARH-01)
+
+
+def test_limits_block_reads_cache_file(denv, tmp_path, monkeypatch) -> None:
+    """ADDED 22-06 (ARH-01): the Limite Claude block READS the optional cache
+    file (a separate poller writes it) — 5h% + weekly% + reset times + the
+    „verificat acum N min” line. No live fetch; pure read."""
+    cache = tmp_path / "sf-dash-limits.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "checked_at": "2026-06-22T08:55:00Z",
+                "five_h_pct": 42,
+                "weekly_pct": 77,
+                "five_h_reset": "2026-06-22T13:00:00Z",
+                "weekly_reset": "2026-06-25T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dash, "_LIMITS_CACHE_PATH", cache)
+
+    view = dash.build_view(denv.cfg, now="2026-06-22T09:00:00Z")
+    limits = view.health.limits
+    assert limits is not None and limits.available
+    assert limits.five_h_pct == 42 and limits.weekly_pct == 77
+    assert limits.checked_age_min == 5  # 09:00 − 08:55
+
+    page = dash.render_page(view, denv.cfg)
+    assert "id='limite'" in page
+    assert dash.RO["limits_label"] in page
+    assert "42%" in page and "77%" in page
+    assert "22-06-2026 16:00" in page  # 5h reset in founder TZ (R4)
+    assert dash.RO["limits_checked"].format(minutes=5) in page
+
+
+def test_limits_block_unavailable_when_cache_absent_or_unparseable(
+    denv, tmp_path, monkeypatch
+) -> None:
+    """ADDED 22-06 (ARH-01): absent or unparseable cache -> the graceful
+    „indisponibil” state, never a crash and never a live fetch."""
+    # Absent file.
+    monkeypatch.setattr(dash, "_LIMITS_CACHE_PATH", tmp_path / "nope.json")
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert "id='limite'" in page
+    assert dash.RO["limits_unavailable"] in page
+
+    # Present but malformed JSON.
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setattr(dash, "_LIMITS_CACHE_PATH", bad)
+    page = dash.render_page(dash.build_view(denv.cfg), denv.cfg)
+    assert dash.RO["limits_unavailable"] in page
 
 
 # ---------------------------------------------------- §10.3 tables, §10.2 blocks

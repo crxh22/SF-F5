@@ -101,6 +101,12 @@ RO: Mapping[str, str] = {
     "section_now": "Acum în lucru",
     "section_decisions": "Decizii așteptate",
     "section_plan": "Plan & istoric",
+    # Founder-locked dashboard reorder (22-06, ARH-01): the top→bottom section
+    # grouping. „Acum în lucru” is reused as the status-strip heading (keeps the
+    # established id='acum' anchor that watchdog notify deep-links land on).
+    "section_operational": "Operațional",
+    "section_roadmap": "Roadmap",
+    "section_secondary": "Secundar",
     # --- ⚙ Configurare tab (live-editable settings; founder 20-06, items 4+5) ---
     "cfg_nav": "⚙ Configurare",
     "cfg_back": "← Înapoi la panou",
@@ -185,6 +191,24 @@ RO: Mapping[str, str] = {
     "queue_waiting": "în așteptarea dependențelor",
     "queue_runnable": "gata de pornire",
     "queue_none_running": "nicio etapă în lucru",
+    # Coadă „cu dependențe” (founder 22-06): per WAITING stage, the unmet
+    # prerequisites that block it. Read-only from dag_edges × stage states.
+    "queue_blocked_on": "așteaptă după",
+    "queue_no_blockers": "—",
+    "queue_waiting_none": "nicio etapă în așteptarea dependențelor",
+    # --- Limite Claude block (founder 22-06; position 1 of the status strip).
+    # A separate poller writes the cache file the architect wires later — the
+    # dashboard only READS it, stays read-only + fast, never fetches live.
+    "limits_label": "Limite Claude",
+    "limits_5h": "Fereastră 5h",
+    "limits_weekly": "Fereastră 7 zile",
+    "limits_reset_at": "reset la",
+    "limits_checked": "verificat acum {minutes} min",
+    "limits_checked_now": "verificat acum",
+    "limits_unavailable": "indisponibil — sonda de limite nu a scris încă date",
+    "limits_col_window": "Fereastră",
+    "limits_col_used": "Folosit",
+    "limits_col_reset": "Reset",
     "budget_label": "Buget",
     "budget_total": "Total fabrică",
     "budget_tokens": "mii tokeni",
@@ -444,6 +468,8 @@ GLOSS: Mapping[str, str] = {
     # introduced by a follow-up slice (glossed now with §11 so the trigger never
     # renders bare — the closure tests are one-directional, token -> gloss)
     "agent_run_failed": "agentul a eșuat la rulare (oprire fără rezultat)",
+    # loop-cap (incident 22-06): merge-gate Tier-1 suite kept failing un-fixably
+    "merge_gate_loop": "buclă la poarta de merge (teste eșuate repetat)",
     # escalation targets (DDL CHECK set, §10.4 — who handles it)
     "phase_architect": "arhitectul de fază",
     "main_architect": "arhitectul principal",
@@ -1112,6 +1138,17 @@ class RunningStage:
 
 
 @dataclass(frozen=True)
+class WaitingStage:
+    """Coadă „cu dependențe” (founder 22-06): one WAITING stage and the unmet
+    prerequisite stages blocking it (a blocker = a stage-level dag_edges
+    prerequisite whose state != 'DONE', dangling prerequisites included)."""
+
+    stage_id: str
+    name: str
+    blockers: tuple[str, ...]  # blocker stage ids, name-glossed at render
+
+
+@dataclass(frozen=True)
 class EscalationRow:
     """§10.4 'Escaladări deschise' row (escalations WHERE status='open')."""
 
@@ -1177,6 +1214,22 @@ class MemoryInfo:
 
 
 @dataclass(frozen=True)
+class LimitsInfo:
+    """Limite Claude block (founder 22-06): the latest 5h + weekly usage-limit
+    snapshot a SEPARATE poller writes to the cache file (the dashboard never
+    fetches live — read-only + fast). All-None = no cache yet / unparseable;
+    the block then renders the graceful „indisponibil” state. checked_age_min
+    is whole minutes since checked_at (None when checked_at is missing/bad)."""
+
+    five_h_pct: int | None
+    weekly_pct: int | None
+    five_h_reset: str | None  # founder format (pre-rendered, R4) or None
+    weekly_reset: str | None  # founder format (pre-rendered, R4) or None
+    checked_age_min: int | None
+    available: bool  # False = no parseable cache -> „indisponibil”
+
+
+@dataclass(frozen=True)
 class Incident:
     """§2b 'Ultimul incident' (newest INCIDENT_EVENT_TYPES event)."""
 
@@ -1223,6 +1276,12 @@ class HealthStrip:
     #: Founder memory panel (20-06): host RAM + cgroup leash + per-agent RSS.
     #: Optional/defaulted so direct HealthStrip constructors stay valid.
     memory: MemoryInfo | None = None
+    #: Coadă „cu dependențe” (founder 22-06): one row per WAITING stage with its
+    #: unmet prerequisites. Optional/defaulted so direct constructors stay valid.
+    waiting_stages: tuple[WaitingStage, ...] = ()
+    #: Limite Claude (founder 22-06): the cached 5h/weekly usage snapshot.
+    #: Optional/defaulted so direct constructors stay valid.
+    limits: LimitsInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -1499,6 +1558,62 @@ def _build_memory(conn: sqlite3.Connection) -> MemoryInfo:
     )
 
 
+#: Limite Claude cache (founder 22-06): a SEPARATE poller writes this JSON; the
+#: dashboard only READS it (read-only + fast — never a live fetch/subprocess).
+#: Shape: {"checked_at": iso8601, "five_h_pct": int, "weekly_pct": int,
+#: "five_h_reset": iso8601, "weekly_reset": iso8601}. Module-level so a test can
+#: monkeypatch it; the architect wires the writer later.
+_LIMITS_CACHE_PATH = Path("/tmp/sf-dash-limits.json")  # noqa: S108 — poller-owned cache
+
+
+def _read_limits(cfg: FactoryConfig, now: str) -> LimitsInfo:
+    """Read the optional limits cache (read-only): present+parseable -> the
+    5h/weekly snapshot with founder-formatted resets and a whole-minute
+    „verificat acum N min” age; absent/unparseable -> the „indisponibil” state.
+    Best-effort throughout — a malformed cache NEVER crashes the page."""
+    unavailable = LimitsInfo(None, None, None, None, None, available=False)
+    try:
+        raw = _LIMITS_CACHE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return unavailable
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return unavailable
+    if not isinstance(data, Mapping):
+        return unavailable
+    tz = cfg.factory.timezone_founder
+
+    def _pct(key: str) -> int | None:
+        value = data.get(key)
+        return int(value) if isinstance(value, (int, float)) else None
+
+    def _reset(key: str) -> str | None:
+        value = data.get(key)
+        if not isinstance(value, str):
+            return None
+        try:
+            return fmt_founder_ts(value, tz)
+        except DashboardError:
+            return None
+
+    checked_age_min: int | None = None
+    checked_at = data.get("checked_at")
+    if isinstance(checked_at, str):
+        try:
+            checked_age_min = _age_seconds(checked_at, now) // 60
+        except (ValueError, TypeError):
+            checked_age_min = None
+    return LimitsInfo(
+        five_h_pct=_pct("five_h_pct"),
+        weekly_pct=_pct("weekly_pct"),
+        five_h_reset=_reset("five_h_reset"),
+        weekly_reset=_reset("weekly_reset"),
+        checked_age_min=checked_age_min,
+        available=True,
+    )
+
+
 def _build_health(
     cfg: FactoryConfig,
     conn: sqlite3.Connection,
@@ -1528,6 +1643,25 @@ def _build_health(
     for srow in stage_rows:
         stages_by_phase.setdefault(srow["phase_id"], []).append(srow)
 
+    # Coadă „cu dependențe” (founder 22-06): the stage-level DAG and each stage's
+    # state, so a WAITING stage can name the prerequisites blocking it. A blocker
+    # = a prerequisite (dag_edges.from_id where to_id=stage, level='stage') whose
+    # state != 'DONE'; a dangling prerequisite (no stage row) blocks too, mirroring
+    # deps_done. Read once here — no extra per-stage query.
+    state_by_stage = {srow["id"]: srow["state"] for srow in stage_rows}
+    prereqs_by_stage: dict[str, list[str]] = {}
+    for edge in conn.execute(
+        "SELECT from_id, to_id FROM dag_edges WHERE level = 'stage'"
+    ).fetchall():
+        prereqs_by_stage.setdefault(edge["to_id"], []).append(edge["from_id"])
+
+    def _blockers(stage_id: str) -> tuple[str, ...]:
+        return tuple(
+            from_id
+            for from_id in prereqs_by_stage.get(stage_id, ())
+            if state_by_stage.get(from_id) != "DONE"
+        )
+
     terminal_phase = {"DONE", "FAILED", "CANCELLED"}
     phases = tuple(
         PhaseHealth(
@@ -1544,6 +1678,7 @@ def _build_health(
     )
 
     running: list[RunningStage] = []
+    waiting_stages: list[WaitingStage] = []
     waiting = runnable = 0
     budgets: list[BudgetRow] = []
     active_states = {"SPEC", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE", "AWAITING_HUMAN",
@@ -1575,6 +1710,13 @@ def _build_health(
             )
         elif category is SchedCategory.WAITING:
             waiting += 1
+            waiting_stages.append(
+                WaitingStage(
+                    stage_id=srow["id"],
+                    name=srow["name"],
+                    blockers=_blockers(srow["id"]),
+                )
+            )
         elif category is SchedCategory.RUNNABLE:
             runnable += 1
         if state in active_states:
@@ -1736,6 +1878,8 @@ def _build_health(
         proactive_limit_hold_display=proactive_limit_hold_display,
         finding_recurrence_display=finding_recurrence_display,
         memory=_build_memory(conn),
+        waiting_stages=tuple(waiting_stages),
+        limits=_read_limits(cfg, now),
     )
 
 
@@ -2319,16 +2463,87 @@ def _render_memory(mem: MemoryInfo) -> str:
     return _bloc(RO["memory_label"], body)
 
 
-def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
-    """§2b health strip, §10.3 shape: each data group its own sub-block (h3 +
-    table); 'Escaladări deschise' FIRST when non-empty (exceptional state
-    outranks routine telemetry), LAST otherwise — the anchor always exists."""
-    health = view.health
-    blocks: list[str] = []
+def _render_limits(limits: LimitsInfo | None) -> str:
+    """Limite Claude block (founder 22-06, position 1 of the status strip): the
+    cached 5h + weekly usage %, their reset times and a „verificat acum N min”
+    line. No cache / unparseable -> the graceful „indisponibil” state. Read-only
+    — the dashboard never fetches live (a separate poller writes the cache)."""
+    if limits is None or not limits.available:
+        body = f"<p class='meta'>{esc(RO['limits_unavailable'])}</p>"
+        return _bloc(RO["limits_label"], body, anchor="limite")
+    rows = "".join(
+        f"<tr><td>{esc(label)}</td>"
+        f"<td class='num'>{esc('—' if pct is None else f'{pct}%')}</td>"
+        f"<td class='num'>{esc(reset or '—')}</td></tr>"
+        for label, pct, reset in (
+            (RO["limits_5h"], limits.five_h_pct, limits.five_h_reset),
+            (RO["limits_weekly"], limits.weekly_pct, limits.weekly_reset),
+        )
+    )
+    body = _table(
+        f"<th>{esc(RO['limits_col_window'])}</th>"
+        f"<th class='num'>{esc(RO['limits_col_used'])}</th>"
+        f"<th class='num'>{esc(RO['limits_col_reset'])}</th>",
+        rows,
+    )
+    if limits.checked_age_min is not None:
+        checked = (
+            RO["limits_checked_now"]
+            if limits.checked_age_min <= 0
+            else RO["limits_checked"].format(minutes=limits.checked_age_min)
+        )
+        body += f"<p class='meta'>{esc(checked)}</p>"
+    return _bloc(RO["limits_label"], body, anchor="limite")
 
-    escalations_block = _render_escalations(view, cfg)
-    if health.escalations:
-        blocks.append(escalations_block)
+
+def _render_queue(health: HealthStrip) -> str:
+    """Coadă block: the runnable count + a per-WAITING-stage table naming the
+    unmet prerequisites blocking it (founder „cu dependențe”, 22-06). Read-only:
+    blockers were derived in build_view from dag_edges × stage states."""
+    counts = _table(
+        "",
+        f"<tr><td>{esc(RO['queue_waiting'])}</td>"
+        f"<td class='num'>{health.waiting_count}</td></tr>"
+        f"<tr><td>{esc(RO['queue_runnable'])}</td>"
+        f"<td class='num'>{health.runnable_count}</td></tr>",
+    )
+    if health.waiting_stages:
+        waiting_rows = "".join(
+            f"<tr><td>{esc(st.name)}"
+            f"<span class='token'>({esc(st.stage_id)})</span></td>"
+            f"<td>{_render_blockers(st.blockers)}</td></tr>"
+            for st in health.waiting_stages
+        )
+        body = counts + _table(
+            f"<th>{esc(RO['col_stage'])}</th>"
+            f"<th>{esc(RO['queue_blocked_on'])}</th>",
+            waiting_rows,
+        )
+    else:
+        body = counts + f"<p class='meta'>{esc(RO['queue_waiting_none'])}</p>"
+    return _bloc(RO["queue_label"], body)
+
+
+def _render_blockers(blockers: tuple[str, ...]) -> str:
+    """The „așteaptă după” cell: each blocker stage id on its own token line, or
+    the „—” placeholder when a WAITING stage has no NAMED blocker (e.g. only a
+    dangling/unknown prerequisite was filtered to nothing)."""
+    if not blockers:
+        return f"<span class='meta'>{esc(RO['queue_no_blockers'])}</span>"
+    return "".join(f"<span class='token'>{esc(b)}</span>" for b in blockers)
+
+
+def _render_health(view: DashboardView, cfg: FactoryConfig) -> dict[str, str]:
+    """§2b health strip, §10.3 shape: each data group its own sub-block (h3 +
+    table). Returns a NAME->html map so render_page can place blocks in the
+    founder-locked order (22-06 reorder); the urgency rule (escalations FIRST
+    when an open escalation exists) is applied by render_page. The 'escalations'
+    block's anchor id='escaladari' is ALWAYS present wherever it lands."""
+    health = view.health
+    blocks: dict[str, str] = {}
+
+    blocks["escalations"] = _render_escalations(view, cfg)
+    blocks["limits"] = _render_limits(health.limits)
 
     stale_mark = (
         f" <span class='rosu'>{esc(RO['pulse_stale'])}</span>" if health.liveness_stale else ""
@@ -2353,18 +2568,16 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if health.finding_recurrence_display
         else ""
     )
-    blocks.append(
-        _bloc(
-            RO["pulse_label"],
-            f"<p>{esc(health.liveness_display)}{stale_mark}</p>"
-            f"{hold_line}{proactive_hold_line}{recurrence_line}",
-        )
+    blocks["pulse"] = _bloc(
+        RO["pulse_label"],
+        f"<p>{esc(health.liveness_display)}{stale_mark}</p>"
+        f"{hold_line}{proactive_hold_line}{recurrence_line}",
     )
 
-    # Founder memory panel (20-06) — right after Puls (his #1 ask): host RAM,
-    # the leash, per-agent RSS. Surfaces the OOM risk mechanically.
+    # Founder memory panel (20-06): host RAM, the leash, per-agent RSS. Surfaces
+    # the OOM risk mechanically. Renders only when memory info is available.
     if health.memory is not None:
-        blocks.append(_render_memory(health.memory))
+        blocks["memory"] = _render_memory(health.memory)
 
     if health.phases:
         phase_rows = "".join(
@@ -2374,15 +2587,13 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
             f" {ph.stages_total} {esc(RO['progress_done'])}</td></tr>"
             for ph in health.phases
         )
-        blocks.append(
-            _bloc(
-                RO["phases_label"],
-                _table(
-                    f"<th>{esc(RO['col_phase'])}</th><th>{esc(RO['col_state'])}</th>"
-                    f"<th class='num'>{esc(RO['col_progress'])}</th>",
-                    phase_rows,
-                ),
-            )
+        blocks["phases"] = _bloc(
+            RO["phases_label"],
+            _table(
+                f"<th>{esc(RO['col_phase'])}</th><th>{esc(RO['col_state'])}</th>"
+                f"<th class='num'>{esc(RO['col_progress'])}</th>",
+                phase_rows,
+            ),
         )
 
     if health.running_stages:
@@ -2407,20 +2618,10 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         )
     else:
         running_body = f"<p class='meta'>{esc(RO['queue_none_running'])}</p>"
-    blocks.append(_bloc(RO["running_label"], running_body))
+    blocks["running"] = _bloc(RO["running_label"], running_body)
 
-    blocks.append(
-        _bloc(
-            RO["queue_label"],
-            _table(
-                "",
-                f"<tr><td>{esc(RO['queue_waiting'])}</td>"
-                f"<td class='num'>{health.waiting_count}</td></tr>"
-                f"<tr><td>{esc(RO['queue_runnable'])}</td>"
-                f"<td class='num'>{health.runnable_count}</td></tr>",
-            ),
-        )
-    )
+    # Coadă „cu dependențe” (founder 22-06): counts + per-WAITING-stage blockers.
+    blocks["queue"] = _render_queue(health)
 
     budget_rows = []
     for row in health.budgets:
@@ -2480,15 +2681,13 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         if budget_rows
         else ""
     )
-    blocks.append(
-        _bloc(
-            RO["budget_label"],
-            f"{budget_table}{budget_effective_note}"
-            f"<p class='meta'>{esc(RO['budget_total'])}:"
-            f" {esc(_fmt_ktok(health.total_tokens))} {esc(RO['budget_tokens'])}"
-            f"{estimated_part}{cost_part}</p>"
-            f"{today_line}{legend}",
-        )
+    blocks["budget"] = _bloc(
+        RO["budget_label"],
+        f"{budget_table}{budget_effective_note}"
+        f"<p class='meta'>{esc(RO['budget_total'])}:"
+        f" {esc(_fmt_ktok(health.total_tokens))} {esc(RO['budget_tokens'])}"
+        f"{estimated_part}{cost_part}</p>"
+        f"{today_line}{legend}",
     )
 
     if health.incident is not None:
@@ -2504,14 +2703,9 @@ def _render_health(view: DashboardView, cfg: FactoryConfig) -> str:
         )
     else:
         incident_body = f"<p class='meta'>{esc(RO['incident_none'])}</p>"
-    blocks.append(_bloc(RO["incident_label"], incident_body))
+    blocks["incident"] = _bloc(RO["incident_label"], incident_body)
 
-    if not health.escalations:
-        blocks.append(escalations_block)
-
-    return (
-        f"<section id='acum'><h2>{esc(RO['section_now'])}</h2>{''.join(blocks)}</section>"
-    )
+    return blocks
 
 
 def _stage_cost_cell(stage: PlanStage) -> str:
@@ -2583,13 +2777,24 @@ def _render_plan(view: DashboardView) -> str:
     return f"<section id='plan'>{''.join(parts)}</section>"
 
 
+def _section(anchor: str, heading: str, body: str) -> str:
+    """One titled <section> with a stable anchor id (the founder-reorder layout
+    groups health sub-blocks under named sections)."""
+    return f"<section id='{anchor}'><h2>{esc(heading)}</h2>{body}</section>"
+
+
 def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
-    """The single server-rendered HTML page: three sections, meta-refresh, zero
-    JS; all dynamic text via esc(). §10.1-S6: when decision cards exist, a
-    one-line top banner anchor-links #decizii (the founder's to-do outranks the
-    taller strip). The meta-refresh lives ONLY here — never on a page that
-    renders a textarea (S3/A-1, pinned by test)."""
+    """The single server-rendered HTML page, meta-refresh, zero JS; all dynamic
+    text via esc(). Layout is the founder-locked 22-06 order (top→bottom):
+    [open escalation, when present] · Stare (Limite Claude · Puls · RAM) ·
+    Decizie · Operațional (În lucru · Coadă) · Roadmap (Faze · Plan & istoric) ·
+    Secundar (Buget · Incident · Escaladări-when-none-open). §10.1-S6: when
+    decision cards exist, a one-line top banner anchor-links #decizii. The
+    meta-refresh lives ONLY here — never on a page that renders a textarea
+    (S3/A-1, pinned by test). The 'escaladari' anchor is ALWAYS rendered exactly
+    once (top when an escalation is open, bottom otherwise — the urgency rule)."""
     refresh = cfg.founder_channel.dashboard.refresh_s
+    blocks = _render_health(view, cfg)
     cards: list[str] = []
     for card in view.cards:
         try:
@@ -2605,6 +2810,31 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
     banner = (
         f"<a class='banner' href='#decizii'>{esc(banner_text)}</a>" if count else ""
     )
+
+    # Urgency rule (preserved from the pre-reorder strip): an OPEN escalation
+    # surfaces at the VERY top; otherwise the block lands in the Secundar
+    # section at the bottom. Either way the id='escaladari' anchor exists once.
+    has_open_escalation = bool(view.health.escalations)
+    top_escalation = blocks["escalations"] if has_open_escalation else ""
+
+    # 1. Stare: Limite Claude · Puls · RAM/Memory (memory may be absent).
+    status_body = blocks["limits"] + blocks["pulse"] + blocks.get("memory", "")
+    # 3. Operațional: În lucru (running) + Coadă (queue).
+    operational_body = blocks["running"] + blocks["queue"]
+    # 4. Roadmap: Faze (phases, may be absent) followed by Plan & istoric. The
+    #    plan keeps its OWN <section id='plan'> (established anchor) as the
+    #    immediately-following sibling, so the two read as one roadmap group
+    #    without nesting one card inside another.
+    roadmap = _section("roadmap", RO["section_roadmap"], blocks.get("phases", "")) + (
+        _render_plan(view)
+    )
+    # 5. Secundar: Buget · Incident · Escaladări (only when none open at top).
+    secondary_body = (
+        blocks["budget"]
+        + blocks["incident"]
+        + ("" if has_open_escalation else blocks["escalations"])
+    )
+
     return (
         "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -2614,9 +2844,12 @@ def render_page(view: DashboardView, cfg: FactoryConfig) -> str:
         f"<h1>{esc(RO['page_heading'])}</h1>"
         f"<nav class='meta'><a href='/configurare'>{esc(RO['cfg_nav'])}</a></nav>"
         f"{banner}"
-        f"{_render_health(view, cfg)}"
-        f"<section id='decizii'><h2>{esc(RO['section_decisions'])}</h2>{cards_html}</section>"
-        f"{_render_plan(view)}"
+        f"{top_escalation}"
+        f"{_section('acum', RO['section_now'], status_body)}"
+        f"{_section('decizii', RO['section_decisions'], cards_html)}"
+        f"{_section('operational', RO['section_operational'], operational_body)}"
+        f"{roadmap}"
+        f"{_section('secundar', RO['section_secondary'], secondary_body)}"
         "</body></html>"
     )
 
