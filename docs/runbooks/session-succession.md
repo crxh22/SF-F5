@@ -45,7 +45,12 @@ firing session's id).
    phone (claude.ai/code, green dot) — if RC silently failed, the founder is still reachable
    on the predecessor's live RC, so DO NOT go silent until the successor's RC is confirmed.
    The old session stays attached in its tmux window, idle — founder reviews history via
-   remote control and exits it manually when done.
+   remote control and exits it manually when done. **⛔ The successor must NEVER kill/exit the
+   predecessor session** (no `tmux kill-session`, no `kill`, no `/exit`) — an architect-initiated
+   kill DROPS the predecessor's claude.ai/code dashboard history (founder-observed 22-06-2026,
+   ARH-03→ARH-02); the on-disk transcript survives but the founder reads history on the dashboard.
+   Sole-writer is enforced by the marker, not by killing. Retiring the old session is the FOUNDER's
+   call, his own way — the architect does NOT "declutter" by killing it. (Launch-protocol §B.)
 6. The predecessor announces the succession to the founder (one line, where the successor
    lives) and goes silent. It must NOT keep working after the successor takes the marker
    (two architects = two writers — same reason the factory has a sole-writer rule).
