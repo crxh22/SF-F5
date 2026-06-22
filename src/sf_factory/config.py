@@ -225,6 +225,12 @@ class EscalationCfg(_StrictModel):
     # (or RESOLVED-but-unit-still-ESCALATED longer than this) -> the stuck-detector
     # bumps target one rung + pages the architect. Minutes; Doctrine §14.
     stuck_escalation_threshold_min: int = Field(ge=1)
+    # Loop-cap (incident 22-06): a stage whose merge-gate Tier-1 SUITE fails this
+    # many times since its last escalation (the builder cannot fix it — a no-op
+    # rework loop; env/infra, not a code defect) is ESCALATED instead of
+    # re-looping forever (Doctrine §8/§20). Defaulted so existing/test configs
+    # validate without it; the live YAML sets it explicitly.
+    merge_gate_max_tier1_failures: int = Field(ge=1, default=3)
 
 
 class RiskClassCfg(_StrictModel):

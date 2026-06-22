@@ -98,6 +98,7 @@ escalation:
   max_context_resets: 1        # context_budget firings executed as reset before escalating
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
   stuck_escalation_threshold_min: 30 # open-too-long climb (2a) + resolved-not-advanced (2b) trigger past this age
+  merge_gate_max_tier1_failures: 3 # Tier-1 suite fails this many times since last escalation -> ESCALATE, not re-loop (incident 22-06: treasury socket-path loop, 12x)
                           # RESTORED to 30 by ETAPA-5f after the proper case-2b fix shipped: the over-fire (case-2b
                           # paging escalation_stuck_resolved for EVERY old resolved escalation of a re-ESCALATED unit,
                           # ~32 false [arhitect] pages) is fixed by scoping (2b) to each unit's MOST-RECENT escalation

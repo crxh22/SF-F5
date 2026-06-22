@@ -3360,6 +3360,79 @@ class StageExecutor:
             )
 
         if tier1.tests_failed:
+            # Loop-cap (incident 22-06: treasury-app-foundations looped 12x at the
+            # merge gate on a PG-socket-path-too-long Tier-1 failure the builder
+            # could NOT fix — a no-op rework loop; env/infra, not a code defect;
+            # Doctrine §8/§20, the silent slow death). Count this stage's Tier-1
+            # SUITE failures since its last escalation; at the cap, ESCALATE (loud,
+            # paged, human-resolved) instead of routing back to BUILD forever.
+            with self._db.transaction() as conn:
+                since = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM events WHERE unit_level = 'stage'"
+                    " AND unit_id = ? AND event_type = 'transition'"
+                    " AND to_state = 'ESCALATED'",
+                    (stage.id,),
+                ).fetchone()[0]
+                tier1_failures = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE unit_level = 'stage'"
+                    " AND unit_id = ? AND event_type = 'tier1_gate'"
+                    " AND json_extract(payload_json, '$.tests_failed') = 1"
+                    " AND seq > ?",
+                    (stage.id, since),
+                ).fetchone()[0]
+            cap = self._cfg.escalation.merge_gate_max_tier1_failures
+            loop_evidence = {
+                "tier1_failures": tier1_failures,
+                "cap": cap,
+                "test_output_path": tier1.test_output_path,
+            }
+            if tier1_failures >= cap:
+
+                def couple_loop(conn: sqlite3.Connection) -> None:
+                    seq = fdb.insert_event(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        event_type="merge_gate_loop",
+                        actor=_ACTOR,
+                        payload=loop_evidence,
+                    )
+                    if not fdb.open_escalation(
+                        conn, Level.STAGE.value, stage.id, "merge_gate_loop"
+                    ):  # uq_open_escalation: one open row per (stage, trigger)
+                        fdb.insert_escalation(
+                            conn,
+                            Escalation(
+                                id=None,
+                                unit_level=Level.STAGE.value,
+                                unit_id=stage.id,
+                                trigger="merge_gate_loop",
+                                target="phase_architect",
+                                payload_artifact_id=None,
+                                event_seq=seq,
+                                status="open",
+                                resolution=None,
+                                created_at=utc_now(),
+                                resolved_at=None,
+                            ),
+                        )
+
+                try:
+                    self._sm.transition(
+                        Level.STAGE,
+                        stage.id,
+                        StageState.ESCALATED.value,
+                        actor=_ACTOR,
+                        reason=(
+                            f"merge-gate Tier-1 suite failed {tier1_failures}x"
+                            f" (cap {cap}) with no fixing rework — stuck loop, escalated"
+                        ),
+                        payload=loop_evidence | {"triggers": ["merge_gate_loop"]},
+                        coupled=couple_loop,
+                    )
+                    return False
+                except TransitionError:
+                    pass  # ESCALATED edge illegal here — fall through to route-back
             self._sm.transition(
                 Level.STAGE,
                 stage.id,

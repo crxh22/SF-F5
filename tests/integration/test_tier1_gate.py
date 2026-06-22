@@ -139,3 +139,37 @@ async def test_tier1_seeded_failing_suite_blocks_merge_until_fixed(make_env) -> 
     assert gates[-1]["passed"] is True
     # The suite's failure evidence file exists (escalation-payload material).
     assert gates[0]["test_output_path"]
+
+
+async def test_tier1_loop_cap_escalates_unfixable_suite(make_env) -> None:
+    """Loop-cap (incident 22-06): a stage whose merge-gate Tier-1 suite keeps
+    failing while the builder cannot fix it (a no-op rework — the validator stays
+    GREEN, so the validator-based max_fix_iterations guard never fires) is
+    ESCALATED at the cap instead of looping forever. The treasury-app-foundations
+    socket-path loop (12x, silent) made observable + bounded — Doctrine §8/§20."""
+    env = make_env(test_command=MARKER_SUITE)  # fails forever: the marker is never written
+    _seed_merge_gate_stage(env)
+    env.write_playbook(
+        {
+            # The builder NEVER writes suite-ok.marker — every rework is a no-op,
+            # the exact treasury signature (env/infra failure, unfixable in code).
+            "builder": {"default": {"notes": False}},
+            # Validator stays green -> the validator-based max_fix_iterations guard
+            # cannot fire; only the new merge-gate loop-cap can stop this.
+            "validator": {"default": {"failing": 0}},
+            "tier2": {"default": {"findings": []}},
+        }
+    )
+
+    await env.stage_executor().execute("s1")
+
+    cap = env.cfg.escalation.merge_gate_max_tier1_failures
+    gates = [json.loads(e["payload_json"]) for e in env.events("s1", "tier1_gate")]
+    # Stopped EXACTLY at the cap — it tried (not zero), and did not loop forever.
+    assert len(gates) == cap and all(g["tests_failed"] for g in gates)
+    # Escalated (not DONE, not still cycling), with the merge_gate_loop trigger.
+    assert env.stage_state("s1") is StageState.ESCALATED
+    assert any(e["trigger"] == "merge_gate_loop" for e in env.escalations("s1"))
+    # The loud signal carries the failure count (Doctrine §20 — never silent).
+    loop_evts = env.events("s1", "merge_gate_loop")
+    assert loop_evts and json.loads(loop_evts[-1]["payload_json"])["tier1_failures"] == cap
