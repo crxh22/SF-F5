@@ -539,6 +539,45 @@ def test_builder_role_frontend_heavy_resolves_to_opus(config_dict) -> None:
     assert cfg.models[role].model == "opus"
 
 
+def test_builder_role_backend_structural_resolves_to_codex(config_dict) -> None:
+    """REAL risk class: a structural backend stage collapses to the 'heavy' tier ->
+    builder_backend_heavy (codex). Regression for the kind×risk routing gap where the
+    LITERAL 'structural' produced builder_backend_structural (absent) and the route
+    silently degraded to builder_heavy (opus), defeating "backend -> codex"."""
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "structural", "backend")
+    assert role == "builder_backend_heavy"
+    assert cfg.models[role].cli == "codex"
+
+
+def test_builder_role_backend_critical_resolves_to_codex(config_dict) -> None:
+    """REAL risk class: a critical backend stage also collapses to 'heavy' tier ->
+    builder_backend_heavy (codex). codex builds backend at EVERY risk; AUDIT is the
+    dual-family check, not the builder."""
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "critical", "backend")
+    assert role == "builder_backend_heavy"
+    assert cfg.models[role].cli == "codex"
+
+
+def test_builder_role_frontend_structural_resolves_to_opus(config_dict) -> None:
+    """REAL risk class: a structural frontend stage -> builder_frontend_heavy (opus +
+    UX-laws injection), never codex."""
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "structural", "frontend")
+    assert role == "builder_frontend_heavy"
+    assert cfg.models[role].cli == "claude"
+    assert cfg.models[role].model == "opus"
+
+
+def test_builder_role_frontend_critical_resolves_to_opus(config_dict) -> None:
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "critical", "frontend")
+    assert role == "builder_frontend_heavy"
+    assert cfg.models[role].cli == "claude"
+    assert cfg.models[role].model == "opus"
+
+
 def test_builder_role_kind_none_routine_is_unchanged_legacy(config_dict) -> None:
     """kind=None keeps the pre-2-D 1-D resolution: builder_<risk_class>."""
     cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)

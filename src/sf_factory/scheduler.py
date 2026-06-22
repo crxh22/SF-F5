@@ -602,19 +602,31 @@ def _builder_role(cfg: FactoryConfig, risk_class: str, kind: str | None = None) 
     declares validator+audits only). Returns the FIRST models key that exists,
     in this order:
 
-      1. ``builder_<kind>_<risk_class>``  (kind given — 2-D route, e.g.
-         ``builder_backend_routine`` → codex, ``builder_frontend_heavy`` → opus)
+      1. ``builder_<kind>_<tier>`` where ``tier`` collapses the real risk_class onto
+         the two declared builder tiers (``routine`` → routine, ``structural`` /
+         ``critical`` → heavy), e.g. ``builder_backend_heavy`` → codex for a
+         structural/critical backend stage, ``builder_frontend_routine`` → opus.
       2. ``builder_<kind>``              (kind given — kind-wide fallback)
       3. ``builder_<risk_class>``        (legacy 1-D route; the ONLY path taken
          when kind is None → byte-identical to the pre-2-D behavior)
       4. ``builder_heavy``              (conservative final fallback)
 
+    The tier collapse is load-bearing: config declares only ``builder_<kind>_routine``
+    and ``builder_<kind>_heavy``, but the risk_classes are routine/structural/critical.
+    Using the LITERAL risk_class in step 1 made ``builder_backend_structural`` /
+    ``_critical`` never exist, so every non-routine backend stage silently fell through
+    to ``builder_heavy`` (opus), defeating the founder-approved "backend → codex"
+    routing (Step-2). Collapsing to the tier restores it: codex builds backend at every
+    risk, opus builds frontend at every risk, while AUDIT stays dual-family.
+
     Backward-compat guarantee: with ``kind=None`` only steps 3–4 run, so kind=None
     legacy stages keep resolving exactly as before. Raises ConfigError when none of
     the candidates is configured."""
+    # routine -> the 'routine' (light) builder tier; structural/critical -> 'heavy'.
+    tier = "routine" if risk_class == "routine" else "heavy"
     candidates: list[str] = []
     if kind:
-        candidates.append(f"builder_{kind}_{risk_class}")
+        candidates.append(f"builder_{kind}_{tier}")
         candidates.append(f"builder_{kind}")
     candidates.append(f"builder_{risk_class}")
     candidates.append("builder_heavy")
