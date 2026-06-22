@@ -1,0 +1,12 @@
+[Unit]
+Description=SF-F5 dashboard "Limite Claude" cache poller — refresh /tmp/sf-dash-limits.json from the live 5h+weekly Claude usage (founder 22-06)
+Documentation=file:///home/artur/projects/SF-F5/src/sf_factory/dashboard.py
+
+[Service]
+Type=oneshot
+User=artur
+# One-shot query+transform+atomic-write. Calls ~/.claude/sf-limit.sh (live OAuth
+# usage query) and writes the dashboard-read cache. On a failed query it leaves
+# the existing cache intact (the dashboard renders a graceful „indisponibil” /
+# stale state). The timer drives the ~5 min cadence.
+ExecStart=/home/artur/projects/SF-F5/deploy/sf-dash-limits-poller.sh

@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the SF-F5 dashboard "Limite Claude" cache every 5 min (founder 22-06)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+AccuracySec=15
+
+[Install]
+WantedBy=timers.target
