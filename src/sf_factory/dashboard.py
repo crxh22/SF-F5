@@ -470,6 +470,8 @@ GLOSS: Mapping[str, str] = {
     "agent_run_failed": "agentul a eșuat la rulare (oprire fără rezultat)",
     # loop-cap (incident 22-06): merge-gate Tier-1 suite kept failing un-fixably
     "merge_gate_loop": "buclă la poarta de merge (teste eșuate repetat)",
+    # integration safety net (step-5): small-stage size gate flagged a plan stage
+    "stage_size_gate": "etapă în afara limitelor de dimensiune (plan)",
     # escalation targets (DDL CHECK set, §10.4 — who handles it)
     "phase_architect": "arhitectul de fază",
     "main_architect": "arhitectul principal",

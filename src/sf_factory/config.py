@@ -400,10 +400,49 @@ class CanonCfg(_StrictModel):
         return self
 
 
+class StageSizeLimitsCfg(_StrictModel):
+    """planning.stage_size_limits — bounds for the mechanical small-stage gate
+    (integration safety net, step-5; Doctrine §14 tunables). Upper bounds cap a stage
+    at one-pass builder confidence; the floor (min_*) flags over-split. Defaults are the
+    founder-locked starter values; the cross-check pins each min < its max."""
+
+    max_acceptance_criteria: int = Field(ge=1, default=7)
+    max_touched: int = Field(ge=1, default=6)
+    max_dependency_degree: int = Field(ge=1, default=6)
+    min_acceptance_criteria: int = Field(ge=0, default=1)
+    min_touched: int = Field(ge=0, default=1)
+
+    @model_validator(mode="after")
+    def _check_floor_below_ceiling(self) -> StageSizeLimitsCfg:
+        if self.min_acceptance_criteria >= self.max_acceptance_criteria:
+            raise ValueError(
+                "planning.stage_size_limits.min_acceptance_criteria "
+                f"({self.min_acceptance_criteria}) must be < max_acceptance_criteria "
+                f"({self.max_acceptance_criteria})"
+            )
+        if self.min_touched >= self.max_touched:
+            raise ValueError(
+                "planning.stage_size_limits.min_touched "
+                f"({self.min_touched}) must be < max_touched ({self.max_touched})"
+            )
+        return self
+
+
+class PlanningCfg(_StrictModel):
+    """planning (integration safety net, step-5): OPTIONAL top-level section, default
+    all-baseline — the size-gate thresholds + its mode. ``stage_size_gate_mode`` starts
+    at 'warn' (report + escalate, never block); 'hard' wires the blocking path (NOT the
+    default). The pricing/capacity_governor precedent: minimal fixtures predate the
+    section and must keep validating without it."""
+
+    stage_size_limits: StageSizeLimitsCfg = StageSizeLimitsCfg()
+    stage_size_gate_mode: Literal["warn", "hard"] = "warn"
+
+
 class FactoryConfig(_StrictModel):
     """Typed mirror of factory.config.yaml: factory, projects, models, budgets, escalation,
     risk_classes, economics, consultation_points, founder_channel, process, canon (D-0009),
-    pricing (CCR-10, optional). extra='forbid' everywhere."""
+    pricing (CCR-10, optional), planning (step-5, optional). extra='forbid' everywhere."""
 
     factory: FactorySection
     projects: dict[str, ProjectCfg]
@@ -422,6 +461,10 @@ class FactoryConfig(_StrictModel):
     #: CCR-11 (D-0037): OPTIONAL top-level section, default DISABLED — the
     #: golden config enables it and declares the models.capacity_probe route.
     capacity_governor: CapacityGovernorCfg = CapacityGovernorCfg()
+    #: step-5 (integration safety net): OPTIONAL top-level section, default
+    #: all-baseline (size limits + 'warn' mode) — the golden config carries it
+    #: explicitly; minimal test fixtures predate it and validate without it.
+    planning: PlanningCfg = PlanningCfg()
 
     @model_validator(mode="after")
     def _cross_checks(self) -> FactoryConfig:

@@ -158,6 +158,17 @@ class TestGoldenRealConfig:
         assert probe.model == "haiku"
         assert probe.mode == "print"
 
+    def test_planning_size_gate_declared_warn_first(self, cfg: FactoryConfig):
+        # step-5 (integration safety net): the real config carries the planning
+        # section, the gate starts at 'warn' (inert/non-blocking), and the
+        # founder-locked starter limits are present. VALUES are tunable; the
+        # warn-first default + the floor<ceiling invariant are the locked shape.
+        assert cfg.planning.stage_size_gate_mode == "warn"
+        limits = cfg.planning.stage_size_limits
+        assert limits.min_acceptance_criteria < limits.max_acceptance_criteria
+        assert limits.min_touched < limits.max_touched
+        assert limits.max_dependency_degree >= 1
+
     def test_pricing_table_structure(self, cfg: FactoryConfig):
         # CCR-10 (dashboard design §11.1): pricing.usd_per_mtok keyed by LEDGER
         # model strings — VALUES are founder-tunable, the structure is not. The
@@ -427,6 +438,59 @@ class TestCrossChecks:
         self, tmp_path, config_dict
     ):
         config_dict["capacity_governor"] = {"enabled": False, "probe_interval_s": 0}
+        _expect_config_error(tmp_path, config_dict)
+
+    # ------------------------------------------------- step-5: planning section
+
+    def test_planning_optional_default_baseline(self, config_dict):
+        # OPTIONAL top-level section (the pricing/capacity_governor precedent):
+        # the frozen minimal fixture predates it and must keep validating, with
+        # the founder-locked defaults and 'warn' mode.
+        assert "planning" not in config_dict
+        cfg = FactoryConfig.model_validate(config_dict)
+        assert cfg.planning.stage_size_gate_mode == "warn"
+        limits = cfg.planning.stage_size_limits
+        assert limits.max_acceptance_criteria == 7
+        assert limits.max_touched == 6
+        assert limits.max_dependency_degree == 6
+        assert limits.min_acceptance_criteria == 1
+        assert limits.min_touched == 1
+
+    def test_planning_section_parses_overrides(self, tmp_path, config_dict):
+        config_dict["planning"] = {
+            "stage_size_limits": {
+                "max_acceptance_criteria": 5,
+                "max_touched": 4,
+                "max_dependency_degree": 3,
+                "min_acceptance_criteria": 2,
+                "min_touched": 1,
+            },
+            "stage_size_gate_mode": "hard",
+        }
+        path = tmp_path / "planning.yaml"
+        path.write_text(yaml.safe_dump(config_dict), encoding="utf-8")
+        cfg = load_config(path)
+        assert cfg.planning.stage_size_gate_mode == "hard"
+        assert cfg.planning.stage_size_limits.max_touched == 4
+
+    def test_planning_bad_mode_literal_rejected(self, tmp_path, config_dict):
+        config_dict["planning"] = {"stage_size_gate_mode": "block"}
+        _expect_config_error(tmp_path, config_dict)
+
+    def test_planning_min_not_below_max_criteria_rejected(self, tmp_path, config_dict):
+        config_dict["planning"] = {
+            "stage_size_limits": {"min_acceptance_criteria": 7, "max_acceptance_criteria": 7}
+        }
+        _expect_config_error(tmp_path, config_dict, match="min_acceptance_criteria")
+
+    def test_planning_min_not_below_max_touched_rejected(self, tmp_path, config_dict):
+        config_dict["planning"] = {
+            "stage_size_limits": {"min_touched": 6, "max_touched": 6}
+        }
+        _expect_config_error(tmp_path, config_dict, match="min_touched")
+
+    def test_planning_unknown_nested_key_rejected(self, tmp_path, config_dict):
+        config_dict["planning"] = {"stage_size_limits": {"max_files": 3}}
         _expect_config_error(tmp_path, config_dict)
 
     def test_cp_duplicate_ids(self, tmp_path, config_dict):

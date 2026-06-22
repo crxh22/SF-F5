@@ -46,7 +46,10 @@ from sf_factory import db as fdb
 from sf_factory.artifacts import (
     PHASE_ARTIFACTS,
     STAGE_ARTIFACTS,
+    PhasePlan,
+    StageSizeLimits,
     detect_sentinels,
+    evaluate_stage_sizes,
     read_phase_plan,
     read_validation_sidecar,
     register_artifact,
@@ -4291,6 +4294,91 @@ class PhaseExecutor:
         )
         return True
 
+    def _apply_stage_size_gate(self, phase: Phase, plan: PhasePlan) -> bool:
+        """Integration safety net (step-5): run the mechanical small-stage size gate
+        over the validated plan and surface its findings. Returns True when ingest may
+        proceed, False only in 'hard' mode WITH an over/under finding (blocks).
+
+        - over/under: 'warn' (default) -> an ``oversized_stage`` event (stage_id, axis,
+          value, limit, kind) PLUS a non-blocking escalation to the architect (the
+          ``transition=False`` pattern) — ingest still proceeds; 'hard' -> the same
+          event + a blocking escalation and ingest is refused (no state change).
+        - skipped: a ``size_gate_skipped`` event per un-checkable axis (VISIBLE, never
+          an escalation) so a legacy plan's coverage gap is recorded, not silent.
+        The no-violation path emits nothing — byte-identical to pre-step-5."""
+        limits_cfg = self._cfg.planning.stage_size_limits
+        violations = evaluate_stage_sizes(
+            plan,
+            StageSizeLimits(
+                max_acceptance_criteria=limits_cfg.max_acceptance_criteria,
+                max_touched=limits_cfg.max_touched,
+                max_dependency_degree=limits_cfg.max_dependency_degree,
+                min_acceptance_criteria=limits_cfg.min_acceptance_criteria,
+                min_touched=limits_cfg.min_touched,
+            ),
+        )
+        if not violations:
+            return True
+
+        mode = self._cfg.planning.stage_size_gate_mode
+        flagged = [v for v in violations if v.kind != "skipped"]
+        skipped = [v for v in violations if v.kind == "skipped"]
+
+        for v in skipped:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type="size_gate_skipped",
+                    actor=_ACTOR,
+                    payload={"stage_id": v.stage_id, "axis": v.axis},
+                )
+
+        for v in flagged:
+            with self._db.transaction() as conn:
+                fdb.insert_event(
+                    conn,
+                    unit_level=Level.PHASE.value,
+                    unit_id=phase.id,
+                    event_type="oversized_stage",
+                    actor=_ACTOR,
+                    payload={
+                        "stage_id": v.stage_id,
+                        "axis": v.axis,
+                        "kind": v.kind,
+                        "value": v.value,
+                        "limit": v.limit,
+                        "mode": mode,
+                    },
+                )
+
+        if flagged:
+            offenders = sorted({v.stage_id for v in flagged})
+            self._escalate(
+                phase,
+                trigger="stage_size_gate",
+                target="main_architect",
+                reason=f"phase plan stage(s) {offenders} violate the size limits ({mode})",
+                payload={
+                    "mode": mode,
+                    "violations": [
+                        {
+                            "stage_id": v.stage_id,
+                            "axis": v.axis,
+                            "kind": v.kind,
+                            "value": v.value,
+                            "limit": v.limit,
+                        }
+                        for v in flagged
+                    ],
+                },
+                transition=False,
+            )
+            if mode == "hard":
+                return False  # block ingest: a hard-mode size violation, no state change
+        return True
+
     async def _step_ingest(self, phase: Phase) -> bool:
         """CONTRACTS_FROZEN -> RUNNING: re-validate the plan strictly, then one
         tx inserts stage rows + stage DAG + the transition (all-or-nothing)."""
@@ -4309,6 +4397,13 @@ class PhaseExecutor:
                 payload={"error": str(exc)},
                 transition=False,
             )
+            return False
+
+        # Integration safety net (step-5): mechanical small-stage size gate. In
+        # 'warn' (the default) it REPORTS + escalates non-blocking, ingest proceeds;
+        # in 'hard' it blocks (escalate without a state change, like the contract
+        # breach above). The happy path (no violations) is byte-identical to before.
+        if not self._apply_stage_size_gate(phase, plan):
             return False
 
         now = utc_now()
@@ -5158,8 +5253,23 @@ class PhaseExecutor:
             f"Write {unit_rel}/phase-plan.md (rationale) and {unit_rel}/phase-plan.json — "
             'EXACTLY {"stages": [{"id": "<plan-local-id>", "name": "...", '
             '"risk_class": "<one of ' + "|".join(risk_classes) + '>", '
-            '"acceptance": "..."}], "dag_edges": [["<from>", "<to>"]]} — '
+            '"acceptance": "...", "acceptance_criteria": ["...", "..."], '
+            '"touched": ["path/or/component", "..."], "role": "<contract|leaf>"}], '
+            '"dag_edges": [["<from>", "<to>"]]} — '
             "ids unique, every edge endpoint declared, DAG acyclic.\n"
+            "Per stage ALSO emit: acceptance_criteria (the acceptance as a checklist "
+            "of discrete, testable items); touched (the files / components / "
+            "contract-symbols the stage will modify); role ('contract' for a thin "
+            "seam-freezing stage that fixes a shared schema/API signature/invariant, "
+            "'leaf' otherwise).\n"
+            "CONTRACT-FIRST: when the phase has shared seams, author a role='contract' "
+            "stage that freezes them FIRST and add dag_edges so EVERY dependent (leaf) "
+            "stage is a DAG descendant of a contract stage — dependents then build "
+            "against a frozen contract (a leaf with no contract ancestor is rejected).\n"
+            "SIZE each stage within the limits: <=7 acceptance_criteria, <=6 touched, "
+            "<=6 dependency-degree (in+out edges); split anything larger, and do not "
+            "over-split a leaf below 1 criterion / 1 touched (contract stages may be "
+            "thinner). Oversized stages are flagged to the architect.\n"
             f"If you cannot proceed, write {unit_rel}/_DECLARED_FAILURE.md; a cross-phase "
             f"contract change needs {unit_rel}/_CONTRACT_CHANGE_REQUEST.md + stop."
         )

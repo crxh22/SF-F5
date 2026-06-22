@@ -178,7 +178,15 @@ _PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 class PhasePlanStage(BaseModel):
     """One stage row of phase-plan.json: id, name, risk_class, acceptance (criteria text),
-    kind ('backend'|'frontend', optional — None when the plan predates the dimension)."""
+    kind ('backend'|'frontend', optional — None when the plan predates the dimension).
+
+    Integration safety net (step-5) adds three OPTIONAL fields, all nullable so every
+    legacy plan validates byte-unchanged:
+    - acceptance_criteria: the acceptance as a structured list (the size gate counts it);
+    - touched: the files / components / contract-symbols this stage will modify (size gate);
+    - role: 'contract' for a thin seam-freezing stage dependents build against, 'leaf'
+      (or None) otherwise — drives the contract-first reachability check + the floor exemption.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -187,11 +195,14 @@ class PhasePlanStage(BaseModel):
     risk_class: str
     acceptance: str
     kind: Literal["backend", "frontend"] | None = None
+    acceptance_criteria: list[str] | None = None
+    touched: list[str] | None = None
+    role: Literal["contract", "leaf"] | None = None
 
 
 class PhasePlan(BaseModel):
-    """Schema of phase-plan.json: stages[{id, name, risk_class, acceptance, kind?}],
-    dag_edges[[from_id, to_id]]; extra='forbid'."""
+    """Schema of phase-plan.json: stages[{id, name, risk_class, acceptance, kind?,
+    acceptance_criteria?, touched?, role?}], dag_edges[[from_id, to_id]]; extra='forbid'."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -252,6 +263,7 @@ def read_phase_plan(path: Path, risk_classes: Collection[str]) -> PhasePlan:
                 )
 
     _assert_acyclic(plan, path)
+    _assert_contract_reachable(plan, path)
     return plan
 
 
@@ -384,6 +396,175 @@ def _assert_acyclic(plan: PhasePlan, path: Path) -> None:
         raise ArtifactContractError(
             f"phase plan {path}: stage DAG is cyclic (stages in/behind a cycle: {cyclic})"
         )
+
+
+def _assert_contract_reachable(plan: PhasePlan, path: Path) -> None:
+    """Contract-first reachability (integration safety net, step-5): a structural
+    correctness property — like acyclicity — but GATED on the presence of a contract
+    stage so legacy/no-contract plans stay unaffected.
+
+    IFF any stage has role=='contract', every leaf (role!='contract' — both None and
+    'leaf') MUST be a DAG descendant of at least one contract stage (a directed path
+    contract->...->leaf exists in dag_edges); a leaf with no contract ancestor would
+    fan out against an unfrozen seam, defeating the pattern. No contract stage -> skip.
+    Reachability is computed over the already-validated acyclic DAG (BFS from contracts)."""
+    contracts = [s.id for s in plan.stages if s.role == "contract"]
+    if not contracts:
+        return  # backward-compat: no contract stage -> the property does not apply
+    adjacency: dict[str, list[str]] = {stage.id: [] for stage in plan.stages}
+    for from_id, to_id in plan.dag_edges:
+        adjacency[from_id].append(to_id)
+    reachable: set[str] = set()
+    frontier = list(contracts)
+    while frontier:
+        node = frontier.pop()
+        for nxt in adjacency[node]:
+            if nxt not in reachable:
+                reachable.add(nxt)
+                frontier.append(nxt)
+    orphans = sorted(
+        s.id for s in plan.stages if s.role != "contract" and s.id not in reachable
+    )
+    if orphans:
+        raise ArtifactContractError(
+            f"phase plan {path}: contract-first reachability violated — leaf stage(s) "
+            f"{orphans} have no contract-stage ancestor (every non-contract stage must "
+            f"be a DAG descendant of a role='contract' stage {sorted(contracts)})"
+        )
+
+
+# ------------------------------------------------------- small-stage size gate
+
+
+@dataclass(frozen=True)
+class StageSizeLimits:
+    """Upper/lower bounds for the mechanical small-stage gate (Doctrine §14 tunables,
+    mirrored in factory.config.yaml ``planning.stage_size_limits``). Plain dataclass so
+    artifacts.py keeps its light dependency surface (models + db); the scheduler builds
+    one from the validated config."""
+
+    max_acceptance_criteria: int
+    max_touched: int
+    max_dependency_degree: int
+    min_acceptance_criteria: int
+    min_touched: int
+
+
+@dataclass(frozen=True)
+class StageSizeViolation:
+    """One finding of ``evaluate_stage_sizes`` — never raised, only reported (the gate
+    WARNs by default, it does not block). ``kind``: 'over' (above an upper limit),
+    'under' (below the over-split floor), 'skipped' (the axis is un-checkable because
+    the plan omitted the field — recorded so the gap is VISIBLE, never silent).
+    ``value``/``limit`` are None on a 'skipped' entry."""
+
+    stage_id: str
+    axis: Literal["acceptance_criteria", "touched", "dependency_degree"]
+    kind: Literal["over", "under", "skipped"]
+    value: int | None
+    limit: int | None
+
+
+def evaluate_stage_sizes(
+    plan: PhasePlan, limits: StageSizeLimits
+) -> list[StageSizeViolation]:
+    """Pure mechanical small-stage gate (integration safety net, step-5): score each
+    stage on three axes and RETURN the violations — this NEVER raises and NEVER blocks
+    (the scheduler decides warn-vs-hard from config).
+
+    Per stage:
+    - criteria_count = len(acceptance_criteria) if not None else None (None -> un-checkable);
+    - touched_count  = len(touched) if not None else None (None -> un-checkable);
+    - degree = in-degree + out-degree in dag_edges (ALWAYS computable).
+
+    A finding is emitted when:
+    - criteria_count is not None and > max_acceptance_criteria  -> over;
+    - touched_count  is not None and > max_touched              -> over;
+    - degree                          > max_dependency_degree   -> over;
+    - over-split FLOOR: criteria_count is not None and < min_acceptance_criteria AND
+      touched_count is not None and < min_touched -> under (BOTH structured axes thin),
+      UNLESS role=='contract' (contract stages are intentionally thin — exempt from the
+      floor, still subject to the upper limits).
+    For each axis that is None (un-checkable on a legacy plan) a kind='skipped' entry is
+    recorded for that axis so the visibility gap is never silent."""
+    degree_in: dict[str, int] = {stage.id: 0 for stage in plan.stages}
+    degree_out: dict[str, int] = {stage.id: 0 for stage in plan.stages}
+    for from_id, to_id in plan.dag_edges:
+        degree_out[from_id] += 1
+        degree_in[to_id] += 1
+
+    violations: list[StageSizeViolation] = []
+    for stage in plan.stages:
+        criteria_count = (
+            len(stage.acceptance_criteria)
+            if stage.acceptance_criteria is not None
+            else None
+        )
+        touched_count = len(stage.touched) if stage.touched is not None else None
+        degree = degree_in[stage.id] + degree_out[stage.id]
+
+        # Un-checkable axes -> visible 'skipped' entries (never silent).
+        if criteria_count is None:
+            violations.append(
+                StageSizeViolation(stage.id, "acceptance_criteria", "skipped", None, None)
+            )
+        if touched_count is None:
+            violations.append(
+                StageSizeViolation(stage.id, "touched", "skipped", None, None)
+            )
+
+        # Upper bounds (all axes, contract stages included).
+        if criteria_count is not None and criteria_count > limits.max_acceptance_criteria:
+            violations.append(
+                StageSizeViolation(
+                    stage.id,
+                    "acceptance_criteria",
+                    "over",
+                    criteria_count,
+                    limits.max_acceptance_criteria,
+                )
+            )
+        if touched_count is not None and touched_count > limits.max_touched:
+            violations.append(
+                StageSizeViolation(
+                    stage.id, "touched", "over", touched_count, limits.max_touched
+                )
+            )
+        if degree > limits.max_dependency_degree:
+            violations.append(
+                StageSizeViolation(
+                    stage.id,
+                    "dependency_degree",
+                    "over",
+                    degree,
+                    limits.max_dependency_degree,
+                )
+            )
+
+        # Over-split floor: both structured axes present AND both under their minima,
+        # and the stage is not an (intentionally thin) contract stage.
+        if (
+            stage.role != "contract"
+            and criteria_count is not None
+            and criteria_count < limits.min_acceptance_criteria
+            and touched_count is not None
+            and touched_count < limits.min_touched
+        ):
+            violations.append(
+                StageSizeViolation(
+                    stage.id,
+                    "acceptance_criteria",
+                    "under",
+                    criteria_count,
+                    limits.min_acceptance_criteria,
+                )
+            )
+            violations.append(
+                StageSizeViolation(
+                    stage.id, "touched", "under", touched_count, limits.min_touched
+                )
+            )
+    return violations
 
 
 # --------------------------------------------------- validation-sidecar contract

@@ -250,3 +250,17 @@ canon:
   # (doctrine+conventions+founder_protocol+architect_ops); spec_agent is a pipeline
   # role → it gets doctrine+conventions+architect_ops (no founder_protocol).
   architect_roles: [main_architect, phase_architect, spec_agent]
+
+planning:
+  # Integration safety net (step-5): the mechanical small-stage size gate (Doctrine §14
+  # tunables). Upper bounds cap a stage at one-pass builder confidence; the floor (min_*)
+  # flags over-split. Each min must be < its max (cross-checked in config.py).
+  stage_size_limits:
+    max_acceptance_criteria: 7
+    max_touched: 6
+    max_dependency_degree: 6
+    min_acceptance_criteria: 1
+    min_touched: 1
+  # warn -> the gate REPORTS (oversized_stage event + non-blocking escalation) and ingest
+  # proceeds; hard -> blocking. Starts at warn so the change is inert for every plan.
+  stage_size_gate_mode: warn

@@ -452,6 +452,191 @@ def test_read_phase_plan_rejects_unsafe_stage_ids(tmp_path: Path, bad_id: str):
         artifacts.read_phase_plan(path, RISK_CLASSES)
 
 
+# ------------------------------------- step-5: new nullable schema fields
+
+
+def test_read_phase_plan_new_fields_omitted_default_none(tmp_path: Path):
+    """Backward compat: a plan with only the legacy keys parses, and the three
+    step-5 fields default to None (every legacy plan validates unchanged)."""
+    path = _write_plan(tmp_path, _plan(["a"], []))
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert plan.stages[0].acceptance_criteria is None
+    assert plan.stages[0].touched is None
+    assert plan.stages[0].role is None
+
+
+def test_read_phase_plan_accepts_new_nullable_fields(tmp_path: Path):
+    payload = _plan(["c", "leaf"], [["c", "leaf"]])
+    payload["stages"][0].update(
+        {"role": "contract", "acceptance_criteria": ["x"], "touched": ["api.py"]}
+    )
+    payload["stages"][1].update(
+        {"role": "leaf", "acceptance_criteria": ["y", "z"], "touched": ["svc.py", "ui.tsx"]}
+    )
+    path = _write_plan(tmp_path, payload)
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert plan.stages[0].role == "contract"
+    assert plan.stages[0].acceptance_criteria == ["x"]
+    assert plan.stages[1].touched == ["svc.py", "ui.tsx"]
+
+
+def test_read_phase_plan_rejects_unknown_role(tmp_path: Path):
+    payload = _plan(["a"], [])
+    payload["stages"][0]["role"] = "seam"  # not in Literal['contract','leaf']
+    path = _write_plan(tmp_path, payload)
+    with pytest.raises(ArtifactContractError):
+        artifacts.read_phase_plan(path, RISK_CLASSES)
+
+
+# ------------------------------ step-5: contract-first reachability (HARD, gated)
+
+
+def test_contract_reachability_skipped_when_no_contract_stage(tmp_path: Path):
+    # No role='contract' stage anywhere -> the property does not apply; a plan with
+    # disconnected leaves validates exactly as a legacy plan would.
+    path = _write_plan(tmp_path, _plan(["a", "b"], []))
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert [s.id for s in plan.stages] == ["a", "b"]
+
+
+def test_contract_reachability_ok_when_leaf_descends_from_contract(tmp_path: Path):
+    payload = _plan(["c", "x", "y"], [["c", "x"], ["x", "y"]])  # c -> x -> y chain
+    payload["stages"][0]["role"] = "contract"
+    path = _write_plan(tmp_path, payload)
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert plan.stages[0].role == "contract"
+
+
+def test_contract_reachability_raises_for_orphan_leaf(tmp_path: Path):
+    # 'orphan' has no path from the contract stage -> hard raise naming it.
+    payload = _plan(["c", "x", "orphan"], [["c", "x"]])
+    payload["stages"][0]["role"] = "contract"
+    path = _write_plan(tmp_path, payload)
+    with pytest.raises(ArtifactContractError, match="orphan"):
+        artifacts.read_phase_plan(path, RISK_CLASSES)
+
+
+def test_contract_reachability_explicit_leaf_role_still_enforced(tmp_path: Path):
+    # role='leaf' (not just None) is treated as a leaf and must be reachable.
+    payload = _plan(["c", "lonely"], [])
+    payload["stages"][0]["role"] = "contract"
+    payload["stages"][1]["role"] = "leaf"
+    path = _write_plan(tmp_path, payload)
+    with pytest.raises(ArtifactContractError, match="lonely"):
+        artifacts.read_phase_plan(path, RISK_CLASSES)
+
+
+# --------------------------------------- step-5: evaluate_stage_sizes (pure, no-raise)
+
+
+_LIMITS = artifacts.StageSizeLimits(
+    max_acceptance_criteria=7,
+    max_touched=6,
+    max_dependency_degree=6,
+    min_acceptance_criteria=1,
+    min_touched=1,
+)
+
+
+def _sized_plan(stages: list[dict], edges) -> artifacts.PhasePlan:
+    """Build a PhasePlan directly (bypasses read_phase_plan) for size-gate unit tests."""
+    rows = []
+    for i, extra in enumerate(stages):
+        row = {"id": f"s{i}", "name": f"S{i}", "risk_class": "routine", "acceptance": "a"}
+        row.update(extra)
+        rows.append(row)
+    return artifacts.PhasePlan(stages=rows, dag_edges=edges)
+
+
+def test_evaluate_stage_sizes_clean_plan_no_violations(tmp_path: Path):
+    plan = _sized_plan(
+        [
+            {"acceptance_criteria": ["a", "b"], "touched": ["f.py", "g.py"]},
+            {"acceptance_criteria": ["c", "d"], "touched": ["h.py"]},
+        ],
+        [["s0", "s1"]],
+    )
+    assert artifacts.evaluate_stage_sizes(plan, _LIMITS) == []
+
+
+def test_evaluate_stage_sizes_flags_over_criteria():
+    plan = _sized_plan(
+        [{"acceptance_criteria": [str(n) for n in range(8)], "touched": ["a"]}], []
+    )
+    overs = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "over"]
+    assert any(v.axis == "acceptance_criteria" and v.value == 8 and v.limit == 7 for v in overs)
+
+
+def test_evaluate_stage_sizes_flags_over_touched():
+    plan = _sized_plan(
+        [{"acceptance_criteria": ["a"], "touched": [f"f{n}.py" for n in range(7)]}], []
+    )
+    overs = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "over"]
+    assert any(v.axis == "touched" and v.value == 7 and v.limit == 6 for v in overs)
+
+
+def test_evaluate_stage_sizes_flags_over_degree():
+    # s0 has out-degree 7 (>6) -> flagged on dependency_degree.
+    targets = list(range(1, 8))
+    stages = [{"acceptance_criteria": ["a"], "touched": ["f.py"]} for _ in range(8)]
+    edges = [["s0", f"s{t}"] for t in targets]
+    plan = _sized_plan(stages, edges)
+    overs = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "over"]
+    assert any(v.stage_id == "s0" and v.axis == "dependency_degree" and v.value == 7 for v in overs)
+
+
+def test_evaluate_stage_sizes_floor_flags_sub_min_leaf():
+    # Both structured axes empty (<1) and not a contract stage -> 'under' on both.
+    plan = _sized_plan([{"acceptance_criteria": [], "touched": []}], [])
+    unders = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "under"]
+    assert {v.axis for v in unders} == {"acceptance_criteria", "touched"}
+
+
+def test_evaluate_stage_sizes_contract_exempt_from_floor():
+    # Same sub-min thinness, but role='contract' -> NO 'under' finding (exempt).
+    plan = _sized_plan(
+        [{"acceptance_criteria": [], "touched": [], "role": "contract"}], []
+    )
+    unders = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "under"]
+    assert unders == []
+
+
+def test_evaluate_stage_sizes_contract_still_subject_to_upper_limits():
+    # A contract stage is exempt from the floor but NOT the ceilings.
+    plan = _sized_plan(
+        [{"acceptance_criteria": [str(n) for n in range(8)], "touched": ["a"],
+          "role": "contract"}],
+        [],
+    )
+    overs = [v for v in artifacts.evaluate_stage_sizes(plan, _LIMITS) if v.kind == "over"]
+    assert any(v.axis == "acceptance_criteria" for v in overs)
+
+
+def test_evaluate_stage_sizes_none_axes_recorded_as_skipped():
+    # Legacy stage: no acceptance_criteria, no touched -> both axes 'skipped',
+    # degree still computed (no over here), no over/under.
+    plan = _sized_plan([{}], [])
+    result = artifacts.evaluate_stage_sizes(plan, _LIMITS)
+    skipped = {v.axis for v in result if v.kind == "skipped"}
+    assert skipped == {"acceptance_criteria", "touched"}
+    assert all(v.kind == "skipped" for v in result)
+
+
+def test_evaluate_stage_sizes_legacy_plan_all_skipped(tmp_path: Path):
+    # A fully legacy validated plan (only acceptance:str) -> every axis skipped,
+    # no over/under, and the function never raises.
+    path = _write_plan(tmp_path, _plan(["a", "b"], [["a", "b"]]))
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    result = artifacts.evaluate_stage_sizes(plan, _LIMITS)
+    assert result and all(v.kind == "skipped" for v in result)
+    assert {(v.stage_id, v.axis) for v in result} == {
+        ("a", "acceptance_criteria"),
+        ("a", "touched"),
+        ("b", "acceptance_criteria"),
+        ("b", "touched"),
+    }
+
+
 # ---------------------------------------------------------------- sentinels
 
 

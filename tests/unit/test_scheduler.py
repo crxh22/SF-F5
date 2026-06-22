@@ -1793,6 +1793,173 @@ async def test_phase_ingest_threads_stage_kind_through_to_row(db, config_dict) -
     assert plain is not None and plain.kind is None
 
 
+def _write_phase_plan(cfg: FactoryConfig, db, phase_id: str, plan: dict) -> None:
+    """Seed a CONTRACTS_FROZEN phase + its phase-plan.json sidecar on disk."""
+    insert_phase(db, phase_id, PhaseState.CONTRACTS_FROZEN)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / phase_id
+    plan_dir = worktree / "_factory" / "phases" / phase_id
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "phase-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+
+async def test_phase_ingest_size_gate_warn_emits_event_escalation_and_proceeds(
+    db, config_dict
+) -> None:
+    """step-5 integration safety net (warn mode, the default): an oversized stage at
+    ingest -> an `oversized_stage` event + a non-blocking escalation row, AND ingest
+    still proceeds (RUNNING, stage rows created). The merge-gate loop-cap is untouched."""
+    cfg = make_config(config_dict)  # no planning section -> defaults: warn, max_touched=6
+    _write_phase_plan(
+        cfg,
+        db,
+        "ph",
+        {
+            "stages": [
+                {
+                    "id": "big",
+                    "name": "big",
+                    "risk_class": "routine",
+                    "acceptance": "a",
+                    "touched": [f"f{n}.py" for n in range(7)],  # 7 > max_touched(6)
+                }
+            ],
+            "dag_edges": [],
+        },
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    # Ingest PROCEEDED (warn never blocks): phase RUNNING, the stage row exists.
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    assert fdb.get_stage(db.read(), "ph.big") is not None
+    # The finding is visible: an oversized_stage event naming the axis + a non-
+    # blocking escalation to the architect.
+    oversized = events_of(db, "ph", "oversized_stage")
+    assert oversized
+    payload = json.loads(oversized[0]["payload_json"])
+    assert payload["axis"] == "touched" and payload["value"] == 7 and payload["limit"] == 6
+    rows = open_escalations(db, "ph")
+    assert any(r["trigger"] == "stage_size_gate" for r in rows)
+
+
+async def test_phase_ingest_size_gate_skipped_event_for_legacy_plan(
+    db, config_dict
+) -> None:
+    """A legacy plan (no acceptance_criteria/touched) ingests cleanly but records
+    `size_gate_skipped` events (the un-checkable axes are visible, never silent),
+    no oversized_stage events, and no size-gate escalation."""
+    cfg = make_config(config_dict)
+    _write_phase_plan(
+        cfg,
+        db,
+        "ph",
+        {
+            "stages": [
+                {"id": "s1", "name": "one", "risk_class": "routine", "acceptance": "a"},
+            ],
+            "dag_edges": [],
+        },
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    assert events_of(db, "ph", "size_gate_skipped")
+    assert events_of(db, "ph", "oversized_stage") == []
+    assert all(r["trigger"] != "stage_size_gate" for r in open_escalations(db, "ph"))
+
+
+async def test_phase_ingest_size_gate_clean_plan_silent(db, config_dict) -> None:
+    """A within-limits plan with both structured axes present emits NEITHER an
+    oversized_stage NOR a size_gate_skipped event — the happy path stays quiet."""
+    cfg = make_config(config_dict)
+    _write_phase_plan(
+        cfg,
+        db,
+        "ph",
+        {
+            "stages": [
+                {"id": "s1", "name": "one", "risk_class": "routine", "acceptance": "a",
+                 "acceptance_criteria": ["x", "y"], "touched": ["f.py", "g.py"]},
+                {"id": "s2", "name": "two", "risk_class": "routine", "acceptance": "b",
+                 "acceptance_criteria": ["z"], "touched": ["h.py"]},
+            ],
+            "dag_edges": [["s1", "s2"]],
+        },
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    assert events_of(db, "ph", "oversized_stage") == []
+    assert events_of(db, "ph", "size_gate_skipped") == []
+    assert all(r["trigger"] != "stage_size_gate" for r in open_escalations(db, "ph"))
+
+
+async def test_phase_ingest_size_gate_hard_mode_blocks(db, config_dict) -> None:
+    """In hard mode an over/under violation BLOCKS ingest: no state change (no
+    ESCALATED edge from CONTRACTS_FROZEN), the escalation + event still land, and
+    NO stage rows are created — distinct from warn, which proceeds."""
+    config_dict["planning"] = {"stage_size_gate_mode": "hard"}
+    cfg = make_config(config_dict)
+    _write_phase_plan(
+        cfg,
+        db,
+        "ph",
+        {
+            "stages": [
+                {"id": "big", "name": "big", "risk_class": "routine", "acceptance": "a",
+                 "touched": [f"f{n}.py" for n in range(7)]},
+            ],
+            "dag_edges": [],
+        },
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.CONTRACTS_FROZEN  # blocked, no transition
+    assert fdb.get_stage(db.read(), "ph.big") is None  # no stage rows ingested
+    assert events_of(db, "ph", "oversized_stage")
+    assert any(r["trigger"] == "stage_size_gate" for r in open_escalations(db, "ph"))
+
+
+async def test_contract_first_leaf_waits_until_contract_stage_done(db, config_dict) -> None:
+    """Contract-first end-to-end (reuses the existing DAG + deps_done): a plan with a
+    role='contract' stage and a leaf edge contract->leaf ingests; the leaf is NOT
+    runnable (deps_done False) until the contract stage reaches DONE — the safety net
+    rides the SAME deps_done gate, no new wait mechanism."""
+    cfg = make_config(config_dict)
+    _write_phase_plan(
+        cfg,
+        db,
+        "ph",
+        {
+            "stages": [
+                {"id": "contract", "name": "seam", "risk_class": "routine",
+                 "acceptance": "freeze", "role": "contract",
+                 "acceptance_criteria": ["schema frozen"], "touched": ["api.py"]},
+                {"id": "leaf", "name": "impl", "risk_class": "routine",
+                 "acceptance": "build", "role": "leaf",
+                 "acceptance_criteria": ["endpoint works"], "touched": ["svc.py"]},
+            ],
+            "dag_edges": [["contract", "leaf"]],
+        },
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    # Leaf blocked while the contract stage is PENDING; contract itself is runnable.
+    assert fdb.deps_done(db.read(), Level.STAGE, "ph.contract")
+    assert not fdb.deps_done(db.read(), Level.STAGE, "ph.leaf")
+    # Drive the contract stage to DONE -> the leaf becomes runnable.
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.contract", StageState.DONE.value)
+    assert fdb.deps_done(db.read(), Level.STAGE, "ph.leaf")
+    # No size-gate noise: both stages are within limits.
+    assert events_of(db, "ph", "oversized_stage") == []
+
+
 async def test_phase_rejects_cyclic_plan_without_silent_state_change(
     db, config_dict
 ) -> None:
