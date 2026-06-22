@@ -147,6 +147,7 @@ class FakeSessionRunner:
         cp_id: str | None = None,
         timeout_s: int | None = None,
         resume_session: str | None = None,
+        stage_kind: str | None = None,
     ) -> AgentResult:
         self.calls.append(
             SimpleNamespace(

@@ -362,6 +362,12 @@ class CanonInjectCfg(_StrictModel):
     # = pre-D-0040 behavior (no architect layer). The Main-Architect session takes
     # this layer via the launcher's flat CANON_FILES instead.
     architect: list[str] = []
+    # An ADDITIVE front-gated layer — appended on top of the base bundle for a
+    # stage agent (builder/validator/auditor) only when the stage's kind is
+    # 'frontend' (runner._canon_text stage_kind). Default empty = no frontend
+    # layer. Never composed for consultation calls (pure functions) or backend/
+    # kind=None stages.
+    frontend: list[str] = []
 
 
 class CanonCfg(_StrictModel):
@@ -378,7 +384,13 @@ class CanonCfg(_StrictModel):
     @model_validator(mode="after")
     def _check_inject_refs(self) -> CanonCfg:
         declared = set(self.files)
-        bundles = ("pipeline_agents", "founder_facing", "consultation_points", "architect")
+        bundles = (
+            "pipeline_agents",
+            "founder_facing",
+            "consultation_points",
+            "architect",
+            "frontend",
+        )
         for bundle_name in bundles:
             for key in getattr(self.inject, bundle_name):
                 if key not in declared:

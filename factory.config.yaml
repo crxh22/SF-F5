@@ -228,11 +228,13 @@ canon:
     conventions: work-protocols/conventions.md
     founder_protocol: work-protocols/protocol_interactiune_founder.md
     architect_ops: work-protocols/architect-operations.md   # D-0040
+    ui_ux_laws: work-protocols/ui-ux-laws.md   # binding UI/UX laws, injected ONLY on frontend stages
   inject:
     pipeline_agents: [doctrine, conventions]            # every role producing artifacts or judgment
     founder_facing: [doctrine, conventions, founder_protocol]
     consultation_points: []   # pure functions, mechanically validated; flip on if DoD §13 CP-quality trigger fires
     architect: [architect_ops]   # D-0040: ADDITIVE layer, composed onto the base bundle for architect_roles
+    frontend: [ui_ux_laws]   # ADDITIVE front-gated layer: composed on top for stage_kind=='frontend' agents (builder/validator/auditor), NOT consultation
   founder_facing_roles: [intake, decision_session, main_architect, phase_architect, notify]
   # D-0040: architect-class roles take the architect layer ON TOP of their base bundle.
   # main_architect/phase_architect are also founder-facing → they get the UNION

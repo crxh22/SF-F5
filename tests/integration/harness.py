@@ -435,3 +435,6 @@ def _write_canon_files(home: Path) -> None:
     (protocols / "architect-operations.md").write_text(  # D-0040
         "architect operations body\n", encoding="utf-8"
     )
+    (protocols / "ui-ux-laws.md").write_text(  # front-gated frontend layer
+        "ui ux laws body\n", encoding="utf-8"
+    )

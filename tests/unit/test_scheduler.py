@@ -237,6 +237,7 @@ class FakeRunner:
         cp_id: str | None = None,
         timeout_s: int | None = None,
         resume_session: str | None = None,
+        stage_kind: str | None = None,
     ) -> AgentResult:
         self.calls.append(
             SimpleNamespace(
@@ -245,6 +246,7 @@ class FakeRunner:
                 unit_id=unit_id,
                 cwd=Path(cwd),
                 resume_session=resume_session,
+                stage_kind=stage_kind,
             )
         )
         if self.db is not None:

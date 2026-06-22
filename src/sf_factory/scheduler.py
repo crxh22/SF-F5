@@ -1798,6 +1798,7 @@ class StageExecutor:
             unit_id=stage.id,
             cwd=cwd,
             resume_session=resume_session,
+            stage_kind=stage.kind,
         )
         # CCR-6: capacity-event scan before anything consumes the result — a
         # usage-limited CLI exits "successfully" with a refusal text, and the

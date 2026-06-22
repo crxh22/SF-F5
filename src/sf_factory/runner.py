@@ -542,6 +542,7 @@ class AgentRunner:
         cp_id: str | None = None,
         timeout_s: int | None = None,
         resume_session: str | None = None,
+        stage_kind: str | None = None,
     ) -> AgentResult:
         """Spawn per config models[role] in its OWN process group (start_new_session=True;
         Linux backstop PR_SET_PDEATHSIG=SIGKILL via preexec_fn — agent trees must die with
@@ -566,7 +567,7 @@ class AgentRunner:
                 "print mode only (OPEN-4); interactive sessions are operator-driven"
             )
         adapter = self._adapters[route.cli]
-        canon = self._canon_text(role=role, kind=kind)
+        canon = self._canon_text(role=role, kind=kind, stage_kind=stage_kind)
         # D-0029: snapshot cwd/AGENTS.md BEFORE the adapter may materialize it —
         # the artifact is deleted/restored in the supervision `finally` below so
         # it never outlives the run (see _AGENTS_MD).
@@ -879,15 +880,22 @@ class AgentRunner:
                 f"run_agent spawns kind 'agent' or 'consultation' only, got {kind!r}"
             )
 
-    def _canon_text(self, *, role: str, kind: str) -> str | None:
+    def _canon_text(
+        self, *, role: str, kind: str, stage_kind: str | None = None
+    ) -> str | None:
         """Assemble the canon bundle for the role class (D-0009): consultation
         points get cfg.canon.inject.consultation_points (empty by default),
         founder-facing roles the founder_facing bundle, every other pipeline
         agent the pipeline_agents bundle. D-0040: the architect layer
         (cfg.canon.inject.architect) is then COMPOSED on top for roles in
         cfg.canon.architect_roles — additive, not exclusive, so a role that is
-        both founder-facing and architect gets the union (deduped). Missing/empty
-        canon file = spawn impossibility — a partial canon is worse than a noisy stop."""
+        both founder-facing and architect gets the union (deduped). The frontend
+        layer (cfg.canon.inject.frontend) is COMPOSED the same way when
+        ``stage_kind == 'frontend'`` (the binding UI/UX laws reach every
+        frontend-stage agent — builder/validator/auditor — and ONLY them; backend
+        and kind=None stages get nothing extra; consultation never takes it).
+        Missing/empty canon file = spawn impossibility — a partial canon is worse
+        than a noisy stop."""
         canon = self._cfg.canon
         if kind == "consultation":
             keys = list(canon.inject.consultation_points)
@@ -901,6 +909,14 @@ class AgentRunner:
         # calls are pure functions and never take it.
         if kind != "consultation" and role in canon.architect_roles:
             for key in canon.inject.architect:
+                if key not in keys:
+                    keys.append(key)
+        # The frontend layer is ADDITIVE the same way — composed on top for a
+        # stage agent only when the stage is a frontend stage (front-gated; backend
+        # and kind=None stages get nothing extra). Deduped, order-preserved.
+        # Consultation calls are pure functions and never take it.
+        if kind != "consultation" and stage_kind == "frontend":
+            for key in canon.inject.frontend:
                 if key not in keys:
                     keys.append(key)
         if not keys:

@@ -43,6 +43,7 @@ CANON_CONVENTIONS = "conventions body marker-C\n"
 CANON_FOUNDER = "founder protocol body marker-F\n"
 _RS_AT = "2026-06-20T12:00:00Z"  # founder dashboard write timestamp (runtime_settings)
 CANON_ARCHITECT = "architect operations body marker-A\n"  # D-0040
+CANON_UX = "ui ux laws body marker-U\n"  # front-gated frontend layer
 
 
 def _write_canon_files(home: Path) -> None:
@@ -55,6 +56,9 @@ def _write_canon_files(home: Path) -> None:
     )
     (protocols / "architect-operations.md").write_text(  # D-0040
         CANON_ARCHITECT, encoding="utf-8"
+    )
+    (protocols / "ui-ux-laws.md").write_text(  # front-gated frontend layer
+        CANON_UX, encoding="utf-8"
     )
 
 
@@ -585,6 +589,54 @@ def test_canon_architect_layer_composition(renv: SimpleNamespace) -> None:
     assert markers("spec_agent") == (False, True)        # architect, not founder-facing
     assert markers("builder_routine") == (False, False)  # plain pipeline → neither
     assert markers("spec_agent", "consultation") == (False, False)  # pure function: no layer
+
+
+def test_canon_frontend_layer_is_front_gated(renv: SimpleNamespace) -> None:
+    """The frontend UI/UX-laws layer is ADDITIVE and front-gated: it reaches every
+    frontend-stage agent (builder, validator, auditor — claude AND codex) and ONLY
+    them. backend / kind=None stages get nothing extra; consultation never takes
+    it. The base bundle is untouched in every case."""
+
+    def has_ux(role: str, stage_kind: str | None, kind: str = "agent") -> bool:
+        txt = renv.runner._canon_text(role=role, kind=kind, stage_kind=stage_kind) or ""
+        return CANON_UX.strip() in txt
+
+    for role in ("builder_routine", "validator", "auditor_cross_model"):
+        assert has_ux(role, "frontend") is True       # frontend stage → laws injected
+        assert has_ux(role, "backend") is False        # backend stage → nothing extra
+        assert has_ux(role, None) is False             # untagged stage → nothing extra
+    # The base bundle is never lost when the frontend layer composes on top.
+    fe_txt = renv.runner._canon_text(role="builder_routine", kind="agent", stage_kind="frontend")
+    assert CANON_DOCTRINE.strip() in fe_txt and CANON_CONVENTIONS.strip() in fe_txt
+    # Consultation calls are pure functions: the frontend layer never composes.
+    assert has_ux("cp1_triage", "frontend", kind="consultation") is False
+
+
+def test_canon_frontend_layer_reaches_codex_agents_md(
+    renv: SimpleNamespace, tmp_path: Path
+) -> None:
+    """Codex parity (D-0009): a codex frontend-stage agent gets the SAME bundle
+    materialized as AGENTS.md, so the UI/UX laws reach it too. Build the frontend
+    bundle the runner would assemble for a codex role (auditor_cross_model) and
+    feed it through CodexAdapter.materialize_workspace — the written AGENTS.md must
+    carry the UX-laws marker. The backend bundle for the same role must NOT."""
+    fe_bundle = renv.runner._canon_text(
+        role="auditor_cross_model", kind="agent", stage_kind="frontend"
+    )
+    assert fe_bundle is not None and CANON_UX.strip() in fe_bundle
+    fe_ws = tmp_path / "codex-fe"
+    fe_ws.mkdir()
+    CodexAdapter().materialize_workspace(fe_ws, fe_bundle)
+    assert CANON_UX.strip() in (fe_ws / "AGENTS.md").read_text(encoding="utf-8")
+
+    be_bundle = renv.runner._canon_text(
+        role="auditor_cross_model", kind="agent", stage_kind="backend"
+    )
+    assert be_bundle is not None and CANON_UX.strip() not in be_bundle
+    be_ws = tmp_path / "codex-be"
+    be_ws.mkdir()
+    CodexAdapter().materialize_workspace(be_ws, be_bundle)
+    assert CANON_UX.strip() not in (be_ws / "AGENTS.md").read_text(encoding="utf-8")
 
 
 async def test_consultation_gets_no_canon_and_is_tagged(renv: SimpleNamespace) -> None:

@@ -114,6 +114,17 @@ A delivery failure NEVER tears down the loop: it logs ONE `alert_delivery_failed
 per failure streak (`kind` carries which signal) and retries next tick — the same contract
 as the stall / decision-latency pages.
 
+## 5. Frontend work — the binding UI/UX laws live in `work-protocols/ui-ux-laws.md`
+
+When you design, plan, or review ANY frontend work (a `kind: frontend` stage — its
+spec, its build, or its audit), the binding UI/UX laws are in
+`work-protocols/ui-ux-laws.md`: the obligatory UX questionnaire (§2), the global UI
+rules (§3), the execution-guarantee mechanism (§4), and the founder's visual-reference
++ UX philosophy + four inviolable laws + design decisions + checklist (§7). Read them
+first — they are factory law, not suggestions. They are injected MECHANICALLY into every
+frontend-stage agent (builder/validator/auditor) and ONLY on frontend stages; you, the
+long-lived architect, carry only this pointer and read the file on demand.
+
 **Your session monitor MUST grep these three event types** (and recognize `[arhitect]`
 ntfy titles) so a successor session learns of escalations within one poll of the threshold
 crossing — see `docs/runbooks/session-succession.md` for the hand-down. The ntfy `[arhitect]`

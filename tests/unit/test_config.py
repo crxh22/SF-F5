@@ -80,6 +80,14 @@ class TestGoldenRealConfig:
         assert set(cfg.canon.inject.pipeline_agents) <= declared
         assert set(cfg.canon.inject.founder_facing) <= declared
         assert set(cfg.canon.inject.consultation_points) <= declared
+        assert set(cfg.canon.inject.architect) <= declared
+        assert set(cfg.canon.inject.frontend) <= declared
+
+    def test_canon_frontend_bundle_carries_ui_ux_laws(self, cfg: FactoryConfig):
+        # The front-gated layer references the binding UI/UX-laws file (Part B):
+        # frontend stages get the laws, and the key resolves to a declared file.
+        assert "ui_ux_laws" in cfg.canon.inject.frontend
+        assert "ui_ux_laws" in cfg.canon.files
 
     def test_watchdog_staleness_documented_relation(self, cfg: FactoryConfig):
         watchdog = cfg.founder_channel.watchdog
@@ -234,6 +242,12 @@ class TestSchemaRejection:
     def test_unknown_nested_key_route(self, tmp_path, config_dict):
         config_dict["models"]["builder_routine"]["temperature"] = 0.2
         _expect_config_error(tmp_path, config_dict)
+
+    def test_canon_inject_frontend_undeclared_key_rejected(self, tmp_path, config_dict):
+        # _check_inject_refs must validate the frontend bundle like the others:
+        # a key not in canon.files is a config error (Part B).
+        config_dict["canon"]["inject"]["frontend"] = ["nonexistent_key"]
+        _expect_config_error(tmp_path, config_dict, match="frontend")
 
     def test_missing_section(self, tmp_path, config_dict):
         del config_dict["escalation"]
