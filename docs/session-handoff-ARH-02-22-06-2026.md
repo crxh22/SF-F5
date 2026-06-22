@@ -69,8 +69,8 @@ directive set + rationale = memory [[erp-rebuild-redesign-22-06]] (read it).
   aggressive cuts (scope Tier-2 payload / scope suite). · **Codex cross-verifies the new plan before "ready".**
 
 ## ⏳ REMAINING PREP (in order; do before the structure-authoring)
-1. **Step 2 — codex-back ROUTING. ⚠️ AWAITING FOUNDER NOD** on: builder routed by back/front → routine-FRONT
-   uses opus not sonnet (he was told; awaiting "da"). Work: add `builder_backend`(codex)/`builder_frontend`(opus)
+1. **Step 2 — codex-back ROUTING. ✅ FOUNDER APPROVED 22-06** (routine-FRONT → opus OK'd; back→codex, front→opus).
+   Work: add `builder_backend`(codex)/`builder_frontend`(opus)
    + 2-D routing (kind×risk); `_builder_role` keys on RISK today (`scheduler.py ~592`); `kind` is on stages now.
    Lift resume gate: add `"codex"` to `RESUME_VERIFIED_CLIS` (`scheduler.py ~119`) AFTER in-flow verify.
    Reconcile codex pricing (gpt-5.5 list $5/$30; config has $1.25/$10). See research-codex-be-fe-build doc.
