@@ -107,3 +107,27 @@ JSON is authored at execution time (it does not exist yet — see §5.1).
 (schemas); `scheduler.py:4202-4237` (stage ingest), `:5033-5071` (planning prompt), `:3640-3692` (spec
 prompt), `:5629` (drain gate), `:725-763` (proving gate); `factory.config.yaml:9-19,222-240`;
 `docs/runbooks/first-live-run.md:34-38`; `work-protocols/architect-operations.md` (canon home).
+
+## 7. Pre-re-seed factory fixes (incident 22-06 — treasury merge-gate loop)
+
+The `treasury-payments.treasury-app-foundations` stage looped **12×** at the merge gate
+(BUILD→VALIDATE→AUDIT→MERGE_GATE→BUILD) over ~8.5h, burning budget. Validation + audit passed EVERY time
+(the code is fine — only 2 trivial findings total); Tier-1 failed every time on ONE infra bug. ARH-01
+stopped the factory 22-06 ~12:37 UTC to halt the burn. These MUST land before re-seeding (stages run
+again post-seed):
+
+1. **Test-PG socket path overflow (HIGH).** The test Postgres unix socket lives INSIDE the worktree:
+   `.../.worktrees/<stage_id>/.devpg/.s.PGSQL.5433`. For a long `stage_id` this exceeds the OS AF_UNIX
+   limit (**107 bytes**); treasury's 42-char id → **109 bytes** → 1052 DB tests ERROR → merge gate fails
+   → rework (`build_noop`, nothing to fix) → infinite loop. **Fix:** relocate the socket to a SHORT,
+   name-length-independent dir (e.g. `/tmp/devpg-<shorthash>/` via `PGHOST`) in the workspace test-PG
+   setup. (The unix socket itself came from the pg-in-agents AF_INET fix, propagated to erp-workspace
+   `main`.) **Belt-and-suspenders:** keep layer stage-ids SHORT — budget
+   `45 (fixed prefix) + len(stage_id) + 21 (/.devpg/.s.PGSQL.5433) ≤ 107` → `len(stage_id) ≤ ~40`.
+2. **Merge-gate loop-cap (MEDIUM — Doctrine §8/§20).** The factory bounced the merge gate 12× with NO
+   escalation and NO cap — a silent infinite loop that drain does NOT stop (drain holds new spawns, not
+   in-flight rework). **Fix:** after N consecutive same-gate (Tier-1) failures with a `build_noop`
+   rework, ESCALATE + halt the stage instead of re-looping. The counter + cap go in the scheduler's
+   merge-gate path (`scheduler.py`, the `tier1_gate` / MERGE_GATE→BUILD logic).
+3. **Short stage-ids constraint (carry into §5.1 authoring).** Until fix #1 lands, the per-layer
+   stage-ids in the seed JSON MUST satisfy the ≤~40-char budget above.
