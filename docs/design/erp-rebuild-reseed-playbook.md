@@ -131,3 +131,72 @@ again post-seed):
    merge-gate path (`scheduler.py`, the `tier1_gate` / MERGE_GATE→BUILD logic).
 3. **Short stage-ids constraint (carry into §5.1 authoring).** Until fix #1 lands, the per-layer
    stage-ids in the seed JSON MUST satisfy the ≤~40-char budget above.
+
+---
+
+## 8. ARH-04 EXECUTION UPDATE (23-06-2026) — supersedes the stale bits above
+
+**§5.1 "author the plans" is DONE.** The structure is authored, dual-audited (opus+codex), reconciled,
+and validated against the live factory code. Artifacts:
+- `docs/projects/erp/rebuild/macro-plan.json` — 10 layer phases, linear DAG (committed `e1adf51`).
+- `docs/projects/erp/rebuild/phase-plans/<l*>/phase-plan.{json,md}` — **40 stages** (20 BE / 20 FE, 14
+  contract, 6 critical). Every plan passes `scripts/validate_phase_plan.py` (read_phase_plan + size gate).
+- `docs/projects/erp/rebuild/STRUCTURE.md` — master view + the **SCOPE BOUNDARY** (deferred domains).
+
+**§7 pre-re-seed fixes — STATUS:** (1) test-PG socket overflow = **DONE on erp-workspace main** (`bb95800`,
+fixed-length `/tmp/sfpg-<hash>/` socket — short-ids NO LONGER load-bearing). (2) merge-gate loop-cap =
+**DONE** (`merge_gate_max_tier1_failures: 3`). (3) short-ids = moot (socket fixed) but ids are short anyway.
+PLUS a NEW fix ARH-04 found + landed: **builder kind×risk routing** (`00c857f`) — backend structural/critical
+now correctly route to **codex** (were silently going to opus; completes Step-2's "backend→codex" intent).
+
+### 8a. THE LANDING-MECHANISM DECISION (founder call — the #1 gate to USABILITY)
+
+`scheduler._step_planning` ALWAYS spawns `phase_architect` to AUTHOR the phase-plan at runtime — there is
+**no pre-place/ingest path**, so the dual-audited structure has no mechanical way to land today (the
+playbook §6 "pre-placing is UNVERIFIED" gotcha is the real gap; the redesign's "phase_architect narrows to
+contracts/spec, not stage-generation" was proposed, never built). Two options:
+
+- **(A) Mechanical ingest-wiring — RECOMMENDED.** Add a config key `projects.<id>.prefrozen_phase_plans:
+  Path|None`. When set, `_step_planning`: (1) copies the ratified `phase-plan.{json,md}` for `<phase_id>`
+  into the worktree, (2) validates via `read_phase_plan`, (3) spawns `phase_architect` with a NARROWED
+  prompt — "the stage plan is FROZEN; author ONLY the intra-phase `_factory/contracts/` seams these stages
+  reference" — and (4) asserts the committed `phase-plan.json` byte-matches the ratified one (else escalate).
+  Result: the dual-audited STAGES are mechanically what runs; the CONTRACTS (interface specs Tier-2
+  validates against) are still LLM-authored per-phase (they need per-phase technical depth). Backward-compat:
+  key unset → today's behavior. Bounded change (~config key + one `_step_planning` branch + tests),
+  dual-audited. This is the **mechanical guarantee** the founder repeatedly demands.
+- **(B) Prompt-adopt — no code.** Commit the phase-plans into the workspace; enrich `_planning_prompt` to
+  "a ratified plan exists at <path> — adopt verbatim, author contracts." Relies on `read_phase_plan` + the
+  proving-ground checkpoint (stop after PLANNING, review, resume). Lower friction; stage-adoption is
+  TRUST-based (the agent could deviate) — NOT a mechanical guarantee.
+
+**Recommendation: A.** It is built AFTER founder approval (it is part of re-seed EXECUTION, founder-gated) —
+NOT pre-built here, because it is a pipeline-semantics change the founder should ratify (Doctrine §12/§13).
+
+### 8b. Updated step sequence (replaces §5 where it differs)
+1. **Founder** approves the structure (STRUCTURE.md) + the scope boundary + picks the landing option.
+2. **[if A] ARH** builds + dual-audits + tests the ingest-wiring; merges. (Post-approval.)
+3. **ARH** exports the **#104 (ASM-006)** contest dossier (`/artifact/1200`) + decision #26 to a
+   carry-forward doc BEFORE archiving the DB; record #26 "superseded by L7 `cont-quote-land`".
+4. **Founder (copy-paste)** disarm watchdog → clean-stop (already stopped; re-confirm 0 agents + pid gone).
+5. **ARH** backup DB; (Strategy A) archive + `sf-factory init` fresh; re-insert `runtime_settings`
+   VERBATIM (`drain.manual=true`, `max_parallel_agents=2`, `budget.critical=500000000`,
+   `budget.routine=80000000`).
+6. **ARH** `sf-factory seed-phases docs/projects/erp/rebuild/macro-plan.json --dry-run` → verify 10
+   phases + 9 edges + anchor → seed for real. (macro-plan MUST be committed & clean — it is, `e1adf51`.)
+7. **ARH** place the pre-authored phase-plans per the landing option (A: set the config key + commit them
+   where it points; B: commit into the worktree path + enrich the prompt).
+8. **ARH** graft the 2 parked branches into the factory-created stage branches: `cont-quote-core` →
+   L7 `cont-quote-land`; `treasury-app-foundations` → L8 `treasury-found`. (Both 1 commit behind main,
+   merge clean — low friction; highest-risk MANUAL step, verify diff.)
+9. **ARH** seed **Diapazon** data — a fiscal range per issuing OwnPJ (registry nomenclature, generic CRUD)
+   — BEFORE the L6 fiscal-invoice gate (its management screen is L9).
+10. **ARH** set `proving_phases: [l0-shell]` in `factory.config.yaml` (prove the new pipeline on the
+    smallest layer before fan-out) + restart-only, so the hold takes effect.
+11. **Founder (copy-paste)** restart factory; verify dashboard bound + recovery + liveness; re-arm
+    watchdog. **Start the session monitor** (factory is live again). **Keep drain ON.**
+12. **ARH** lift drain layer-by-layer as each layer is built + founder-verifies the deployed layer.
+
+### 8c. Preservation (unchanged from §3 — RE-CONFIRM before any mutation)
+Never delete the 2 `stage/*` branches; do NOT reset workspace `main` (foundation+inventory); re-insert
+`runtime_settings`; back up `factory.db`+wal+shm; export the #104 dossier + #26 first.
