@@ -27,18 +27,21 @@ models:
   main_architect:        {cli: claude, model: opus,    mode: interactive}
   phase_architect:       {cli: claude, model: opus,    mode: print, effort: xhigh}
   spec_agent:            {cli: claude, model: opus,    mode: print, effort: xhigh}
-  builder_routine:       {cli: claude, model: sonnet,  mode: print, effort: high}
+  builder_routine:       {cli: claude, model: sonnet,  mode: print, effort: max}
   builder_heavy:         {cli: claude, model: opus,    mode: print, effort: xhigh}
   # 2-D builder routing (kind × risk), founder-approved 22-06: backend stages →
   # codex (gpt-5.5, offload onto the codex limit window for capacity); frontend
   # stages → claude (opus), including routine-risk frontend → opus (UI quality +
   # UX-laws injection). kind=None legacy stages keep builder_routine/builder_heavy
   # above. codex builders mirror auditor_cross_model's route shape (no tools block).
-  builder_backend_routine:  {cli: codex,  model: gpt-5.5, mode: print, effort: high}
+  # EFFORT POLICY (founder 22-06): NO reasoning downgrade on quality roles. codex
+  # ALWAYS xhigh (its ceiling — 'max' is Claude-only, see config.py cross-check); opus
+  # xhigh; sonnet at 'max' (the ONLY sub-opus/sub-codex builder model — mega-light work).
+  builder_backend_routine:  {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
   builder_backend_heavy:    {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
-  builder_frontend_routine: {cli: claude, model: opus,    mode: print, effort: high}
+  builder_frontend_routine: {cli: claude, model: opus,    mode: print, effort: xhigh}
   builder_frontend_heavy:   {cli: claude, model: opus,    mode: print, effort: xhigh}
-  validator:             {cli: claude, model: sonnet,  mode: print, effort: high}
+  validator:             {cli: claude, model: sonnet,  mode: print, effort: max}
   validator_structural:  {cli: claude, model: opus,    mode: print, effort: xhigh}
   # D-0041: integration validator moved codex(gpt-5.5)→opus. Its merge-gate payload
   # = full diff of the gating unit + ALL sibling diffs since contract freeze; that
@@ -63,7 +66,7 @@ models:
   # Decision Sessions are rare, turn-bounded and TOOLS-OFF (structural no-write
   # enforcement); founder-facing trade-off reasoning warrants the strongest model
   # (D-0017, OPEN-D3 resolved).
-  decision_session:      {cli: claude, model: opus,    mode: print, tools: none, effort: high}
+  decision_session:      {cli: claude, model: opus,    mode: print, tools: none, effort: xhigh}
 
 budgets:
   per_stage:                          # tokens per stage by risk class; keys mirror risk_classes

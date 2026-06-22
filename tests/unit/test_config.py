@@ -100,23 +100,30 @@ class TestGoldenRealConfig:
         assert cfg.projects["erp"].test_command == "bash scripts/test.sh"
 
     def test_effort_routing_ratified(self, cfg: FactoryConfig):
-        # CCR-6 (12-06-2026) + D-0038: per-role reasoning effort. The codex roles
-        # (integration_validator, auditor_cross_model) now carry xhigh too (gpt-5.5
-        # via `-c model_reasoning_effort`). Omissions remain deliberate:
-        # main_architect (interactive — the launcher owns --effort), cp1_triage (haiku).
+        # CCR-6 (12-06-2026) + D-0038 + EFFORT POLICY (founder 22-06): NO reasoning
+        # downgrade on quality roles. opus → xhigh; codex/gpt-5.5 → xhigh (its ceiling
+        # via `-c model_reasoning_effort`; 'max' is Claude-only — see config.py cross-
+        # check); sonnet → 'max' (the only sub-opus/sub-codex builder model, mega-light).
+        # Omissions remain deliberate: main_architect (interactive — the launcher owns
+        # --effort), cp1_triage / capacity_probe (haiku — utility, no effort knob).
         for role in (
             "phase_architect",
             "spec_agent",
             "builder_heavy",
+            "builder_backend_routine",
+            "builder_backend_heavy",
+            "builder_frontend_routine",
+            "builder_frontend_heavy",
             "validator_structural",
             "auditor_same_model",
             "integration_validator",
             "auditor_cross_model",
+            "decision_session",
         ):
             assert cfg.models[role].effort == "xhigh", role
-        for role in ("builder_routine", "validator", "decision_session"):
-            assert cfg.models[role].effort == "high", role
-        for role in ("main_architect", "cp1_triage"):
+        for role in ("builder_routine", "validator"):
+            assert cfg.models[role].effort == "max", role
+        for role in ("main_architect", "cp1_triage", "capacity_probe"):
             assert cfg.models[role].effort is None, role
 
     def test_integration_validator_tools_allowlist(self, cfg: FactoryConfig):
