@@ -52,6 +52,7 @@ from sf_factory.scheduler import (
     Scheduler,
     StageExecutor,
     UnitExecutor,
+    _builder_role,
 )
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
@@ -478,6 +479,98 @@ def test_executors_satisfy_the_frozen_protocol() -> None:
     for cls in (StageExecutor, PhaseExecutor):
         assert callable(cls.execute)
     assert isinstance(UnitExecutor, type)  # importable contract object
+
+
+# --------------------------------------------- _builder_role: 2-D routing (kind×risk)
+
+
+_CODEX_ROUTE = {"cli": "codex", "model": "gpt-5.5", "mode": "print", "effort": "high"}
+_CODEX_XHIGH = {"cli": "codex", "model": "gpt-5.5", "mode": "print", "effort": "xhigh"}
+_OPUS_ROUTE = {"cli": "claude", "model": "opus", "mode": "print", "effort": "high"}
+_OPUS_XHIGH = {"cli": "claude", "model": "opus", "mode": "print", "effort": "xhigh"}
+
+#: The four 2-D builder routes mirroring factory.config.yaml (the stub conftest
+#: fixture carries only the 1-D builder_routine/builder_heavy). 'heavy' is used as
+#: the second declared risk class so the heavy variants resolve via step 1, not the
+#: builder_heavy final fallback.
+_2D_BUILDER_ROUTES: dict[str, dict[str, str]] = {
+    "builder_backend_routine": dict(_CODEX_ROUTE),
+    "builder_backend_heavy": dict(_CODEX_XHIGH),
+    "builder_frontend_routine": dict(_OPUS_ROUTE),
+    "builder_frontend_heavy": dict(_OPUS_XHIGH),
+}
+
+
+def _routing_cfg(config_dict: dict[str, Any], routes: dict[str, dict[str, str]]) -> FactoryConfig:
+    """Build a validated FactoryConfig with exactly ``routes`` layered onto the
+    stub fixture models (so claude/codex builder routes are present for the pure
+    _builder_role resolution tests)."""
+    config_dict["models"].update({k: dict(v) for k, v in routes.items()})
+    return make_config(config_dict)
+
+
+def test_builder_role_backend_routine_resolves_to_codex(config_dict) -> None:
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "routine", "backend")
+    assert role == "builder_backend_routine"
+    assert cfg.models[role].cli == "codex"
+
+
+def test_builder_role_backend_heavy_resolves_to_codex(config_dict) -> None:
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "heavy", "backend")
+    assert role == "builder_backend_heavy"
+    assert cfg.models[role].cli == "codex"
+
+
+def test_builder_role_frontend_routine_resolves_to_opus(config_dict) -> None:
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "routine", "frontend")
+    assert role == "builder_frontend_routine"
+    assert cfg.models[role].cli == "claude"
+    assert cfg.models[role].model == "opus"
+
+
+def test_builder_role_frontend_heavy_resolves_to_opus(config_dict) -> None:
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    role = _builder_role(cfg, "heavy", "frontend")
+    assert role == "builder_frontend_heavy"
+    assert cfg.models[role].cli == "claude"
+    assert cfg.models[role].model == "opus"
+
+
+def test_builder_role_kind_none_routine_is_unchanged_legacy(config_dict) -> None:
+    """kind=None keeps the pre-2-D 1-D resolution: builder_<risk_class>."""
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    assert _builder_role(cfg, "routine", None) == "builder_routine"
+    # default arg (omit kind entirely) is the same legacy path
+    assert _builder_role(cfg, "routine") == "builder_routine"
+
+
+def test_builder_role_kind_none_undeclared_risk_falls_back_to_heavy(config_dict) -> None:
+    """kind=None + an undeclared risk class -> builder_heavy (final fallback)."""
+    cfg = _routing_cfg(config_dict, _2D_BUILDER_ROUTES)
+    assert _builder_role(cfg, "exotic", None) == "builder_heavy"
+
+
+def test_builder_role_kind_wide_fallback_when_no_risk_variant(config_dict) -> None:
+    """kind=backend with only a kind-wide builder_backend declared (no _routine
+    variant) -> builder_backend (step 2 of the resolution order)."""
+    cfg = _routing_cfg(config_dict, {"builder_backend": dict(_CODEX_ROUTE)})
+    # builder_backend_routine (step 1) is NOT declared; builder_backend (step 2) wins.
+    assert "builder_backend_routine" not in cfg.models
+    assert _builder_role(cfg, "routine", "backend") == "builder_backend"
+
+
+def test_builder_role_raises_when_no_candidate_configured(config_dict) -> None:
+    """No matching kind/risk route AND no builder_heavy -> ConfigError naming
+    both risk_class and kind."""
+    del config_dict["models"]["builder_heavy"]
+    cfg = make_config(config_dict)
+    with pytest.raises(ConfigError) as exc:
+        _builder_role(cfg, "exotic", "nosuchkind")
+    msg = str(exc.value)
+    assert "exotic" in msg and "nosuchkind" in msg
 
 
 # ------------------------------------------------------- scheduler: DAG + cap

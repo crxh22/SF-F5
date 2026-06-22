@@ -122,6 +122,11 @@ CP1_ID = "CP-1"
 #: hard gate holds until verified in code — wave-4 A2 integration territory,
 #: like the D-0014(2) cmdline check. A route outside this set executes
 #: `continue_session` as `rebuild` + `verdict_downgraded` (§3.1).
+#: NOTE (2-D routing, 22-06): the new backend builders route to codex, so codex
+#: builder resume is now reachable in-flow — but it is intentionally NOT yet added
+#: here. codex builders therefore downgrade a CP-1 `continue_session` to `rebuild`
+#: (safe) until in-flow codex resume is verified post-re-seed; codex joins this set
+#: only then (founder's sequencing — do not pre-empt by adding it now).
 RESUME_VERIFIED_CLIS = frozenset({"claude", "stub"})
 
 #: Sentinel artifact kind -> (filename, events.event_type, escalations.trigger).
@@ -589,19 +594,33 @@ def _isolation_ignored(path: str, ignore_globs: Sequence[str]) -> bool:
     return False
 
 
-def _builder_role(cfg: FactoryConfig, risk_class: str) -> str:
-    """Builder route per risk class. Convention over config (the risk_classes
-    section declares validator+audits only): prefer the models key
-    'builder_<risk_class>' when declared, else the conservative
-    'builder_heavy'. Raises ConfigError when neither route exists."""
-    candidate = f"builder_{risk_class}"
-    if candidate in cfg.models:
-        return candidate
-    if "builder_heavy" in cfg.models:
-        return "builder_heavy"
+def _builder_role(cfg: FactoryConfig, risk_class: str, kind: str | None = None) -> str:
+    """Builder route by stage KIND × RISK (convention over config — risk_classes
+    declares validator+audits only). Returns the FIRST models key that exists,
+    in this order:
+
+      1. ``builder_<kind>_<risk_class>``  (kind given — 2-D route, e.g.
+         ``builder_backend_routine`` → codex, ``builder_frontend_heavy`` → opus)
+      2. ``builder_<kind>``              (kind given — kind-wide fallback)
+      3. ``builder_<risk_class>``        (legacy 1-D route; the ONLY path taken
+         when kind is None → byte-identical to the pre-2-D behavior)
+      4. ``builder_heavy``              (conservative final fallback)
+
+    Backward-compat guarantee: with ``kind=None`` only steps 3–4 run, so kind=None
+    legacy stages keep resolving exactly as before. Raises ConfigError when none of
+    the candidates is configured."""
+    candidates: list[str] = []
+    if kind:
+        candidates.append(f"builder_{kind}_{risk_class}")
+        candidates.append(f"builder_{kind}")
+    candidates.append(f"builder_{risk_class}")
+    candidates.append("builder_heavy")
+    for candidate in candidates:
+        if candidate in cfg.models:
+            return candidate
     raise ConfigError(
-        f"no builder route for risk class {risk_class!r}: neither models.{candidate}"
-        " nor models.builder_heavy is configured"
+        f"no builder route for risk class {risk_class!r} (kind {kind!r}): none of"
+        f" {candidates} is configured under models.*"
     )
 
 
@@ -1757,13 +1776,13 @@ class StageExecutor:
         if stage.state is StageState.SPEC:
             return ("spec_agent",)
         if stage.state is StageState.BUILD:
-            return (_builder_role(self._cfg, stage.risk_class),)
+            return (_builder_role(self._cfg, stage.risk_class, stage.kind),)
         if stage.state is StageState.VALIDATE:
             return (self._validator_role(stage), _cp_point(self._cfg, CP1_ID).role)
         if stage.state is StageState.AUDIT:
             return (
                 *self._risk_cfg(stage).audits,
-                _builder_role(self._cfg, stage.risk_class),
+                _builder_role(self._cfg, stage.risk_class, stage.kind),
             )
         if stage.state is StageState.MERGE_GATE:
             return ("integration_validator",)
@@ -2207,7 +2226,7 @@ class StageExecutor:
         await self._assert_no_unregistered_files(stage, worktree)
 
         conn = self._db.read()
-        role = _builder_role(self._cfg, stage.risk_class)
+        role = _builder_role(self._cfg, stage.risk_class, stage.kind)
         entry = _last_transition_payload(
             conn, Level.STAGE.value, stage.id, StageState.BUILD.value
         )
@@ -2494,7 +2513,7 @@ class StageExecutor:
             "iteration": iteration,
         }
         if value == "continue_session":
-            role = _builder_role(self._cfg, stage.risk_class)
+            role = _builder_role(self._cfg, stage.risk_class, stage.kind)
             conn = self._db.read()
             session_id = fdb.last_session_id(
                 conn, unit_level=Level.STAGE.value, unit_id=stage.id, role=role
@@ -2691,7 +2710,7 @@ class StageExecutor:
             return await self._leave_clean_audit(stage, worktree)
 
         # Executor triage of the union of findings (DoD §7).
-        builder = _builder_role(self._cfg, stage.risk_class)
+        builder = _builder_role(self._cfg, stage.risk_class, stage.kind)
         await self._run_step_agent(
             stage,
             builder,

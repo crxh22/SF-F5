@@ -29,6 +29,15 @@ models:
   spec_agent:            {cli: claude, model: opus,    mode: print, effort: xhigh}
   builder_routine:       {cli: claude, model: sonnet,  mode: print, effort: high}
   builder_heavy:         {cli: claude, model: opus,    mode: print, effort: xhigh}
+  # 2-D builder routing (kind × risk), founder-approved 22-06: backend stages →
+  # codex (gpt-5.5, offload onto the codex limit window for capacity); frontend
+  # stages → claude (opus), including routine-risk frontend → opus (UI quality +
+  # UX-laws injection). kind=None legacy stages keep builder_routine/builder_heavy
+  # above. codex builders mirror auditor_cross_model's route shape (no tools block).
+  builder_backend_routine:  {cli: codex,  model: gpt-5.5, mode: print, effort: high}
+  builder_backend_heavy:    {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
+  builder_frontend_routine: {cli: claude, model: opus,    mode: print, effort: high}
+  builder_frontend_heavy:   {cli: claude, model: opus,    mode: print, effort: xhigh}
   validator:             {cli: claude, model: sonnet,  mode: print, effort: high}
   validator_structural:  {cli: claude, model: opus,    mode: print, effort: xhigh}
   # D-0041: integration validator moved codex(gpt-5.5)→opus. Its merge-gate payload
@@ -147,7 +156,7 @@ pricing:
     # operator-estimated, to be verified against the OpenAI account — codex sums are ~ estimates
     # either way (design §11.5.4 watch item). 'default' retained for historical ledger rows.
     default:  {input: 1.25, output: 10}
-    gpt-5.5:  {input: 1.25, output: 10}   # D-0038: live codex model; estimate pending real invoice
+    gpt-5.5:  {input: 5,    output: 30}   # gpt-5.5 published list price (reconciled 22-06 from the prior $1.25/$10 estimate; still subject to real-invoice verification)
 
 consultation_points:
   # The ONLY registered points. Any orchestrator LLM call outside this registry = governance breach (DoD §4),
