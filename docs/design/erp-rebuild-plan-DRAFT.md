@@ -418,3 +418,18 @@ splits further if a stage exceeds it.**
   Django-admin-for-v1 (Q3 — deferrable to L9, recommend Django-admin v1 + tell the founder admin is the
   cockpit). Q1 escalation #103/#104 is an L7 decision (parked decision #26) — decided when L7 is reached,
   NOT a plan-approval blocker.
+
+**Empirical usability audit (22-06) — live "what a user cannot do" run (corrections):**
+A subagent logged into the running ERP as the founder and attempted all 11 core tasks: **9 of 11 are
+impossible** in the app today (only Stock + Notifications + the ZN-fed procurement chain are reachable,
+and those dead-end with no ZN to seed them). One-to-one confirmation that Layers 0–5 are the right
+priority. Three corrections to pin into the specs:
+- **Real nomenclature registry keys** are `generic_parts_catalog` / `specific_parts_catalog` (the guesses
+  `generic_part`/`specific_part` 404 as `unknown_nomenclature`). L4 specs must use the real keys; verify
+  each key live before building its screen.
+- **Generic CRUD = GET/POST/PUT only; PATCH *and* DELETE return 405** (`nomenclature/api.py:90`). The L1.2
+  framework must edit via full-object **PUT** (never PATCH) and "delete" = deactivate.
+- **Verification-method caveat:** an unregistered device gets **403 *before* routing**
+  (`accounts/middleware.py`), so "endpoint absent" CANNOT be proven by an anonymous curl — only after auth
+  (the DEBUG 404 page enumerates all mounted URLs) or by code inspection. Validators/verifiers must
+  authenticate before asserting an endpoint is unmounted.
