@@ -17,13 +17,17 @@ firing session's id).
    document per Doctrine §9 (history = decision log; the handoff carries: where everything
    lives, live snapshot disclaimer, immediate work items in order, working-mode learnings).
    Archive pattern per existing handoffs. Commit it.
-3. **Launch the successor** (incremented letter: ETAPA-5a → 5b → 5c …):
+3. **Launch the successor.** NAMING (founder directive 22-06-2026): the `ETAPA-5{letter}`
+   lineage ENDED at **ETAPA-5z**. Successors are now named **`ARH - NN`** — `NN` zero-padded,
+   starting at **`01`** and incrementing (`ARH - 01` → `ARH - 02` → `ARH - 03` …). The
+   phone-visible RC label carries the spaces (`ARH - 01`); the tmux session uses a shell-safe
+   slug (`arh-01`):
    ```bash
-   SFF5_TMUX_SESSION=etapa-5<next> SFF5_RC_NAME=ETAPA-5<next> /home/artur/projects/SF-F5/claude_canon.sh \
-     "Ești ETAPA-5<next>, succesoarea sesiunii Main-Architect. Citește docs/session-handoff-<...>.md și continuă. Scrie session_id-ul tău în ~/.claude/sf-architect-session (înlocuiește conținutul) ca să preiei garda de context."
+   SFF5_TMUX_SESSION=arh-<NN> SFF5_RC_NAME="ARH - <NN>" /home/artur/projects/SF-F5/claude_canon.sh \
+     "Ești ARH - <NN>, succesoarea sesiunii Main-Architect. Citește docs/session-handoff-<...>.md și continuă. Scrie session_id-ul tău în ~/.claude/sf-architect-session (înlocuiește conținutul) ca să preiei garda de context."
    ```
    The launcher carries the canon + effort + **Remote Control** identically (claude_canon.sh
-   contract): it passes `--model opus --effort max --remote-control ETAPA-5<next>`, so RC is
+   contract): it passes `--model opus --effort max --remote-control "ARH - <NN>"`, so RC is
    ON and the session is phone-named at launch (D-0041) — no manual taps. `SFF5_RC_NAME`
    sets the phone-visible label (defaults to the tmux session name otherwise).
 4. **Hand over the marker:** the successor's FIRST duty (in its launch prompt) is writing
@@ -31,7 +35,7 @@ firing session's id).
    the marker, never the name. (The predecessor can pre-clear the marker if paranoid;
    a missing marker = guard inert, never wrong-target.)
 5. **Founder: zero taps needed** (D-0041 automated `/rc` + naming). The successor already
-   appears on the phone as `ETAPA-5<next>` with Remote Control live — the founder just OPENS
+   appears on the phone as `ARH - <NN>` with Remote Control live — the founder just OPENS
    it. **VERIFY before the predecessor goes silent:** confirm the successor shows up on the
    phone (claude.ai/code, green dot) — if RC silently failed, the founder is still reachable
    on the predecessor's live RC, so DO NOT go silent until the successor's RC is confirmed.
