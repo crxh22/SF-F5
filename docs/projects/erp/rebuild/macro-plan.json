@@ -1,0 +1,26 @@
+{
+  "project": "erp",
+  "phases": [
+    {"id": "l0-shell", "name": "L0 Navigation shell + module registry (the living module surface)"},
+    {"id": "l1-nomencl", "name": "L1 Root money + classification nomenclatures + generic-CRUD framework"},
+    {"id": "l2-money-base", "name": "L2 Own legal entities (OwnPJ) + money locations + exchange rates"},
+    {"id": "l3-parties", "name": "L3 Commercial parties: Counterparty (+roles) + Contract"},
+    {"id": "l4-catalog", "name": "L4 Parts catalog (Generic/Specific) + production nomenclatures + Warehouse"},
+    {"id": "l5-engine-docs", "name": "L5 Vehicle + foundation-engine re-verify + documents-lifecycle REST API"},
+    {"id": "l6-stock-ops", "name": "L6 Inventory & procurement OPERATIONS surface (UI + lifecycle verbs)"},
+    {"id": "l7-service-orders", "name": "L7 Service-orders spine: Cont de plata (quote) editor + ZN"},
+    {"id": "l8-treasury", "name": "L8 Treasury & payments OPERATIONS (payments, allocation, conformity)"},
+    {"id": "l9-config", "name": "L9 Config / users / rights management UI (last module)"}
+  ],
+  "dag_edges": [
+    ["l0-shell", "l1-nomencl"],
+    ["l1-nomencl", "l2-money-base"],
+    ["l2-money-base", "l3-parties"],
+    ["l3-parties", "l4-catalog"],
+    ["l4-catalog", "l5-engine-docs"],
+    ["l5-engine-docs", "l6-stock-ops"],
+    ["l6-stock-ops", "l7-service-orders"],
+    ["l7-service-orders", "l8-treasury"],
+    ["l8-treasury", "l9-config"]
+  ]
+}

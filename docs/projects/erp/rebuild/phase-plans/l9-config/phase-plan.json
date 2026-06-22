@@ -1,0 +1,81 @@
+{
+  "stages": [
+    {
+      "id": "config-rights-rest",
+      "name": "[NEW] parameter + rights REST — Parameter history-preserving set_param endpoint + CURATED non-destructive rights endpoints; FREEZE the config seam (CRITICAL — the rights-mutation backend is the security fault line)",
+      "risk_class": "critical",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "Build the backend config surface NEW and FREEZE it as L9's contract — two seams the L9.2/L9.3 screens build on. (1) PARAMETER REST: today `Parameter` is editable ONLY via Django admin (`ParameterAdmin`/`ParameterHistoryAdmin`); the history-preserving writer `nomenclature/parameters.py:set_param(key, value, *, actor)` exists but has NO REST. Expose a small endpoint over it: GET a parameter's current typed value + its ParameterHistory (ordered), and PUT a new value THROUGH set_param so a ParameterHistory row is appended on every change (actor=request.user). Respect the typed `to_stored` rules verbatim — decimal stored as a string and FLOAT REJECTED (money precision), int/str/bool strict, json/pointer as-is; surface ParameterTypeError / ParameterMissing / ParameterUnset as 400/404 in the F1 envelope. No silent defaults; history is append-only (no edit/delete of prior rows). (2) RIGHTS REST: today rights meta-administration is superuser-only (`IsSuperuserMetaAdmin`) and the only template op is DESTRUCTIVE — `_overwrite_rights` deletes ALL of a user's rows then bulk-creates (overwrite-by-contract). Add a CURATED NON-DESTRUCTIVE surface: per-dimension grant/revoke of a SINGLE Right row (additive add / targeted remove, NOT all-or-nothing), and a NON-DESTRUCTIVE template apply/copy that MERGES (adds the template's rows without wiping existing ones) or copies one user's rights onto another additively. Keep the existing non-destructive Device list/approve/revoke (`CanManageDevices`) endpoints as-is (they already exist) — this stage adds the parameter + non-destructive-rights pieces and re-verifies the device endpoints are reachable for the L9.3 screen. Keep `is_superuser` and data-rights as separate planes (spec §4.8 — do not let star rights grant meta-admin). This stage is risk_class CRITICAL — the rights-mutation backend is the security fault line (a wrong grant/revoke or a leaked meta-admin plane is an auth-correctness defect), so the founder human_gate is this stage's per-stage verification; it remains role:contract (the seam both L9 FE leaves freeze onto). FOUNDER-DECISION FLAG: whether this in-app surface ships at all (vs keeping Django admin for v1) is a founder call (DRAFT PART-5 Q3) — this stage is authored fully so it is build-ready, and may be deferred/reduced. Prove via API tests: PUT a decimal parameter appends history and rejects a float; a single-right grant adds exactly one row; a template apply MERGES (existing rows survive); device approve/revoke still reachable.",
+      "acceptance_criteria": [
+        "Parameter REST over set_param: GET current typed value + ordered ParameterHistory; PUT writes through set_param appending a history row (actor=request.user)",
+        "Typed rules honoured: decimal stored as string + FLOAT REJECTED; int/str/bool strict; json/pointer as-is; ParameterTypeError/Missing/Unset surfaced as 400/404 (F1 envelope); no silent defaults",
+        "Curated NON-DESTRUCTIVE rights: per-dimension single-Right grant (additive) + targeted revoke; template apply/copy MERGES (never the destructive all-rows overwrite)",
+        "Meta-admin plane preserved: is_superuser gates meta-administration; star data-rights do NOT grant it; existing Device list/approve/revoke verified reachable for L9.3 — CRITICAL stage: founder human_gate is the per-stage verification (the rights-mutation backend is the security fault line); stays role:contract",
+        "History/journal append-only (no edit/delete of prior Parameter or rights-audit rows); rights changes attributed (granted_by=actor)",
+        "Soft-delete discipline where applicable (PUT semantics, no stray DELETE/PATCH on history); real DB keys; rights-checked endpoints",
+        "API tests: decimal-history-append + float-reject; single grant adds one row; template apply merges (existing survive); device endpoints reachable"
+      ],
+      "touched": [
+        "backend/apps/nomenclature/api.py",
+        "backend/apps/accounts/api.py",
+        "backend/apps/accounts/rights.py",
+        "backend/apps/nomenclature/urls.py",
+        "backend/apps/accounts/urls.py",
+        "backend/apps/accounts/tests/test_curated_rights_api.py"
+      ]
+    },
+    {
+      "id": "config-params-fe",
+      "name": "[NEW] FE: config/parameters editor (typed values + history) + exchange-rate/diapazon admin + print-template overrides + residual nomenclatures StatusLabel/TicketType",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React config/parameters screens on the verified L9.1 backend, running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). Surfaces: (1) PARAMETERS EDITOR — list business parameters with their typed values; edit via a TYPE-AWARE control (decimal/int/str/bool/json/pointer — decimal as text never a float input, mirroring the backend float-rejection), PUT through L9.1 so a change is recorded, and render the per-parameter HISTORY (ordered, who/when/old->new) read-only; surface the typed-validation 400s inline. (2) EXCHANGE-RATE / DIAPAZON admin — a rate-history admin reusing the L2 rate surface (POST a new rate, see per-currency history, last=in force, MDL non-settable) and a Diapazon (fiscal number-range per OwnPJ) admin (the ranges L6 fiscal invoices consume; the generic-CRUD framework drives it). (3) PRINT-TEMPLATE OVERRIDES — manage PrintTemplateOverride rows (per doc-type template text/flags). (4) RESIDUAL CONFIG NOMENCLATURES — StatusLabel + TicketType, the two otherwise-unhomed config nomenclatures, on the generic-CRUD catalog framework (list + create/edit drawer + deactivate via PUT active=false). Every picker (currency, OwnPJ, doc-type) supports add-new-inline. Soft-delete = deactivate (never hard delete). FOUNDER-DECISION FLAG: this screen may be deferred to Django-admin-v1 (founder call); authored fully so it is build-ready. Founder visual review applies. Self-loop the screens visually.",
+      "acceptance_criteria": [
+        "Parameters editor: list + type-aware edit control (decimal as text not float; int/str/bool/json/pointer); PUT through L9.1 records the change; typed 400s surfaced inline",
+        "Per-parameter history rendered read-only (ordered, who/when, old->new); history is not editable from the UI",
+        "Exchange-rate admin (reuse L2 rate surface: POST rate, per-currency history, MDL non-settable) + Diapazon (number-range per OwnPJ) admin on the generic-CRUD framework",
+        "Print-template overrides managed (PrintTemplateOverride per doc-type); residual config nomenclatures StatusLabel + TicketType on the generic-CRUD catalog (list + create/edit + deactivate)",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; pickers (currency/OwnPJ/doc-type) support add-new-inline; vitest covers the editor + history + typed-validation states",
+        "Soft-delete = deactivate (PUT active=false); no hard delete; add-new-inline returns the new row selected",
+        "Founder visual gate passes; build-notes flag deferral-to-Django-admin-v1 as a founder decision"
+      ],
+      "touched": [
+        "frontend/src/modules/config/ParametersScreen.tsx",
+        "frontend/src/modules/config/ExchangeRateDiapazonScreen.tsx",
+        "frontend/src/modules/config/PrintTemplateOverridesScreen.tsx",
+        "frontend/src/modules/config/ConfigNomenclaturesScreen.tsx",
+        "frontend/src/api/config.ts"
+      ]
+    },
+    {
+      "id": "users-rights-fe",
+      "name": "[NEW] FE: users + rights — user create/edit, device approve/revoke, per-dimension rights editor + NON-destructive template apply/copy",
+      "risk_class": "critical",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React users + rights administration screens on the verified L9.1 backend, running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). This is the sensitive auth/rights surface -> typed `critical` so the founder personally gates it (the per-stage human_gate is the verification). Surfaces: (1) USERS — list + create/edit a user (username, name, active; is_superuser is a SEPARATE plane shown read-only-aware, not casually toggled), exercising the accounts user surface. (2) DEVICES — a device approval queue: list pending/approved/revoked devices and APPROVE / REVOKE via the existing CanManageDevices endpoints (so a second user's new machine can be approved WITHOUT Django admin). (3) RIGHTS EDITOR — a per-dimension rights editor: view a user's Right rows grouped by dimension, GRANT a single right (additive) or REVOKE a single right (targeted) via the L9.1 curated NON-DESTRUCTIVE endpoints, and apply/copy a RightsTemplate that MERGES (the UI must make clear it ADDS rights and never silently wipes the user's existing rights — the destructive overwrite path is NOT exposed). Show is_superuser and data-rights as the two separate planes (a star-rights user is still not a meta-admin) so the founder is not misled. Every picker (dimension, template, user) supports add-new-inline where sensible. No hard delete (revoke is a targeted row removal, attributed). FOUNDER-DECISION FLAG: may be deferred to Django-admin-v1 (founder call); authored fully so it is build-ready. The founder gate (create a scoped second user, approve a device, edit a parameter) lands here + on L9.2.",
+      "acceptance_criteria": [
+        "Users: list + create/edit (username/name/active); is_superuser shown as a distinct plane, not casually toggled; created users usable for login",
+        "Device approval queue: list by state + approve/revoke via CanManageDevices endpoints; a second user's device approvable WITHOUT Django admin",
+        "Rights editor: per-dimension view; single-right GRANT (additive) + targeted REVOKE via the curated non-destructive endpoints; no destructive overwrite path exposed",
+        "Template apply/copy MERGES and the UI states it ADDS (never wipes) existing rights; is_superuser vs data-rights shown as separate planes so star-rights != meta-admin",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; vitest covers users/devices/rights flows incl. the additive-grant + merge-apply states",
+        "Revoke = targeted attributed row removal (no hard wipe); add-new-inline where sensible; sensitive actions confirmed",
+        "Critical: founder human_gate; founder can create a scoped second user + approve its device end-to-end; build-notes flag deferral-to-Django-admin-v1"
+      ],
+      "touched": [
+        "frontend/src/modules/config/UsersScreen.tsx",
+        "frontend/src/modules/config/DeviceApprovalScreen.tsx",
+        "frontend/src/modules/config/RightsEditor.tsx",
+        "frontend/src/api/accounts.ts",
+        "frontend/src/modules/config/routes.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["config-rights-rest", "config-params-fe"],
+    ["config-rights-rest", "users-rights-fe"]
+  ]
+}

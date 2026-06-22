@@ -1,0 +1,57 @@
+{
+  "stages": [
+    {
+      "id": "menu-registry",
+      "name": "[REBUILD] Typed sectioned menu registry — frozen self-registration seam replacing flat appRoutes+Nav",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "contract",
+      "acceptance": "Replace the flat `appRoutes: AppRouteDef[]` array and the array-mapping `Nav` in `frontend/src/shell/` with a typed, sectioned MENU REGISTRY that becomes the single frozen seam every later FE screen self-registers against — no screen list scattered across files again. Export a stable registry-entry type `{ path: string; label: string; icon?: ReactNode; group: MenuGroup; order: number; element: ReactNode; rightsKey?: string }` and a `registerScreen(entry)` (or a typed const-array registry the framework appends to) plus a `MenuGroup` union of exactly the four founder groups in fixed display order — `operatiuni` (process-centric, the sosire→…→livrare arc per ui-ux-laws §7.4), `nomenclatoare` (catalog/entity-centric — nomenclatures ARE reference data), `date_de_baza`, `config`. `AppShell.Nav` renders sections from the registry grouped+sorted by `(group, order)` with Romanian group headings (centralized in `shell/strings.ts`, never hardcoded), and `AppRoutes` generates its `<Route>` set from the SAME registry — one source feeds both nav and routing. Empty groups render gracefully (collapsed/omitted, not broken). All existing foundation/inventory-procurement routes (Home, Inbox, ordering, reception, supplier-invoices, returns, stocktaking, stock) migrate into registry entries with correct group/order so nothing regresses. Keep `AppLayout`, tokens, and the existing `ConfigProvider`/component layer untouched (no raw antd, no hardcoded colors/spacing — mechanical UI/UX guards stay green); registry is config-only, adds no new visual primitives. Full UI/UX gate runs: §2 questionnaire answered (operator who/role/device per group), states covered (empty group, active/inactive nav item, keyboard-navigable nav), desktop+phone capture self-check. The entry-type shape is the CONTRACT — frozen here, depended on by every L0/L1+ FE stage; document it as the public seam in the stage's .md and keep it minimal (path/label/icon/group/order/element/rightsKey only — no per-screen logic leaks into the type).",
+      "acceptance_criteria": [
+        "Exported registry-entry type {path,label,icon?,group,order,element,rightsKey?} + a MenuGroup union of exactly operatiuni/nomenclatoare/date_de_baza/config in fixed order; screens self-register via a single registry API (no scattered route arrays).",
+        "AppShell Nav renders grouped, sorted sections (group then order) with Romanian headings from shell/strings.ts; empty groups degrade gracefully; nav is keyboard-operable and shows active state.",
+        "AppRoutes generates all <Route> elements from the same registry; one source of truth feeds both navigation and routing.",
+        "All pre-existing routes (home, inbox, ordering, reception, supplier-invoices, returns/supplier, returns/client, stocktaking, stock) migrated into registry entries with no route regression (shell tests still green).",
+        "No new raw antd / hardcoded colors/spacing introduced; AppLayout + tokens + component layer unchanged; mechanical UI/UX token+component guards pass.",
+        "UI/UX spec questionnaire answered (process-centric Operatiuni vs catalog-centric Nomenclatoare rationale, operator/role/device) and load/empty/active/disabled states handled; desktop+phone self-capture clean.",
+        "vitest covers the registry (grouping/sorting, empty-group, route generation) and the migrated nav renders every group; the entry-type seam is documented as the frozen contract."
+      ],
+      "touched": [
+        "frontend/src/shell/registry.tsx",
+        "frontend/src/shell/routes.tsx",
+        "frontend/src/shell/AppShell.tsx",
+        "frontend/src/shell/AppRoutes.tsx",
+        "frontend/src/shell/strings.ts",
+        "frontend/src/shell/__tests__/shell.test.tsx"
+      ]
+    },
+    {
+      "id": "mount-orphans-home",
+      "name": "[REBUILD] Mount orphaned IssueCounter/ReturnCounter + turn empty HomePage into a minimal launcher",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Make the two previously-unreachable warehouse screens reachable and replace the placeholder Home with a real launcher, all THROUGH the L0 menu registry (no bypassing it). Register `features/warehouse-issue/IssueCounter.tsx` and `features/warehouse-issue/ReturnCounter.tsx` as registry entries in the `operatiuni` group with real paths, Romanian labels, and sensible order so they appear in the nav and resolve to working routes (they currently render nowhere — orphaned components with tests but no route). Replace the empty `HomePage` stub (the `<p>welcome</p>` placeholder in `shell/routes.tsx`) with a minimal landing/launcher that renders the registry grouped into navigable section cards/links — a real entry surface, not a dashboard — so the founder lands somewhere structured and can reach every registered screen in one click. The launcher derives entirely from the registry (adding a screen later automatically surfaces it on Home — no edit to Home). Respect the operator-density philosophy (ui-ux-laws §7.3: dense, keyboard-first, no decorative empty space; surface what the operator acts on). Full UI/UX gate: questionnaire (who lands here, what they do next, on what device), states (empty group, single-item group), desktop+phone capture. Standing law applies only as relevant — these are navigation/launch surfaces, not operational create forms, so the edit/storno/history obligation is N/A here (note this explicitly in the .md); no picker is rendered so add-new-inline is N/A. Keep all styling on tokens + approved components.",
+      "acceptance_criteria": [
+        "IssueCounter and ReturnCounter registered as operatiuni-group registry entries with real paths + Romanian labels; both reachable from the nav and render their working screens (orphan routes closed — gap G7).",
+        "HomePage stub replaced by a registry-driven launcher: grouped navigable sections/cards covering every registered screen, derived from the registry (a new screen auto-appears with no Home edit).",
+        "Launcher and new entries respect operator-density/keyboard-first philosophy and use only tokens + approved components (no raw antd, no hardcoded styles).",
+        "States handled: empty/sparse group, single-item group, active route; launcher is keyboard-navigable.",
+        "UI/UX spec questionnaire answered (who lands on Home, next action, device) and desktop+phone self-capture clean.",
+        "vitest covers the launcher rendering registry groups and the two newly-mounted routes resolving; existing IssueCounter/ReturnCounter component tests stay green.",
+        "Companion .md notes edit/storno/history and add-new-inline are N/A here (launch/nav surfaces, no operational form, no picker) so the omission is intentional, not a gap."
+      ],
+      "touched": [
+        "frontend/src/shell/routes.tsx",
+        "frontend/src/features/warehouse-issue/IssueCounter.tsx",
+        "frontend/src/features/warehouse-issue/ReturnCounter.tsx",
+        "frontend/src/shell/HomeLauncher.tsx",
+        "frontend/src/shell/strings.ts",
+        "frontend/src/shell/__tests__/shell.test.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["menu-registry", "mount-orphans-home"]
+  ]
+}

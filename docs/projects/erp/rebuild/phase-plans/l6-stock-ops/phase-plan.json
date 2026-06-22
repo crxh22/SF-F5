@@ -1,0 +1,151 @@
+{
+  "stages": [
+    {
+      "id": "procurement-reverify",
+      "name": "[KEEP] Procurement/inventory operational API re-verify — ordering/reception/supplier-invoice/issue/return/stocktaking/reservation producers + R2/R3/R6/R8 postings on real data; freezes the operational seam",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "VERIFY-ONLY KEEP stage (routine = no post-build code audit) — re-verify (do NOT rebuild) the DONE+merged inventory-procurement backend in reality and FREEZE its already-mounted HTTP surface as this layer's operational contract; prove the EXISTING behavior on the new deps and ship NO production code fix here. Every L6 FE stage and the order-to-stock extension build on this exact seam. The endpoints are live on main: `/api/procurement/` (suppliers, orderable-lines, stock-availability, reservations, orders, orders/<id>, warehouses, receivable-lines, receptions, receptions/<id>, supplier-invoices(+/<id>/finalize,/<id>), linkable-purchase-docs, stock/undelivered|ordered|budget-variance), `/api/inventory/` (warehouse-issues, painter-material-issues, returns-from-executor, painter-material-share, returns/supplier(+/sources), returns/client(+/sources), returns/<id>(+/fiscal-invoice), fiscal-invoices/<id>/cancel, stock/* read views), and `/api/stocktaking/` (depozits, own-pjs, records, preview, documents, …). Authenticate first (an unregistered device 403s before routing). Prove the posting producers fire correctly on THIS data: reception auto-reserves + posts (R3/stock-in), supplier fiscal invoice posts the fiscal/payable legs (R6), warehouse/painter issue posts stock-out (R2), returns reverse, stocktaking reconciles. Confirm idempotency + write-guards + the Diapazon prerequisite (a fiscal number range must exist per issuing OwnPJ before the fiscal-invoice legs are exercised). If a producer/posting is NOT firing through the API — a defect requiring a CODE change — ESCALATE it for a separate structural fix stage rather than patching in place (routine ships no un-audited code fix). Surface the frozen endpoint list to the FE stages in build-notes.",
+      "acceptance_criteria": [
+        "All `/api/procurement/`, `/api/inventory/`, `/api/stocktaking/` routes confirmed reachable + rights-gated post-auth (the live mounted list enumerated in build-notes as the frozen seam)",
+        "Reception posts stock-in + auto-reserves (R3); supplier fiscal invoice posts the payable/fiscal legs (R6); warehouse/painter issue posts stock-out (R2); returns reverse correctly — proven on real data",
+        "R6/R8 payment-adjacent postings net correctly; idempotency + finalize write-guards hold on re-run",
+        "Diapazon prerequisite verified: a fiscal number range exists per issuing OwnPJ before any fiscal-invoice leg is exercised (else the gate flags it)",
+        "Soft-delete / cancel discipline confirmed (cancel = storno endpoint; no destructive DELETE on finalized docs)",
+        "VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change is found (a producer/posting not firing through the API), ESCALATE for a separate structural fix stage — never an in-place fix here; the frozen endpoint inventory logged in build-notes."
+      ],
+      "touched": [
+        "backend/apps/procurement/api.py",
+        "backend/apps/inventory/api.py",
+        "backend/apps/inventory/returns_api.py",
+        "backend/apps/procurement/reception.py",
+        "backend/apps/inventory/issue.py",
+        "backend/apps/procurement/tests/test_operational_reverify.py"
+      ]
+    },
+    {
+      "id": "order-to-stock",
+      "name": "[REBUILD] Standalone order-to-stock — extend ordering+reception so a purchase can target OWN STOCK not only a ZnLine (unblocks vanzare_piese/revanzare_tva; corrects the ZN-only assumption)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "Today a SupplierOrder line carries a `zn_line_reference` and a PurchaseReception payload REQUIRES a `zn_id` — purchasing is structurally ZN-only, which blocks buying parts straight to own stock for resale (`vanzare_piese` / `revanzare_tva`). REBUILD the ordering + reception backend so a purchase line can target OWN STOCK (a warehouse) with NO ZnLine: make the ZN linkage optional on both the order line (`zn_line_reference` nullable) and the reception (`zn_id` nullable / a stock-target mode), and route a no-ZN reception into a plain stock-in lot (R3 own-stock) instead of a ZN-reserved lot. Preserve the existing ZN-targeted path byte-for-byte (the layering rule stands: procurement imports `service_orders` directly — keep the lazy import; do NOT add an upward FK; the BigInteger reference pattern stays for the ZN case). Extend `orderable-lines`/`receivable-lines` (or add a stock-target entry mode) so the FE can place + receive a stock order without a ZN. Guard: a stock-target line must name a warehouse and a part; mixed ZN/stock on one document handled per spec. Prove via API test: place a no-ZN supplier order to a warehouse, receive it, and confirm a stock-in lot lands (R3) with no ZN reservation, AND a ZN-targeted order still reserves exactly as before (no regression).",
+      "acceptance_criteria": [
+        "Order line ZN linkage made optional (`zn_line_reference` nullable) + a stock-target mode added; reception accepts a no-ZN stock target (`zn_id` nullable / stock mode) naming a warehouse",
+        "A no-ZN reception posts a plain own-stock-in lot (R3) with no ZN reservation; the lot is queryable as own stock",
+        "The existing ZN-targeted order→reserve→receive path is preserved unchanged (regression test green)",
+        "Layering preserved: procurement keeps the lazy `service_orders` import, no new upward FK, BigInteger ref retained for the ZN case",
+        "Stock-target guard: a stock line must name a warehouse + a part; bad/mixed payloads rejected with a clean 400 envelope",
+        "Migration is additive (nullable columns, no data loss); API test covers no-ZN order→receive→stock-in AND the ZN-path no-regression"
+      ],
+      "touched": [
+        "backend/apps/procurement/models/supplier_order.py",
+        "backend/apps/procurement/models/reception.py",
+        "backend/apps/procurement/orders.py",
+        "backend/apps/procurement/reception.py",
+        "backend/apps/procurement/api.py",
+        "backend/apps/procurement/tests/test_order_to_stock.py"
+      ]
+    },
+    {
+      "id": "ordering-reception-fe",
+      "name": "[REBUILD] FE: ordering + reception screens + the order-to-stock entry point + lifecycle (edit/cancel/storno/history via L5 controls; align to new menu/UI-UX)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Peeled from the old `ordering-fe` at planning (too large for one builder pass): this stage owns the ORDERING + RECEPTION surface (the sibling `supplier-invoice-fe` owns the supplier-fiscal-invoice screen). REBUILD the existing create-only ordering + reception screens (`features/ordering/OrderingPage`, `features/reception/ReceptionPage`) into operational screens, running the full UI/UX gate (antd only via `src/ui` wrappers, Romanian copy, tokens, founder visual review) and registering into the new L0 menu (Operațiuni section). Operational-FE law is the core of this stage — the create-only pattern must NOT recur: mount the reusable document-lifecycle controls built in L5 (cancel/storno + edit-reverse-and-repost + version-history) on each finalized order/reception via `/api/documents/<id>/…`, so a clerk can edit, cancel (zero-effect storno), and read the version history. Add the standalone ORDER-TO-STOCK entry point from the order-to-stock backend (this stage descends from `order-to-stock`): let the user place a purchase targeting a warehouse (own stock) with no ZN, and receive it into stock. Every picker (supplier counterparty, part, warehouse) supports add-new-inline. Surface the API 400 envelope on validation edge cases. vitest covers create, the lifecycle actions (edit/cancel/history wired to the documents API), the order-to-stock flow, and add-new-inline-returns-selected.",
+      "acceptance_criteria": [
+        "Ordering + reception screens rebuilt as operational (not create-only); registered into the L0 Operațiuni menu; antd via src/ui, Romanian, tokens",
+        "L5 document-lifecycle controls mounted on each finalized order/reception: edit (reverse-and-repost), cancel (storno), version-history — wired to `/api/documents/<id>/…`",
+        "Standalone order-to-stock entry point present: place a no-ZN purchase to a warehouse + receive it into stock from the UI",
+        "Pickers (supplier/part/warehouse) support add-new-inline returning the new row selected; soft-delete = deactivate, never hard delete",
+        "Server 400 envelope surfaced on validation edge cases; lifecycle action errors handled gracefully",
+        "vitest: ordering+reception create + edit/cancel/history (documents API) + order-to-stock flow + add-new-inline-returns-selected; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/ordering/OrderingPage.tsx",
+        "frontend/src/features/reception/ReceptionPage.tsx",
+        "frontend/src/api/ordering.ts",
+        "frontend/src/api/reception.ts",
+        "frontend/src/features/ordering/OrderingPage.test.tsx"
+      ]
+    },
+    {
+      "id": "supplier-invoice-fe",
+      "name": "[REBUILD] FE: supplier-fiscal-invoice screen + lifecycle (edit/cancel/storno/history via L5 controls; align to new menu/UI-UX)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Peeled from the old `ordering-fe` at planning (too large for one builder pass): this stage owns the SUPPLIER-FISCAL-INVOICE surface (the sibling `ordering-reception-fe` owns ordering + reception + the order-to-stock entry). REBUILD the existing create-only supplier-invoice screen (`features/supplierInvoices/SupplierInvoicesPage`) into an operational screen, running the full UI/UX gate (antd only via `src/ui` wrappers, Romanian copy, tokens, founder visual review) and registering into the new L0 menu (Operațiuni section). Operational-FE law is the core of this stage — the create-only pattern must NOT recur: mount the reusable document-lifecycle controls built in L5 (cancel/storno + edit-reverse-and-repost + version-history) on each finalized supplier fiscal invoice via `/api/documents/<id>/…`, so a clerk can edit, cancel (zero-effect storno), and read the version history. Wire the live `/api/procurement/supplier-invoices(+/<id>/finalize,/<id>)` + `linkable-purchase-docs` endpoints (link the invoice to its receptions). Every picker (supplier counterparty, purchase doc) supports add-new-inline. Surface the API 400 envelope on validation edge cases (incl. the Diapazon fiscal-range prerequisite when issuing). vitest covers create, the lifecycle actions (edit/cancel/history wired to the documents API), the link-to-purchase-docs flow, and add-new-inline-returns-selected.",
+      "acceptance_criteria": [
+        "Supplier-fiscal-invoice screen rebuilt as operational (not create-only); registered into the L0 Operațiuni menu; antd via src/ui, Romanian, tokens",
+        "L5 document-lifecycle controls mounted on each finalized supplier invoice: edit (reverse-and-repost), cancel (storno), version-history — wired to `/api/documents/<id>/…`",
+        "Live supplier-invoice endpoints wired (`supplier-invoices/<id>/finalize`, `linkable-purchase-docs`): the invoice links to its receptions; finalize posts the payable/fiscal legs",
+        "Pickers (supplier/purchase-doc) support add-new-inline returning the new row selected; soft-delete = deactivate, never hard delete",
+        "Server 400 envelope surfaced on validation edge cases (incl. the Diapazon fiscal-range prerequisite); lifecycle action errors handled gracefully",
+        "vitest: supplier-invoice create + edit/cancel/history (documents API) + link-to-purchase-docs + add-new-inline-returns-selected; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/supplierInvoices/SupplierInvoicesPage.tsx",
+        "frontend/src/features/supplierInvoices/SupplierInvoiceActions.tsx",
+        "frontend/src/api/supplierInvoices.ts",
+        "frontend/src/features/supplierInvoices/SupplierInvoicesPage.test.tsx"
+      ]
+    },
+    {
+      "id": "issue-fe",
+      "name": "[REBUILD] FE: warehouse-issue + painter-material-issue screens + lifecycle (edit/cancel/storno/history via L5 controls; add-new-inline pickers)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Peeled from the old `issue-return-fe` at planning (too large for one builder pass): this stage owns the ISSUE surface (the sibling `returns-stocktake-fe` owns returns + stocktaking + reservations). REBUILD the issue screens — `features/warehouse-issue/IssueCounter` (mounted on real routes by L0) + the painter-material-issue surface — into operational screens, running the full UI/UX gate (antd only via `src/ui` wrappers, Romanian copy, tokens, founder visual review) and registering into the L0 Operațiuni menu. Operational-FE law: mount the L5 reusable document-lifecycle controls (cancel/storno + edit-reverse-and-repost + version-history via `/api/documents/<id>/…`) on each finalized issue document so the create-only pattern does not recur. Wire the live backend endpoints (`/api/inventory/warehouse-issues`, `/api/inventory/painter-material-issues`, `/api/inventory/painter-material-share`, plus the relevant `/api/inventory/stock/*` read views for availability). Every picker (part, warehouse, executor, counterparty) supports add-new-inline returning the new row selected. Surface the API 400 envelope on validation edge cases (e.g. insufficient stock). vitest covers each issue screen's create + the lifecycle actions (edit/cancel/history wired to the documents API) + add-new-inline-returns-selected.",
+      "acceptance_criteria": [
+        "Warehouse-issue + painter-material-issue screens rebuilt as operational + registered into the L0 Operațiuni menu; antd via src/ui, Romanian, tokens",
+        "L5 document-lifecycle controls (edit/cancel-storno/history via `/api/documents/<id>/…`) mounted on each finalized issue doc; create-only pattern eliminated",
+        "Live issue endpoints wired (`warehouse-issues`, `painter-material-issues`, `painter-material-share`); issue posts stock-out (R2); stock-availability read views surfaced",
+        "Pickers (part/warehouse/executor/counterparty) support add-new-inline returning the new row selected; soft-delete = deactivate only",
+        "Server 400 envelope + lifecycle errors handled gracefully on each surface",
+        "vitest: per-issue-screen create + lifecycle (documents API) + add-new-inline-returns-selected; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/warehouse-issue/IssueCounter.tsx",
+        "frontend/src/features/warehouse-issue/PainterMaterialIssue.tsx",
+        "frontend/src/api/issue.ts",
+        "frontend/src/features/warehouse-issue/IssueCounter.test.tsx"
+      ]
+    },
+    {
+      "id": "returns-stocktake-fe",
+      "name": "[REBUILD] FE: return-from-executor/to-supplier/from-client + stocktaking + reservation screens + lifecycle (edit/cancel/storno/history via L5 controls)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Peeled from the old `issue-return-fe` at planning (too large for one builder pass): this stage owns the RETURNS + STOCKTAKING + RESERVATION surface (the sibling `issue-fe` owns the issue screens). REBUILD the return/stocktaking/reservation screens — `features/returns/ReturnSupplierPage` + `ReturnClientPage` + the return-from-executor surface (and the `ReturnCounter` route mounted by L0), `features/stocktaking/StocktakingPage`, plus the reservation surface — into operational screens, running the full UI/UX gate (antd only via `src/ui` wrappers, Romanian copy, tokens, founder visual review) and registering into the L0 Operațiuni menu. Operational-FE law: mount the L5 reusable document-lifecycle controls (cancel/storno + edit-reverse-and-repost + version-history via `/api/documents/<id>/…`) on each finalized return/stocktaking document so the create-only pattern does not recur. Wire the live backend endpoints (`/api/inventory/returns-from-executor|returns/supplier(+/sources)|returns/client(+/sources)|returns/<id>(+/fiscal-invoice)|fiscal-invoices/<id>/cancel`, `/api/stocktaking/*` incl. preview/records/documents, plus the reservation views under `/api/procurement/reservations`). The returns flow surfaces its source-selection (`returns/supplier/sources`, `returns/client/sources`) and the post-return fiscal invoice + its cancel. Stocktaking surfaces the reconciliation grid + finalize. Every picker (part, warehouse, executor, counterparty) supports add-new-inline. vitest covers each screen's create + lifecycle actions + the returns source→document→fiscal-invoice flow + stocktaking reconcile/finalize.",
+      "acceptance_criteria": [
+        "Return (supplier/client/from-executor), stocktaking, reservation screens rebuilt as operational + registered into the L0 menu; antd via src/ui, Romanian, tokens",
+        "L5 document-lifecycle controls (edit/cancel-storno/history via `/api/documents/<id>/…`) mounted on each finalized return/stocktaking doc; create-only pattern eliminated",
+        "Returns flow wired: source-selection → return document → post-return fiscal invoice → invoice cancel; returns reverse the stock legs correctly",
+        "Stocktaking reconciliation grid → finalize wired; reservation surface wired (`/api/procurement/reservations`)",
+        "Pickers (part/warehouse/executor/counterparty) support add-new-inline returning the new row selected; soft-delete = deactivate only; 400 + lifecycle errors handled gracefully",
+        "vitest: per-screen create + lifecycle + returns source→doc→fiscal-invoice + stocktaking reconcile/finalize; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/returns/ReturnSupplierPage.tsx",
+        "frontend/src/features/returns/ReturnClientPage.tsx",
+        "frontend/src/features/stocktaking/StocktakingPage.tsx",
+        "frontend/src/api/returns.ts",
+        "frontend/src/api/stocktaking.ts",
+        "frontend/src/features/returns/useReturns.test.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["procurement-reverify", "order-to-stock"],
+    ["procurement-reverify", "ordering-reception-fe"],
+    ["procurement-reverify", "supplier-invoice-fe"],
+    ["procurement-reverify", "issue-fe"],
+    ["procurement-reverify", "returns-stocktake-fe"],
+    ["order-to-stock", "ordering-reception-fe"]
+  ]
+}

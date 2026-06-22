@@ -1,0 +1,102 @@
+{
+  "stages": [
+    {
+      "id": "own-pj-rest",
+      "name": "[NEW] OwnPJ REST — first slice of parties/api.py (create/edit/list, vat_payer, system-counterparty spawn surfaced)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "`parties` has NO api.py and is NOT mounted in `erp/urls.py` (admin-only today) — build the first slice NEW and FREEZE it as this layer's contract. Create `parties/api.py` + `parties/urls.py` and mount `api/parties/` in `erp/urls.py`, exposing OwnPJ list/create/edit (PUT, full-object) with the `vat_payer` flag and `name`/`code` (both unique). The endpoint shape is the seam every later parties slice (L3 Counterparty/Contract, L5 Vehicle) and the L2 FE build on — keep it thin and stable: error envelope per F1, rights-checked like the nomenclature views, soft-delete via PUT (no DELETE/PATCH). OwnPJ has NO `active` column in the real model, but the standing soft-delete law needs a target here: add a nullable `active` column to OwnPJ (`apps/parties/models.py`) + a reversible migration so deactivate = PUT active=false (never DELETE); the queryset/serializer expose it. OwnPJ.save() already calls ensure_system_counterparties() inside one transaction: a create/edit MUST run through save() so the `TVA {name}` (always) and `Impozit pe venit {name}` (iff vat_payer) system Counterparty rows are idempotently ensured and re-synced on rename; the response (or a sibling read endpoint) MUST expose those spawned system counterparties so the FE can show them read-only. Flipping vat_payer False KEEPS the existing Impozit counterparty (history). Prove via API test: POST a vat_payer PJ → its two system counterparties exist; rename → names re-sync; second identical save → no duplicates (idempotent); PUT active=false deactivates without DELETE.",
+      "acceptance_criteria": [
+        "`parties/api.py` + `parties/urls.py` created; `api/parties/` mounted in `erp/urls.py`; OwnPJ list/create/edit reachable post-auth",
+        "Create/edit accept name, code (unique), vat_payer; write goes through OwnPJ.save() (system-counterparty spawn fires)",
+        "Response or a read endpoint exposes the spawned system counterparties (TVA always; Impozit pe venit iff vat_payer) for read-only FE display",
+        "Idempotent: re-saving an unchanged PJ creates no duplicate system counterparties; rename re-syncs their names; vat_payer->False keeps the Impozit row",
+        "Adds a nullable `active` column + reversible migration so deactivate = PUT active=false (never DELETE); no DELETE/PATCH path (mirror nomenclature 405 discipline); real DB keys, no synthetic ids",
+        "Rights-checked + F1 error envelope; API test proves create + spawn + idempotency + rename re-sync + PUT active=false deactivation"
+      ],
+      "touched": [
+        "backend/apps/parties/api.py",
+        "backend/apps/parties/urls.py",
+        "backend/apps/parties/models.py",
+        "backend/apps/parties/migrations/0002_ownpj_active.py",
+        "backend/erp/urls.py",
+        "backend/apps/parties/tests/test_own_pj_api.py"
+      ]
+    },
+    {
+      "id": "money-loc-rest",
+      "name": "[KEEP] CashDesk/BankAccount nomenclature REST re-verify — clean() enforced through the API",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "VERIFY-ONLY KEEP stage (routine = no post-build code audit) — re-verify (do NOT rebuild) the existing generic nomenclature CRUD for the registered keys `cash_desk` and `bank_account` at `/api/nomenclature/<key>/`, proving the EXISTING behavior in reality on the new deps; ship NO production code fix here. Prove that the model-level `clean()` runs on every API write (the serializer calls full_clean(validate_unique=False)), not only in Django admin. Confirm the money-location invariants surface as API 400s: requires_pj (CEC/card desk must bind an OwnPJ), forbids_pj (non-CEC desk must NOT), and one-currency-per-money-location, plus the OwnPJ/Currency/type FKs resolve. Confirm GET/POST/PUT only — DELETE and PATCH return 405 (soft-delete = PUT active=false). If a clean() rule is found NOT enforced through the API — a defect requiring a CODE change — ESCALATE it for a separate structural fix stage rather than patching in place (routine ships no un-audited code fix). Authenticate before asserting (an unregistered device 403s before routing). Tie this stage to the contract via the DAG so the FE can rely on a verified nomenclature surface.",
+      "acceptance_criteria": [
+        "`/api/nomenclature/cash_desk/` and `/api/nomenclature/bank_account/` GET/POST/PUT verified live post-auth; DELETE & PATCH return 405",
+        "requires_pj enforced through the API: a CEC/card CashDesk without OwnPJ is rejected with a 400 (not silently saved)",
+        "forbids_pj enforced: a non-CEC desk WITH an OwnPJ is rejected; one-currency/one-money-location invariant holds via the API",
+        "OwnPJ, Currency, CashDeskType/BankAccountType, Bank FKs resolve and validate on create/edit",
+        "Soft-delete = PUT active=false; rows persist + remain referenceable after deactivation",
+        "VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change is found (a clean() rule not enforced through the serializer), ESCALATE for a separate structural fix stage — never an in-place fix here."
+      ],
+      "touched": [
+        "backend/apps/nomenclature/api.py",
+        "backend/apps/nomenclature/models/treasury.py",
+        "backend/apps/nomenclature/tests/test_money_location_api.py"
+      ]
+    },
+    {
+      "id": "rate-rest",
+      "name": "[RECONCILE/EXPOSE] DefaultExchangeRate REST — expose append-only create + history-list over the EXISTING set_default_rate + dedup the treasury duplicate writer (NOT green-field)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "RECONCILE/EXPOSE, not green-field NEW: the rate writer ALREADY EXISTS on main — this stage exposes a REST endpoint over the EXISTING `set_default_rate` and dedups the treasury duplicate writer; it does NOT build a fresh rate engine. `DefaultExchangeRate` is an append-only journal, deliberately NOT a NomenclatureBase / NOT in the generic registry (generic PUT would mutate history) — so it needs its OWN small REST endpoint, NOT the nomenclature CRUD. CORRECTION vs DRAFT: the rate WRITER already exists on main — `nomenclature/exchange_rates.py:set_default_rate(currency, rate, *, actor)` (+ a Django-admin add-path) — and a SECOND, duplicate writer was added on the treasury branch (`treasury/currency.py:set_exchange_rate`, same table, same full_clean positive-rate guard, plus float-rejection + an MDL-is-base guard). This stage is therefore: (1) EXPOSE an append-only CREATE (POST a new rate for a currency, actor = request.user) and a per-currency HISTORY-LIST (GET, ordered, last row = in force) REST endpoint OVER the existing `set_default_rate`; and (2) RECONCILE/dedup the two writers to ONE canonical path so L8 treasury reuses it — fold treasury's stricter guards (reject MDL as base; reject float input; full_clean positive-rate) into `set_default_rate` and have `treasury/currency.py:set_exchange_rate` delegate to it (or be removed), leaving `current_rate`/`mdl_equivalent` read helpers intact. No mutation/delete of journal rows; MDL has no settable rate. Prove: POST EUR rate appears in history; second POST appends (history grows, prior preserved); non-positive and float rejected; POST MDL rejected; both code paths now write through one function (test asserts single writer).",
+      "acceptance_criteria": [
+        "New append-only REST: POST creates a DefaultExchangeRate row (actor=request.user via set_default_rate); GET lists per-currency history ordered, last = in force",
+        "Endpoint mounted under parties/treasury REST surface (its own route, NOT the generic nomenclature registry); no PUT/PATCH/DELETE on journal rows",
+        "Single canonical writer: treasury `set_exchange_rate` delegates to (or is replaced by) `set_default_rate`; the MDL-base + float-rejection guards live in the one path",
+        "Positive-rate (full_clean) enforced; non-positive rejected 400; float input rejected; POST for MDL rejected (base currency, definitionally 1)",
+        "Read helpers (`current_default_rate`/`current_rate`, `mdl_equivalent`) preserved and unaffected; history immutable",
+        "Tests: history append + ordering; dedup proven (one writer); L8 reuse path documented in build-notes"
+      ],
+      "touched": [
+        "backend/apps/parties/api.py",
+        "backend/apps/nomenclature/exchange_rates.py",
+        "backend/apps/treasury/currency.py",
+        "backend/apps/parties/urls.py",
+        "backend/apps/nomenclature/tests/test_exchange_rate_api.py"
+      ]
+    },
+    {
+      "id": "money-fe",
+      "name": "[NEW] FE: OwnPJ + CashDesk + BankAccount + set-exchange-rate screens (clean() rules mirrored as UI validation)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React money-base screens on the verified L2 backend, running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). Four surfaces: (1) OwnPJ list + create/edit (name, code, vat_payer) with a READ-ONLY panel showing the auto-spawned system counterparties (TVA …, Impozit pe venit …) returned by the contract endpoint; (2) CashDesk and (3) BankAccount management screens (list + create/edit drawer + deactivate via PUT active=false) whose form validation MIRRORS the backend clean(): enforce requires_pj/forbids_pj by type and one-currency-per-location BEFORE submit, and surface the API 400 envelope if the server rejects; (4) a set-exchange-rate form that POSTs a new rate (rate-rest) and renders the per-currency rate HISTORY (last = in force), with MDL not settable. Every picker (OwnPJ, Currency, CashDeskType/BankAccountType, Bank) supports add-new-inline. Soft-delete = deactivate (never a hard delete). The OwnPJ system-counterparty panel is read-only (system-managed rows). Self-loop the screens visually; this layer's founder gate is the capstone here.",
+      "acceptance_criteria": [
+        "OwnPJ screen: list + create/edit (name/code/vat_payer) + read-only spawned-system-counterparty panel; system rows not editable",
+        "CashDesk + BankAccount screens: list + create/edit drawer + deactivate (PUT active=false); pickers (OwnPJ/Currency/type/Bank) support add-new-inline",
+        "Client-side validation mirrors clean(): requires_pj/forbids_pj by desk type + one-currency-per-location block bad combos before submit; server 400 surfaced on edge cases",
+        "Set-exchange-rate form POSTs a new rate and shows per-currency history (last=in force); MDL offered as non-settable/base",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; vitest covers the screens + validation states",
+        "Soft-delete only (no hard delete); add-new-inline returns the new row selected; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/modules/parties/OwnPjScreen.tsx",
+        "frontend/src/modules/parties/CashDeskScreen.tsx",
+        "frontend/src/modules/parties/BankAccountScreen.tsx",
+        "frontend/src/modules/parties/ExchangeRateScreen.tsx",
+        "frontend/src/api/parties.ts"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["own-pj-rest", "money-loc-rest"],
+    ["own-pj-rest", "rate-rest"],
+    ["own-pj-rest", "money-fe"],
+    ["money-loc-rest", "money-fe"],
+    ["rate-rest", "money-fe"]
+  ]
+}

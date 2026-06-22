@@ -1,0 +1,125 @@
+{
+  "stages": [
+    {
+      "id": "vehicle-rest",
+      "name": "[NEW] Vehicle REST — completes parties/api.py (owner Counterparty, make/model/reg/mileage; custody/follow-up read-only)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "`parties` Vehicle has NO REST today (parties/api.py exists only from L2/L3 slices, Vehicle absent) — build the Vehicle slice NEW and FREEZE it as a contract seam the Vehicle FE builds on. Extend `parties/api.py` + `parties/urls.py` (mounted at `api/parties/` since L2) with Vehicle list/create/edit: owner (FK → Counterparty, PROTECT, required), make/model/registration_number (CharFields, blank-allowed — 1C import carries gaps/dupes, NO uniqueness pinned), mileage (`parcurs`, PositiveInteger, nullable — empty when not recorded at intake). The custody (at_company/at_client/at_outsourcer) and follow_up columns plus their date_* fields are F4 frozen-skeleton fields owned by service-orders' intake (`act primire`): expose them READ-ONLY here (no transition behavior — the interim Vehicle form is a quick master-data path, intake rides L7). Vehicle has NO `active` column in the real model, but the standing soft-delete law needs a target here: add a nullable `active` column to Vehicle (`apps/parties/models.py`) + a reversible migration so deactivate = PUT active=false (never DELETE); the queryset/serializer expose it. No DELETE/PATCH (mirror the nomenclature 405 discipline); rights-checked + F1 error envelope; real DB keys. Keep the endpoint thin + stable (it is the FE's seam). Prove via API test: POST a Vehicle with an owner Counterparty → reads back; custody/follow_up present but not mutable through this endpoint; mileage may be null; PUT active=false deactivates without DELETE.",
+      "acceptance_criteria": [
+        "Vehicle list/create/edit added to `parties/api.py` + `parties/urls.py` under `api/parties/`; reachable post-auth",
+        "owner FK (→ Counterparty, required, PROTECT) resolves; make/model/registration_number accepted blank (no uniqueness enforced)",
+        "mileage (PositiveInteger) nullable: create with no mileage succeeds; set via PUT works",
+        "custody + follow_up (+ their date_* fields) exposed READ-ONLY — not mutable through this endpoint (intake = L7 service-orders)",
+        "Adds a nullable `active` column + reversible migration so deactivate = PUT active=false (never DELETE); no DELETE/PATCH; rights-checked + F1 error envelope; real DB keys",
+        "API test: POST Vehicle with owner reads back; custody/follow_up read-only; mileage nullable proven; PUT active=false deactivates"
+      ],
+      "touched": [
+        "backend/apps/parties/api.py",
+        "backend/apps/parties/urls.py",
+        "backend/apps/parties/models.py",
+        "backend/apps/parties/migrations/0004_vehicle_active.py",
+        "backend/apps/parties/tests/test_vehicle_api.py"
+      ]
+    },
+    {
+      "id": "docs-lifecycle-api",
+      "name": "[NEW] documents lifecycle REST API — the KEYSTONE contract (MUTATE verbs: finalize/edit/cancel-storno over engine.py)",
+      "risk_class": "critical",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "`documents` has NO api.py and is NOT mounted in `erp/urls.py` — the finalize/edit(reverse-and-repost)/storno(zero-effect cancellation) engine is callable-Python-only (`documents/engine.py`: create/finalize/edit/storno/collect_dependents/link, returning EditResult{document,new_version,posting,warnings,cascade}). Build `documents/api.py` + `documents/urls.py`, mount `api/documents/` (alongside the existing print sub-route), and FREEZE it as the standing keystone contract every later operational doc-type (L6 stock ops, L7 service-orders, L8 treasury) plugs into — keep it thin + stable. SCOPE = the MUTATE verbs ONLY (the version-history + dependency-cascade-preview READ endpoints are the sibling `docs-history-read` stage, which descends from this contract): finalize (draft→final), edit (full two-namespace {base,data} payload; partial payloads rejected; drafts post nothing), storno (final only; exactly one of to_version= OR zero_effect=True; surfaces NotImplementedError as a clean refusal for types with no cancellation notion). RESOLVE the per-type adapter concern (codex audit): `edit` is a SINGLE GENERIC verb — it wraps the engine's reverse-and-repost around each producer's EXISTING create serializer, taking the per-producer {base,data} payload the producer already defines, so NO new per-type edit adapter is written (the producer's own create serializer is the per-type shape; the verb is type-agnostic). State this explicitly in the spec so no per-type edit endpoint is built. Engine refusals map to typed 4xx envelopes: InvalidTransition, EditRefused(blockers=[concrete docs]), ClosedPeriodRefused(periods), ValueError(bad to_version). Each mutation stays ONE engine transaction (full rollback on mid-cascade failure); no deletion path exists or is added. EditResult.cascade is surfaced on the mutate response so callers see corrected dependents (the standalone cascade PREVIEW is docs-history-read). Founder critical human_gate is the per-stage verification.",
+      "acceptance_criteria": [
+        "`documents/api.py` + `documents/urls.py` created; `api/documents/` mounted (with print sub-route intact); reachable post-auth + rights-checked; MUTATE verbs only (reads = docs-history-read)",
+        "finalize (draft→final) and edit (full {base,data} payload; partial rejected; drafts post nothing) exposed over engine.finalize/engine.edit",
+        "edit is ONE generic verb wrapping reverse-and-repost around each producer's EXISTING create serializer (per-producer {base,data} payload); NO per-type edit adapter written (codex concern resolved)",
+        "storno (final only) exposed: exactly one of to_version / zero_effect=True; no-cancellation types refuse cleanly (NotImplementedError → typed 4xx)",
+        "Engine refusals → typed envelopes: InvalidTransition, EditRefused(blockers), ClosedPeriodRefused(periods), bad-version ValueError; one transaction per mutation, full rollback proven",
+        "NO deletion path added (test asserts absence); EditResult.cascade surfaced on the mutate response so callers see corrected dependents",
+        "API test exercises finalize→edit→storno(zero-effect) on a FixtureDoc/real type; founder critical gate inputs prepared"
+      ],
+      "touched": [
+        "backend/apps/documents/api.py",
+        "backend/apps/documents/urls.py",
+        "backend/erp/urls.py",
+        "backend/apps/documents/serializers.py",
+        "backend/apps/documents/tests/test_lifecycle_api.py"
+      ]
+    },
+    {
+      "id": "docs-history-read",
+      "name": "[NEW] documents read API — version-history + dependency-cascade-PREVIEW GETs over the engine (descends from the lifecycle contract)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "Add the READ half of `documents/api.py` — split out of the keystone `docs-lifecycle-api` contract (which owns the MUTATE verbs) per the dual-audit reconciliation — as thin GETs over the same engine, descending from that frozen contract. Two read endpoints, no mutation, no new engine logic: (1) version-history — the `DocumentVersion` list for a document, ordered, with `current_version` marked (a thin GET over the version store); (2) dependency-cascade PREVIEW over `engine.collect_dependents` — read-only, topologically ordered, disposition-bearing (the SAME traversal the resolver uses, surfaced before a mutation so a caller/clerk sees what an edit/storno would touch). Both are rights-checked + F1-enveloped exactly like the lifecycle verbs, mounted under the same `api/documents/` surface the contract froze (this stage adds routes; it does NOT re-mount or alter the contract's mutate endpoints). No deletion path; no write path. The reusable FE document-actions controls (vehicle-fe) render history + the cascade preview from THESE endpoints before offering edit/storno. Prove via API test: version-history lists a document's versions with current marked; the cascade preview returns the topo-ordered disposition-bearing dependents for a document that has them (and an empty set for a leaf document), matching the resolver's own traversal.",
+      "acceptance_criteria": [
+        "version-history GET: returns the DocumentVersion list for a document, ordered, with current_version marked; thin read over the engine/version store (no mutation)",
+        "dependency-cascade PREVIEW GET over engine.collect_dependents: read-only, topologically ordered, disposition-bearing — matches the resolver's traversal",
+        "Both endpoints mounted under the contract's `api/documents/` surface as added routes; the mutate endpoints are NOT re-mounted or altered",
+        "Rights-checked + F1 envelope; no deletion/write path (test asserts read-only)",
+        "Descends from docs-lifecycle-api (the frozen contract); the vehicle-fe document-actions controls consume these for history + pre-mutation cascade preview",
+        "API test: version-history lists versions (current marked); cascade preview returns topo-ordered dependents for a doc with dependents + empty for a leaf doc"
+      ],
+      "touched": [
+        "backend/apps/documents/api.py",
+        "backend/apps/documents/urls.py",
+        "backend/apps/documents/serializers.py",
+        "backend/apps/documents/tests/test_history_read_api.py"
+      ]
+    },
+    {
+      "id": "engine-reverify",
+      "name": "[KEEP] foundation engine re-verify THROUGH the new lifecycle API — posting/register/snapshot/period + fiscal numbering, prove idempotency + write-guards",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "VERIFY-ONLY KEEP stage (routine = no post-build code audit) — re-verify (do NOT rebuild) the foundation engine in reality on the test ERP, exercising it THROUGH the newly exposed lifecycle API (docs-lifecycle-api) so the proof covers the real seam, not just callable-Python; prove the EXISTING behavior on the new deps and ship NO production code fix here. Re-run, on real data: posting (post_document_event is the ONLY write path — a direct movement save outside engine context still raises), the R-register effects + balances on both managerial/official axes, the per-register snapshot + registers_period_state, the closed-period refusal path (ADR-0003 reversal dating — original managerial_date while open, current-period-adjustment when closed), and the fiscal-numbering integration: R15A SupplierFiscalInvoice / R15B IssuedFiscalInvoice + Diapazon (fiscal ranges, FK → OwnPJ) auto-assign-but-editable + release-and-reuse, e-factura register/cancel. Prove idempotency (re-posting a version REPLACES, never appends — ADR-006 P4) and the write-guards hold. NO rebuild — this proves the existing asset is sound on this data through the exposed API. INTEGRATOR NOTE: Diapazon data must be seeded / admin-entered for each issuing OwnPJ before the fiscal-invoice path is testable (its management screen is L9). Authenticate before asserting; if a defect requiring a CODE change to the engine is found, ESCALATE it for a separate structural fix stage — never silently patch the engine here (routine ships no un-audited code fix).",
+      "acceptance_criteria": [
+        "Engine exercised through the docs-lifecycle API on the test ERP: finalize→edit→storno post/reverse correctly; registers net to zero on a zero-effect storno",
+        "post_document_event remains the ONLY write path (out-of-context direct movement save raises); balances correct on managerial AND official axes",
+        "Idempotency proven: re-posting a version replaces (no append); per-register snapshot + registers_period_state consistent",
+        "Closed-period refusal + current-period-adjustment dating (ADR-0003) verified by artificially closing a period",
+        "Fiscal numbering integration: R15A/R15B + Diapazon auto-assign/editable/release-reuse + e-factura register-cancel re-verified on real data",
+        "Diapazon-seed prerequisite documented for the integrator (per issuing OwnPJ, before this path); VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change to the engine is found, ESCALATE for a separate structural fix stage — never an in-place engine patch here."
+      ],
+      "touched": [
+        "backend/apps/documents/tests/test_engine_reverify_via_api.py",
+        "backend/apps/registers/tests/test_balances_reverify.py",
+        "backend/apps/fiscal/tests/test_diapazon_reverify.py"
+      ]
+    },
+    {
+      "id": "vehicle-fe",
+      "name": "[NEW] FE: Vehicle screen + REUSABLE document-actions controls (cancel/storno/edit/history) — the create-only pattern STOPS here",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build, on the verified L5 contracts (vehicle-rest + docs-lifecycle-api for the MUTATE verbs + docs-history-read for the READ endpoints), TWO deliverables running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). (1) A Vehicle management screen: list + create/edit (owner Counterparty with add-new-inline, make/model/registration_number, mileage) + deactivate (PUT active=false); custody/follow_up shown READ-ONLY (intake is L7). (2) The KEYSTONE FE asset — a REUSABLE \"document actions\" control set (cancel/storno, edit, version-history viewer, dependency-cascade preview) that mounts on ANY operational document screen; the mutate actions (edit/storno) drive the docs-lifecycle API and the history + cascade-preview reads come from docs-history-read; L6/L7/L8 operational screens mount THIS component so the create-only pattern never recurs. The controls must: offer edit (full {base,data} payload), storno (zero-effect cancel OR revert-to-version), render version-history (current marked) + the cascade preview before a mutation, and surface the typed engine refusals (EditRefused blockers list, ClosedPeriodRefused, InvalidTransition) as clear Romanian messages. Standing factory law: soft-delete = deactivate; pickers add-new-inline; edits via PUT. Self-loop visually. FOUNDER GATE (met here): create a Vehicle; then on an EXISTING inventory-procurement document use cancel/storno + history and watch the registers net to zero — the first proof of engine + lifecycle verbs end-to-end on real screens.",
+      "acceptance_criteria": [
+        "Vehicle screen: list + create/edit (owner add-new-inline, make/model/reg, mileage) + deactivate (PUT active=false); custody/follow_up read-only",
+        "Reusable document-actions component built (cancel/storno, edit, version-history, cascade-preview) driving the docs-lifecycle API — designed for L6/L7/L8 reuse",
+        "edit sends full {base,data} payload; storno offers zero-effect cancel OR revert-to-version; history shows versions with current marked",
+        "Typed engine refusals surfaced as Romanian messages: EditRefused(blockers list), ClosedPeriodRefused, InvalidTransition; cascade preview shown before mutating",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; add-new-inline returns the new row selected; soft-delete only",
+        "vitest covers the Vehicle screen + the document-actions states (edit/storno/history/refusal)",
+        "Founder gate inputs ready: create Vehicle + cancel/storno+history on an existing inventory-procurement doc → registers net to zero"
+      ],
+      "touched": [
+        "frontend/src/modules/parties/VehicleScreen.tsx",
+        "frontend/src/modules/documents/DocumentActions.tsx",
+        "frontend/src/modules/documents/VersionHistory.tsx",
+        "frontend/src/modules/documents/CascadePreview.tsx",
+        "frontend/src/api/documents.ts"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["docs-lifecycle-api", "docs-history-read"],
+    ["docs-lifecycle-api", "engine-reverify"],
+    ["vehicle-rest", "vehicle-fe"],
+    ["docs-lifecycle-api", "vehicle-fe"],
+    ["docs-history-read", "vehicle-fe"]
+  ]
+}

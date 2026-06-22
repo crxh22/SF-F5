@@ -1,0 +1,127 @@
+{
+  "stages": [
+    {
+      "id": "cont-quote-land",
+      "name": "[REBUILD] cont-quote-core land — graft the branch, re-verify the EXISTING /api/quotes/ + discount Σ≡total + lifecycle + 62-day auto-refuse + R6 payment-state + relink guard against the NOW-REAL L1–L5 deps, resolve contest #104 (contested finding ASM-006), then merge",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "CORRECTION vs DRAFT (doc-1 §1.1): the `stage/service-orders.cont-quote-core` branch ALREADY ships the backend REST — `so_quotes/api.py` (~400 lines: QuotesCollectionView POST create/GET list, QuoteDetailView GET/PUT edit, SendForCoordination/Accept/Refuse/Relink) + `so_quotes/urls.py` mounting `/api/quotes/` + an `erp/urls.py` patch — so this stage is RE-VERIFY + LAND the existing API, NOT build-from-scratch (only the React editor was peeled, → L7 FE stages). GRAFT the 37-file `so_quotes` app onto the now-real foundation (it is 1 commit behind, merges 0-conflict per merge-tree) and FREEZE `/api/quotes/` as this layer's contract — the cont/quote editor + ZN build on it. Re-verify HARD against the NOW-REAL deps L1–L5 (real Contract/Vehicle/Counterparty/Part/Document, NOT the branch fixtures): the discount matrix invariant Σ effective_value ≡ Cont.total to the cent for every (method × scope) with the rounding remainder on the largest in-scope line; the commercial lifecycle (draft→awaiting→accepted/refused + re-coordination revert) through `status_layers.transition`; the 62-day auto-refuse scan (`get_param('quote_auto_refuse_timeout')`, skip released conts); the R6-derived payment_state (paid/residual_debt); and the relink guard (relink to a new Contract blocked → ConformityTicket when lines carry a ZN mapping). RESOLVE the open contested audit #104 (contested finding ASM-006) (`unresolved_contest` on this branch, dossier `/artifact/1200`) AT THIS TIME: feed the exported dossier + the contested finding as a documented spec INPUT, classify it per architect-operations §1 (comply→fix in this graft / accurate-no-action→settled / spec-lie→correct the spec), and record the disposition before merge. Mount `/api/quotes/` in `erp/urls.py` and prove the suite green on real deps; THEN merge. Soft-delete/lifecycle discipline preserved (no destructive delete; storno via the lifecycle).",
+      "acceptance_criteria": [
+        "`so_quotes` grafted onto real main (0-conflict); `/api/quotes/` (Collection/Detail/SendForCoordination/Accept/Refuse/Relink) mounted in `erp/urls.py` + reachable post-auth; frozen as the layer contract",
+        "Discount invariant proven on real data: Σ effective_value ≡ Cont.total to the cent for every (method × scope); rounding remainder lands on the largest in-scope line",
+        "Lifecycle (draft→awaiting→accepted/refused + re-coordination revert) runs through status_layers.transition; 62-day auto-refuse skips released conts; R6-derived payment_state (paid/residual_debt) correct",
+        "Relink guard verified: relinking a cont with ZN-mapped lines is blocked and raises a ConformityTicket; clean relink succeeds",
+        "Contest #104 (contested finding ASM-006) resolved here: dossier `/artifact/1200` fed as a documented input, the finding classified (comply/settled/spec-fix) per architect-operations §1, disposition recorded before merge",
+        "Re-verified against REAL L1–L5 deps (not branch fixtures); the so_quotes suite is green on this data; merge only after the contest disposition + green suite"
+      ],
+      "touched": [
+        "backend/apps/so_quotes/api.py",
+        "backend/apps/so_quotes/urls.py",
+        "backend/erp/urls.py",
+        "backend/apps/so_quotes/discount.py",
+        "backend/apps/so_quotes/lifecycle.py",
+        "backend/apps/so_quotes/tests/test_api.py"
+      ]
+    },
+    {
+      "id": "quote-editor-lines",
+      "name": "[NEW] FE: cont/quote editor — header + lines (create/edit a quote header + lines grid via /api/quotes/ ContLine/QuoteLine; full UI/UX gate — important screen)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build PART 1 of the peeled cont/quote editor on the frozen `/api/quotes/` contract (the React editor was deliberately peeled from the branch — this is it), running the full UI/UX gate (antd only via `src/ui` wrappers, Romanian copy, tokens, founder visual review — an important screen). Scope is the quote HEADER + the LINES grid only (discounts + lifecycle are the sibling quote-editor-flow stage): create/edit a Cont de plata header (contract, tip_cont, vehicle/payer/owner, direction, office employee, assessment, comments) via `POST /api/quotes/` and `PUT /api/quotes/<id>/`, and a lines grid for work/part/material lines (kind, qty, unit_price, comment, client part description) showing the server-derived effective_value per line + the running total read back from the detail response (the editor never computes money — the backend owns Σ). The editor writes quote LINES (ContLine/QuoteLine) through the `/api/quotes/` API only — it does NOT touch ZN or `zn-core`: the PART picker on a part line calls the inventory `GET /api/parts/search` (IP4) and posts the chosen part onto the cont line via `/api/quotes/`; the `/api/quotes/` backend is what creates the L1 ZnLine anchor server-side from that cont line, so the FE has NO direct dependency on the (later, separately-frozen) ZN seam. Add-new-inline supported on the part picker. Operational-FE law applies: edit is first-class and the version-history surface is mounted; never a destructive delete (a removed line is a content edit through PUT). Surface the API 400/409 envelope (invalid composition, unknown line) inline. vitest covers header create/edit, line add/edit/remove with server-derived totals reflected, and the part-line-write-through-quotes-API path.",
+      "acceptance_criteria": [
+        "Quote header create/edit wired to `POST /api/quotes/` + `PUT /api/quotes/<id>/` (contract/tip_cont/vehicle/payer/direction/office/assessment/comments)",
+        "Lines grid for work/part/material (kind/qty/unit_price/comment/part description); server-derived effective_value + total read back from the detail response (UI never computes money)",
+        "Part picker calls `GET /api/parts/search` (IP4) + posts the part onto the cont line via `/api/quotes/` (ContLine/QuoteLine); the ZnLine anchor is created server-side by the quotes API — NO direct FE dependency on `zn-core`; add-new-inline on the part picker returns the new row selected",
+        "Edit first-class + version-history mounted; line removal is a PUT content edit, never a hard delete",
+        "API 400/409 envelopes (invalid_cont_composition / unknown_cont_line / invalid_field_value) surfaced inline; antd via src/ui, Romanian, tokens",
+        "vitest: header create/edit + line add/edit/remove with server totals reflected + part-line-write-through-quotes-API; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/quotes/QuoteEditorPage.tsx",
+        "frontend/src/features/quotes/QuoteLinesGrid.tsx",
+        "frontend/src/features/quotes/QuotePartPicker.tsx",
+        "frontend/src/api/quotes.ts",
+        "frontend/src/features/quotes/QuoteEditorPage.test.tsx"
+      ]
+    },
+    {
+      "id": "quote-editor-flow",
+      "name": "[NEW] FE: cont/quote editor — discounts + lifecycle (discount scope/method controls Σ lines≡total; send-for-coordination/accept/refuse + lifecycle/history)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build PART 2 on the SAME cont/quote editor (depends on quote-editor-lines), running the full UI/UX gate (antd via `src/ui`, Romanian copy, tokens, founder visual review). Two capability groups. (1) Discount controls: header discount_scope (none / total_works / total_parts / grand_total / individual_line) × discount_method (percentage / target_amount) + discount_value, plus per-line discount (line_discount_method/value) for the individual_line scope — on save the editor re-reads the detail response and DISPLAYS the server-distributed discount_amount/effective_value per line and the recomputed total, demonstrating Σ effective_value ≡ total to the cent (the UI presents, never recomputes — the backend discount engine is authoritative; surface the `invalid_discount` 400 envelope on a bad scope/method/value combo). (2) Lifecycle controls + history: send-for-coordination / accept / refuse buttons calling `POST /api/quotes/<id>/{send-for-coordination,accept,refuse}`, gated by the cont's current status (a refused cont can be re-accepted; an accepted edit triggers the §5.2 re-coordination revert) and surfacing the `invalid_quote_transition` 409; mount the version-history view. Operational-FE law: no destructive delete; storno/lifecycle is via these transitions. vitest covers each discount scope×method reflecting the server-distributed result and the lifecycle transitions incl. an illegal-transition 409.",
+      "acceptance_criteria": [
+        "Discount controls: scope (none/total_works/total_parts/grand_total/individual_line) × method (percentage/target_amount) + value + per-line discount for individual_line; bad combos surface the `invalid_discount` 400",
+        "On save the editor re-reads detail + displays server-distributed discount_amount/effective_value per line + the recomputed total (Σ effective ≡ total to the cent, presented not computed)",
+        "Lifecycle buttons wired: send-for-coordination / accept / refuse via `POST /api/quotes/<id>/…`, gated by current status (refused→accepted allowed); `invalid_quote_transition` 409 surfaced",
+        "An accepted-cont content edit triggers the re-coordination revert (reflected in the status surface); version-history view mounted",
+        "No destructive delete; storno/lifecycle via the transitions; antd via src/ui, Romanian, tokens",
+        "vitest: each discount scope×method reflecting the server result + send/accept/refuse transitions + an illegal-transition 409; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/quotes/QuoteDiscountControls.tsx",
+        "frontend/src/features/quotes/QuoteLifecycleBar.tsx",
+        "frontend/src/features/quotes/QuoteHistory.tsx",
+        "frontend/src/api/quotes.ts",
+        "frontend/src/features/quotes/QuoteLifecycleBar.test.tsx"
+      ]
+    },
+    {
+      "id": "zn-core",
+      "name": "[NEW] ZN core — ZN+ZnLine behaviour over the frozen L1 skeletons (verification/procurement/production status layers, restant chain, cont→ZN line mapping); freezes the ZN API",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "Build the ZN (zona de necesitate / work-order) behaviour NEW over the byte-frozen L1 `Zn`/`ZnLine` skeletons (status columns already declared on the models: status_verification {awaiting_verification,…}, status_procurement, status_production, an Origin {ordinary,restant} + the restant_origin chain ref) and FREEZE a ZN REST surface as this stage's contract (the ZN screen builds on it). Implement the three status LAYERS through `status_layers.transition` (never raw field writes — the framework stamps the date_* columns + writes the immutable StatusTransitionLog): a verification layer, a procurement-status layer, and a production-status layer, each with its documented legal source-set per layer (fail-explicit, like the cont lifecycle). Implement the restant CHAIN (a restant-origin ZN records its creation date + origin marker + the chain ref back to its predecessor) and the cont→ZN line MAPPING (`ZnLine.cont_line` PROTECT FK to the L1 `ContLine` — a ZN line maps to exactly one cont line; the L7 cont editor already writes that anchor). Expose ZN list/detail + the status-transition endpoints + a create-from-accepted-cont path; keep the layering rule (no upward FK from registers/procurement; procurement already references the ZN by BigInteger). Prove via API test: create a ZN from an accepted cont, walk each status layer through its legal transitions (illegal source rejected), and build a restant ZN linking back to its origin.",
+      "acceptance_criteria": [
+        "ZN REST frozen as the contract: list/detail + per-layer status-transition endpoints + create-from-accepted-cont; reachable + rights-gated post-auth",
+        "Three status layers (verification/procurement/production) driven through status_layers.transition with per-layer legal source-sets; illegal source rejected (fail-explicit); date_* + StatusTransitionLog stamped by the framework",
+        "Restant chain implemented: a restant-origin ZN carries its creation date + origin marker + chain ref to its predecessor",
+        "cont→ZN line mapping enforced: `ZnLine.cont_line` PROTECT FK to L1 ContLine; a ZN line maps to exactly one cont line; mapping integrity guarded",
+        "Layering preserved: no new upward FK; procurement's BigInteger ZN reference + lazy import unchanged",
+        "API test: create-from-accepted-cont, walk each status layer (legal + an illegal-source rejection), build a restant ZN linking to origin"
+      ],
+      "touched": [
+        "backend/apps/service_orders/zn.py",
+        "backend/apps/service_orders/api.py",
+        "backend/apps/service_orders/urls.py",
+        "backend/erp/urls.py",
+        "backend/apps/service_orders/tests/test_zn_core.py"
+      ]
+    },
+    {
+      "id": "zn-screen",
+      "name": "[NEW] FE: ZN board — status layers, lines, links back to its Cont; add-new-inline for parts/executors",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the ZN board/screen on the frozen ZN REST contract (zn-core), running the full UI/UX gate (antd via `src/ui` wrappers, Romanian copy, tokens, founder visual review) and registering into the new L0 menu. The board renders a ZN's three status LAYERS (verification / procurement / production) as distinct, clearly-labelled status surfaces with the legal transition actions wired to the zn-core status-transition endpoints (an illegal transition is not offered; a server 409 is surfaced gracefully), the ZN LINES (each mapped back to its cont line), and a LINK back to the originating Cont de plata (and, for a restant ZN, a link along the restant chain to its origin). Add-new-inline supported for the parts + executors pickers on a ZN line (returning the new row selected). Operational-FE law: edit is first-class and the transition history is visible; no destructive delete (a line change is a content edit; status changes go through the transitions, never a raw write). vitest covers rendering the three status layers, performing a legal transition, surfacing an illegal-transition 409, and the cont/restant back-links + add-new-inline. This is the L7 founder-gate capstone screen (open the ZN produced from an accepted cont and walk its statuses).",
+      "acceptance_criteria": [
+        "ZN board renders the three status layers (verification/procurement/production) as distinct labelled surfaces; legal transitions wired to zn-core endpoints; illegal transitions not offered + server 409 surfaced",
+        "ZN lines shown, each linked back to its cont line; a link back to the originating Cont de plata is present",
+        "Restant ZN shows the chain link to its origin",
+        "Add-new-inline for parts + executors on a ZN line returns the new row selected; soft-delete = deactivate, no hard delete",
+        "Edit first-class + transition history visible; status changes only via transitions (no raw write); antd via src/ui, Romanian, tokens",
+        "vitest: three-layer render + a legal transition + an illegal-transition 409 + cont/restant back-links + add-new-inline; founder visual gate passes"
+      ],
+      "touched": [
+        "frontend/src/features/zn/ZnBoardPage.tsx",
+        "frontend/src/features/zn/ZnStatusLayers.tsx",
+        "frontend/src/features/zn/ZnLinesPanel.tsx",
+        "frontend/src/api/zn.ts",
+        "frontend/src/features/zn/ZnBoardPage.test.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["cont-quote-land", "quote-editor-lines"],
+    ["cont-quote-land", "quote-editor-flow"],
+    ["cont-quote-land", "zn-core"],
+    ["quote-editor-lines", "quote-editor-flow"],
+    ["zn-core", "zn-screen"]
+  ]
+}

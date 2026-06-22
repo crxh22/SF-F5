@@ -1,0 +1,101 @@
+{
+  "stages": [
+    {
+      "id": "counterparty-rest",
+      "name": "[NEW] Counterparty + CounterpartyRole REST (commercial rows only; role add/remove; supplier/client/employee/outsourcer filters)",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "Extend `parties/api.py` (built in L2) with the Counterparty + CounterpartyRole CRUD and FREEZE it as this layer's primary contract — it is the seam the Counterparty FE and every app-wide counterparty picker (procurement, contracts, executors, warehouses) build on. Expose list/create/edit (PUT, full-object) of COMMERCIAL counterparties ONLY: the queryset MUST go through `Counterparty.objects.commercial()` (which excludes any row holding the SYSTEM_COUNTERPARTY role) so the system tax counterparties spawned by OwnPJ are never listed, edited, or deleted via this API — guard create/edit so a commercial row can never acquire system_kind/system_own_pj/the SYSTEM_COUNTERPARTY role. Support role add/remove against the closed role vocabulary (client/supplier/employee/outsourcer) with the per-(counterparty,role) uniqueness honored (adding a held role is a no-op or a clean 400, never a duplicate). Provide filter params for supplier/client/employee/outsourcer (role-membership filters) for the pickers. Counterparty has NO `active` column in the real model, but the standing soft-delete law needs a target here: add a nullable `active` column to Counterparty (`apps/parties/models.py`) + a reversible migration so deactivate = PUT active=false (never DELETE); the `.commercial()` queryset/serializer expose it. No DELETE/PATCH. Rights-checked + F1 envelope. Prove via API test: create a commercial counterparty with two roles; system rows are invisible/guarded; role add is idempotent; role filters select correctly; PUT active=false deactivates without DELETE.",
+      "acceptance_criteria": [
+        "Counterparty list/create/edit added to parties REST; list + all writes scoped through `Counterparty.objects.commercial()` (SYSTEM_COUNTERPARTY rows excluded)",
+        "Create/edit cannot set system_kind/system_own_pj or attach the SYSTEM_COUNTERPARTY role (guarded; commercial rows stay commercial)",
+        "Role add/remove over {client,supplier,employee,outsourcer}; per-(counterparty,role) uniqueness honored (re-add is no-op/clean 400, no duplicate)",
+        "Role-membership filters (supplier/client/employee/outsourcer) drive the app-wide pickers",
+        "Adds a nullable `active` column + reversible migration so deactivate = PUT active=false (never DELETE); no DELETE/PATCH; real DB keys returned",
+        "API test: 2-role commercial counterparty created; system counterparties unreachable here; role-add idempotent; filters correct; PUT active=false deactivates"
+      ],
+      "touched": [
+        "backend/apps/parties/api.py",
+        "backend/apps/parties/urls.py",
+        "backend/apps/parties/serializers.py",
+        "backend/apps/parties/models.py",
+        "backend/apps/parties/migrations/0003_counterparty_active.py",
+        "backend/apps/parties/tests/test_counterparty_api.py"
+      ]
+    },
+    {
+      "id": "contract-rest",
+      "name": "[NEW] Contract REST — full clean() surfaced (alb⇒own_pj req / negru⇒forbidden; ≤1 money location; pay-cat direction match)",
+      "risk_class": "critical",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "Add Contract CRUD to `parties/api.py` and FREEZE it as a contract seam — it is risk_class CRITICAL (doc-1 §4) because it carries the money/legal correctness rules a clerk hits daily and the founder must personally gate. The API MUST surface Contract.clean() in full as field-level 400s, NOT only the admin/DB CheckConstraints: (a) delivery_payment_mode=alb REQUIRES own_pj, negru FORBIDS own_pj (mirrors the contract_own_pj_iff_alb check); (b) at most one of default_cash_desk / default_bank_account set (contract_at_most_one_money_location); (c) default_payment_category_in.direction must be IN and default_payment_category_out.direction must be OUT (direction match). Expose create/edit (PUT, full-object) over the real FKs (counterparty PROTECT, contract_type, own_pj nullable, the two money-location FKs, price_level, the two payment-category FKs); serializer runs full_clean so every rule fires on the API path; PROTECT-on-delete and the salary/installment JSON/Money fields pass through untouched (consuming phases own their semantics — document them as read/opaque here). Soft-delete = PUT active=false (the model has `active`). No DELETE/PATCH. Founder human_gate is this stage's verification. Prove via API test every clean() branch rejects its bad combo and a valid alb + valid negru contract each save.",
+      "acceptance_criteria": [
+        "Contract list/create/edit added to parties REST; serializer runs full_clean so clean() fires on every API write (not just admin/DB)",
+        "alb⇒own_pj required AND negru⇒own_pj forbidden enforced as field-level 400s (both directions tested)",
+        "At-most-one money location enforced (cash_desk XOR bank_account; both-set rejected)",
+        "Payment-category direction match enforced: default_payment_category_in must be IN, _out must be OUT (wrong-direction rejected)",
+        "Real FKs (counterparty/contract_type/own_pj/cash_desk/bank_account/price_level/payment_category x2) resolve; PROTECT honored; salary/installment fields pass through opaque",
+        "Soft-delete = PUT active=false; no DELETE/PATCH; founder human_gate gates the stage; API test covers every clean() branch + a valid alb + a valid negru"
+      ],
+      "touched": [
+        "backend/apps/parties/api.py",
+        "backend/apps/parties/serializers.py",
+        "backend/apps/parties/urls.py",
+        "backend/apps/parties/models.py",
+        "backend/apps/parties/tests/test_contract_api.py"
+      ]
+    },
+    {
+      "id": "counterparty-fe",
+      "name": "[NEW] FE: Counterparty screen (list + create/edit, multi-role chips) — the app-wide add-new-inline picker target",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the Counterparty management screen on the counterparty-rest contract, running the full UI/UX gate (src/ui wrappers only, Romanian copy, tokens, founder visual review). List + create/edit drawer with MULTI-ROLE chips (add/remove client/supplier/employee/outsourcer, reflecting the per-role uniqueness — a held role can't be added twice). Only COMMERCIAL counterparties are shown/edited (the API already guards system rows; the UI never offers system-counterparty creation). This screen is ALSO the canonical add-new-inline component every counterparty picker app-wide reuses (procurement, contracts, executors, warehouses): expose a reusable inline-create that, on save, returns the newly created counterparty already selected to the calling picker. Operational-FE law applies: edit + deactivate (PUT active=false; never hard delete) + the create-only pattern does not recur; multi-role editing is the history surface here. Role filters (supplier/client/…) available as list filters. vitest covers list/create/edit, role chip add/remove, and the inline-create-returns-selected flow.",
+      "acceptance_criteria": [
+        "List + create/edit drawer for commercial counterparties; multi-role chips add/remove {client,supplier,employee,outsourcer} with held-role de-dup",
+        "Reusable add-new-inline component: invoked from any counterparty picker, returns the new row selected to the caller",
+        "System counterparties never shown or creatable; only commercial rows surfaced",
+        "Edit + deactivate (PUT active=false); no hard delete; role-membership list filters present",
+        "antd only via src/ui wrappers; Romanian copy; tokens; founder visual gate passes",
+        "vitest: list/create/edit + chip add/remove + inline-create-returns-selected"
+      ],
+      "touched": [
+        "frontend/src/modules/parties/CounterpartyScreen.tsx",
+        "frontend/src/modules/parties/CounterpartyPicker.tsx",
+        "frontend/src/api/parties.ts",
+        "frontend/src/modules/parties/CounterpartyScreen.test.tsx"
+      ]
+    },
+    {
+      "id": "contract-fe",
+      "name": "[NEW] FE: Contract screen (conditional fields by alb/negru + money-location XOR; inline add-new Counterparty/PriceLevel/PaymentCategory)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the Contract management screen on the contract-rest contract, running the full UI/UX gate. Create/edit with CONDITIONAL fields driven by the model rules so bad combos are blocked before submit and the API 400 is surfaced on edge cases: (a) when delivery_payment_mode=alb, own_pj is REQUIRED and shown; when negru, own_pj is hidden/forbidden; (b) the default money location is a single choice — cash_desk XOR bank_account (selecting one clears/disables the other); (c) default_payment_category_in restricted to IN-direction categories, default_payment_category_out to OUT-direction. Inline add-new for Counterparty (reusing the counterparty-fe inline component), PriceLevel, and PaymentCategory directly from the form. Operational-FE law: edit + deactivate (PUT active=false) + history; never hard delete. The form must mirror clean() as UI validation (alb/negru, money-location XOR, direction match) AND still gracefully surface a server 400 envelope. vitest covers the conditional field behavior and each validation block. Founder gate: create a commercial Counterparty (2 roles) then a Contract (alb) and watch alb/negru + money-location validation block bad combos.",
+      "acceptance_criteria": [
+        "Create/edit with conditional own_pj (required on alb, hidden/forbidden on negru) mirroring contract_own_pj_iff_alb",
+        "Money-location XOR: choosing default_cash_desk disables/clears default_bank_account and vice-versa; both-set impossible in the UI",
+        "Payment-category pickers filtered by direction (in=IN, out=OUT); wrong-direction not selectable; server 400 surfaced if it slips",
+        "Inline add-new for Counterparty (reuses counterparty-fe component), PriceLevel, PaymentCategory from within the form",
+        "Edit + deactivate (PUT active=false) + history; no hard delete; antd via src/ui, Romanian, tokens; founder visual gate passes",
+        "vitest: conditional fields + alb/negru + money-location-XOR + direction-match validation blocks"
+      ],
+      "touched": [
+        "frontend/src/modules/parties/ContractScreen.tsx",
+        "frontend/src/modules/parties/ContractForm.tsx",
+        "frontend/src/api/parties.ts",
+        "frontend/src/modules/parties/ContractScreen.test.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["counterparty-rest", "contract-rest"],
+    ["counterparty-rest", "counterparty-fe"],
+    ["counterparty-rest", "contract-fe"],
+    ["contract-rest", "contract-fe"]
+  ]
+}

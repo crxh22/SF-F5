@@ -1,0 +1,105 @@
+{
+  "stages": [
+    {
+      "id": "treasury-found",
+      "name": "[RE-SLOT] treasury-app-foundations land — abstract Payment DocumentBacked base + currency resolver + conformity helper + ConformityTicket; FREEZE the Payment seam",
+      "risk_class": "structural",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "Land the existing `treasury` app from `stage/treasury-payments.treasury-app-foundations` (15 files, backend-only, NO api.py) RE-SLOTTED here as L8's contract, and FREEZE the abstract `Payment` base as the seam every producer (L8.2) and screen (L8.3) build on. Graft the skeleton/layering (treasury is the L7 top layer — may reference service_orders + nomenclature; import-linter contract preserved), the abstract `Payment(DocumentBacked)` base (money-location cash_desk XOR bank_account check-constraint; amount + rate stored; currency/direction/own_pj/fiscal_side/amount_mdl all DERIVED via properties, never stored), the currency resolver (`currency.py`: current_rate / mdl_equivalent), the alb/negru conformity helper (`conformity.py`: channel_fiscal_side keyed on CashDeskType.requires_pj, raise_conformity_ticket_if_mismatch — idempotent per (payment_document, cont)), and `ConformityTicket` (the (payment_document, cont) idempotency ledger). The branch merges clean onto main (0 conflicts, 1 trivial commit behind). RE-VERIFY on REAL L1/L2 money nomenclatures (Currency, CashDesk/BankAccount channels, PaymentCategory, DefaultExchangeRate rows) created through L1/L2 REST — NOT the treasury test fixtures (the fixture_payment / FixtureDoc precedent stays test-only). RECONCILE THE RATE WRITER: L2's rate-rest stage already established ONE canonical append-only writer (`nomenclature/exchange_rates.py:set_default_rate`, with the MDL-base + float-rejection + full_clean positive-rate guards folded in) and made `treasury/currency.py:set_exchange_rate` delegate to it (or removed it) — this stage MUST inherit that single-path reconciliation, NOT re-introduce a second writer; treasury keeps ONLY the read helpers current_rate/mdl_equivalent over the one journal. Backend-only — NO api.py this stage (the seam is the abstract base, not an endpoint). Prove: the app loads against real nomenclatures; current_rate resolves a real EUR rate and raises ExchangeRateMissing when absent; the conformity helper raises one idempotent ticket on a real alb/negru mismatch; the rate path writes through the single L2 canonical function (no duplicate writer remains).",
+      "acceptance_criteria": [
+        "treasury app landed (skeleton/layering/migrations) on real main; import-linter layering holds (treasury may reference service_orders + nomenclature; no new upward FK)",
+        "Abstract Payment(DocumentBacked) base frozen: cash_desk XOR bank_account check-constraint; amount+rate stored; currency/direction/own_pj/fiscal_side/amount_mdl derived (never stored)",
+        "Currency resolver re-verified on a REAL DefaultExchangeRate row: current_rate returns the latest-in-force rate; ExchangeRateMissing raised for an unset non-MDL currency; MDL=1 with no row",
+        "Conformity helper + ConformityTicket re-verified: a real alb/negru channel-vs-cont mismatch raises ONE non-blocking accounting Ticket, idempotent per (payment_document, cont)",
+        "Rate writer reconciled to L2's single canonical set_default_rate: treasury set_exchange_rate delegates to (or is removed in favour of) it; NO duplicate writer; read helpers intact",
+        "Re-verified on L1/L2 REST-created nomenclatures (not test fixtures); fixture_payment stays test-only; backend-only (no api.py)",
+        "Real DB keys; one builder pass; build-notes record the reconciliation + the frozen Payment seam for L8.2"
+      ],
+      "touched": [
+        "backend/apps/treasury/models.py",
+        "backend/apps/treasury/currency.py",
+        "backend/apps/treasury/conformity.py",
+        "backend/apps/treasury/migrations/0001_initial.py",
+        "backend/erp/settings/base.py",
+        "backend/apps/treasury/tests/test_seed_verification.py"
+      ]
+    },
+    {
+      "id": "payment-producers",
+      "name": "[NEW] payment producers — concrete incasare/plata_contragent/plata_directa_cheltuieli/state_payment on the abstract base; R5/R6/R8 postings",
+      "risk_class": "critical",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "Peeled from the bundled producers stage at planning (producers + allocation exceeded one builder pass): this stage owns the four concrete PAYMENT DOC TYPES + their postings (the sibling `payment-allocation` owns allocation/advance vs Conts + the conformity ticket). Build the four concrete payment document types NEW on the L8.1 abstract `Payment` base — `incasare` (client receipt, IN), `plata_contragent` (counterparty payment, OUT), `plata_directa_cheltuieli` (direct expense, OUT, counterparty-less + expense_direction_tag), `state_payment` (taxes to the state, OUT) — each registering concretely in the documents registry (the abstract base is never registered; each subclass names its own constraints via the %(class)s templates). On finalize, each producer POSTS through the existing foundation engine: the R5 currency/cash-bank side (keeps the ORIGINAL amount + rate), and the MDL legs R6 (settlement) / R8 (expense, body/service/general tag via expense_direction_tag) / R10 as the doc type requires — money in MDL via mdl_equivalent. Rate is pre-filled from current_rate(currency) and stored per-document (an override allowed, stored on the row). Lifecycle/storno/edit ride the foundation documents engine (reverse-and-repost): a cancelled/reversed payment's R5/R6 rows reverse. This is critical (money posting + irreversible engine paths) — the founder human_gate is the per-stage verification. Allocation against Conts is OUT OF SCOPE here (it is `payment-allocation`); this stage only proves each type posts its own legs correctly. Prove via posting tests: each type posts the correct R5/R6/R8 legs in MDL; direction follows PaymentCategory.direction; an FX payment stores amount+rate and posts the MDL equivalent; a reversal reverses the legs.",
+      "acceptance_criteria": [
+        "Four concrete types (incasare/plata_contragent/plata_directa_cheltuieli/state_payment) register on the abstract Payment base; each names its own constraints; plata_directa_cheltuieli is counterparty-less with an expense_direction_tag",
+        "Finalize posts the correct legs: R5 currency side keeps original amount+rate; R6/R8(/R10) MDL legs via mdl_equivalent; direction follows PaymentCategory.direction",
+        "Rate pre-filled from current_rate(currency), stored per-document with an override allowed; FX payment stores amount+rate and posts the MDL equivalent",
+        "Storno/edit via the foundation documents engine reverse the R5/R6 rows (reverse-and-repost)",
+        "Allocation/advance vs Conts is explicitly OUT OF SCOPE here (owned by payment-allocation); no cont_reference R6 rows posted in this stage",
+        "Each subclass registers concretely (abstract base never registered); real DB keys; one builder pass",
+        "Critical: founder human_gate; dual code audit; posting tests cover each type's legs + a reversal"
+      ],
+      "touched": [
+        "backend/apps/treasury/producers.py",
+        "backend/apps/treasury/api.py",
+        "backend/apps/treasury/urls.py",
+        "backend/erp/urls.py",
+        "backend/apps/treasury/tests/test_producers.py"
+      ]
+    },
+    {
+      "id": "payment-allocation",
+      "name": "[NEW] payment allocation — allocate/advance vs ACCEPTED Conts (NEGATIVE R6, cont_reference=Cont.id) + conformity ticket at recording",
+      "risk_class": "critical",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "Peeled from the bundled producers stage at planning (producers + allocation exceeded one builder pass): this stage owns ALLOCATION/ADVANCE against Conts + the conformity ticket; it descends from `payment-producers` (it allocates the documents that stage produces). Build the allocation path NEW on the concrete payment types: allocating a payment (or advance) against a Cont posts an R6 settlement row carrying the loose integer cont_reference == Cont.id (registers has NO FK to service_orders), settlement_type 'payment' or 'advance_settlement', NEGATIVE amount (debt-reducing — the create_retur_furnizor sign precedent), so the EXISTING so_quotes payment_state.py seam (reads R6 payment-type rows, paid = magnitude clamped >=0) derives the Cont's state (unpaid/partially_paid/fully_paid) with NO new so_quotes code. Allocation targets ONLY Cont.StatusCommercial.ACCEPTED conts (refuse allocation against a non-accepted cont). At RECORDING, call the L8.1 conformity helper so an alb/negru channel-vs-cont mismatch raises its non-blocking idempotent ticket per (payment_document, cont) — the payment still proceeds (informational, addressed to accounting). An advance with no specific Cont yet posts only the R5/cash side until allocated (the seam reads per-cont). Storno/reversal of an allocation reverses the NEGATIVE R6 row so the derived Cont state recovers. This is critical (allocation correctness + the R6 seam that drives every Cont's paid-state + irreversible engine paths) — the founder human_gate is the per-stage verification. Prove via tests: an allocation posts the NEGATIVE R6 row and flips a real ACCEPTED Cont's derived state; a reversal restores it; allocation against a non-accepted cont is refused; an alb/negru mismatch at recording raises ONE idempotent conformity ticket while the payment proceeds.",
+      "acceptance_criteria": [
+        "Allocation/advance posts an R6 row (cont_reference=Cont.id, settlement_type payment|advance_settlement, NEGATIVE amount); the existing so_quotes payment_state seam derives unpaid/partially_paid/fully_paid with no so_quotes change",
+        "Allocation targets ONLY Cont.StatusCommercial.ACCEPTED; allocating against a non-accepted cont is refused",
+        "Conformity helper invoked at recording: a real alb/negru channel-vs-cont mismatch raises the non-blocking idempotent ticket (per (payment_document, cont)); the payment still proceeds",
+        "An unallocated advance posts only the R5/cash side until allocated (the seam reads per-cont)",
+        "Storno/reversal of an allocation reverses the NEGATIVE R6 row so the Cont's derived payment state recovers",
+        "Descends from payment-producers; real DB keys; one builder pass",
+        "Critical: founder human_gate; dual code audit; tests cover allocate→state-flip + reversal + non-accepted-refusal + conformity-ticket-on-mismatch"
+      ],
+      "touched": [
+        "backend/apps/treasury/allocation.py",
+        "backend/apps/treasury/api.py",
+        "backend/apps/treasury/urls.py",
+        "backend/apps/treasury/tests/test_allocation.py"
+      ]
+    },
+    {
+      "id": "payment-fe",
+      "name": "[NEW] FE: take-a-payment + allocate-to-cont screens (channel->currency derived, rate prefill+override, MDL equivalent, conformity ticket surfacing, L5 lifecycle controls)",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React treasury operations screens on the verified L8 backend (payment-producers for the four doc types + their postings, payment-allocation for allocate-to-cont + the conformity ticket), running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). TAKE-A-PAYMENT screen: pick the payment doc type (incasare / plata_contragent / plata_directa_cheltuieli / state_payment); pick a money channel (CashDesk or BankAccount) and DERIVE the currency from the channel (one channel = one currency — show it read-only, never let the user pick a conflicting currency); the PaymentCategory drives the in/out direction (label it distinctly from the body/service/general expense Direction tag, per the two-direction caveat); PREFILL the rate from the current exchange rate for the channel currency with an explicit per-document OVERRIDE field; show the live MDL EQUIVALENT (amount x rate) as the user types; counterparty required except for plata_directa_cheltuieli (counterparty-less, with the expense-direction tag). ALLOCATE-TO-CONT UI: from a recorded payment (or as an advance), search/pick an ACCEPTED Cont and allocate against it; after allocation, SHOW the Cont's DERIVED payment state change (unpaid -> partially/fully paid + residual) so the founder sees the seam move; allocation against a non-accepted cont is not offered/blocked. CONFORMITY surfacing: when recording in a channel whose alb/negru side mismatches the cont's mode, surface the non-blocking conformity ticket inline (the payment still proceeds — it is informational, addressed to accounting). LIFECYCLE/HISTORY: mount the reusable L5 document-actions controls (edit / cancel(storno) / version-history) on every payment — the create-only pattern never recurs. Every picker (channel, PaymentCategory, counterparty, Cont, currency) supports add-new-inline where it makes sense (channels/counterparties yes; Cont is selected not created here). Soft-delete is N/A for posted docs (use storno). These are important screens -> founder visual review is the layer gate.",
+      "acceptance_criteria": [
+        "Take-a-payment: pick doc type + channel; currency DERIVED read-only from the channel (no conflicting pick); PaymentCategory drives direction, labelled distinctly from the expense Direction tag",
+        "Rate prefilled from current rate with an explicit per-document override; live MDL equivalent (amount x rate) shown as the user types; counterparty required except plata_directa_cheltuieli",
+        "Allocate-to-cont: search/pick an ACCEPTED Cont and allocate (or advance); the Cont's DERIVED payment state + residual updates visibly after allocation; non-accepted conts not offered",
+        "Conformity ticket surfaced inline on an alb/negru channel-vs-cont mismatch; the payment still proceeds (non-blocking, informational)",
+        "L5 lifecycle controls (edit / cancel storno / history) mounted on every payment; reversing a payment shows the Cont state recover; create-only pattern absent",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; add-new-inline on channel/counterparty pickers; vitest covers the screens + derived-state + override + conformity states",
+        "Founder visual gate passes (the L8 capstone): FX payment shows MDL equivalent, allocation moves the Cont state, conformity ticket appears on mismatch"
+      ],
+      "touched": [
+        "frontend/src/modules/treasury/TakePaymentScreen.tsx",
+        "frontend/src/modules/treasury/AllocateToContPanel.tsx",
+        "frontend/src/modules/treasury/ConformityTicketBanner.tsx",
+        "frontend/src/api/treasury.ts",
+        "frontend/src/modules/treasury/routes.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["treasury-found", "payment-producers"],
+    ["payment-producers", "payment-allocation"],
+    ["payment-allocation", "payment-fe"]
+  ]
+}

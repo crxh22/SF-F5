@@ -1,0 +1,100 @@
+{
+  "stages": [
+    {
+      "id": "parts-prod-rest",
+      "name": "[KEEP] parts + production nomenclature REST re-verify — FREEZE the catalog/production seam (real keys, M2M, resolve race-safety)",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "VERIFY-ONLY KEEP stage (routine = no post-build code audit) — re-verify (do NOT rebuild) the existing generic nomenclature CRUD at `/api/nomenclature/<key>/` for the REAL parts + production keys and FREEZE that surface as this layer's contract; prove the EXISTING behavior in reality on the new deps and ship NO production code fix here. Every L4 FE leaf builds on it. Parts keys are `generic_parts_catalog` and `specific_parts_catalog` (NOT generic_part — the guess 404s as unknown_nomenclature); production keys are `stages`, `stage_state`, `departments`, `works`, `executor`. Prove live, post-auth (an unregistered device 403s before routing): GET/POST/PUT work and DELETE+PATCH return 405 (soft-delete = PUT active=false). For SpecificPart confirm the enrichment columns surface through the API — `generic_part` FK (link to its Generic), `original_code` (OEM, nullable), `aftermarket_codes` (array), `manufacturer` — and that the partial UNIQUE constraint on `original_code` (uniq_specificpart_original_code, WHERE original_code IS NOT NULL) holds: this is the constraint that makes `apps/procurement/catalog.py:resolve_or_create_specific(code, generic_part=...)` race-safe (resolve is a procurement-app callable, NOT a nomenclature endpoint — verify the constraint here, do not relocate resolve). For production confirm the M2M editors round-trip through the API: Department.base_works / Department.foreign_works (M2M → Stage), Work.stages (M2M → Stage), and Executor's counterparty (OneToOne → parties.Counterparty, nullable), base_department (FK → Department) and procent_executor (decimal fraction). If a rule is found NOT enforced through the API — a defect requiring a CODE change — ESCALATE it for a separate structural fix stage rather than patching in place (routine ships no un-audited code fix). Tie every FE leaf to this stage via the DAG.",
+      "acceptance_criteria": [
+        "`generic_parts_catalog` + `specific_parts_catalog` GET/POST/PUT verified live post-auth; DELETE & PATCH 405; soft-delete = PUT active=false",
+        "SpecificPart API exposes generic_part FK, original_code, aftermarket_codes (array), manufacturer; the partial-unique original_code constraint holds (proven by a duplicate-OEM POST rejected)",
+        "`stages`/`stage_state`/`departments`/`works`/`executor` CRUD verified live; the real registry keys confirmed (no guessed keys)",
+        "M2M round-trips through the API: Department.base_works & foreign_works (→Stage), Work.stages (→Stage) settable + readable",
+        "Executor API: counterparty O2O (nullable), base_department FK, procent_executor decimal all resolve + validate",
+        "resolve_or_create_specific named as a procurement-app callable relying on this constraint (NOT re-exposed here); race-safety constraint re-verified",
+        "VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change is found (a rule not enforced through the API), ESCALATE for a separate structural fix stage — never an in-place fix here."
+      ],
+      "touched": [
+        "backend/apps/nomenclature/api.py",
+        "backend/apps/nomenclature/models/catalog.py",
+        "backend/apps/nomenclature/models/production.py",
+        "backend/apps/nomenclature/tests/test_parts_production_api.py"
+      ]
+    },
+    {
+      "id": "warehouse-rest",
+      "name": "[KEEP] Warehouse nomenclature REST re-verify — nullable responsible Counterparty FK through the API",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "leaf",
+      "acceptance": "VERIFY-ONLY KEEP stage (routine = no post-build code audit) — re-verify (do NOT rebuild) the existing generic nomenclature CRUD for the registered key `warehouse` at `/api/nomenclature/warehouse/`, proving the EXISTING behavior in reality on the new deps; ship NO production code fix here. Prove live post-auth that GET/POST/PUT work and DELETE+PATCH return 405 (soft-delete = PUT active=false). Confirm the `responsible` FK → parties.Counterparty is NULLABLE and resolves through the API (a warehouse may be created with NO responsible, and one may be set/cleared via PUT); confirm the `code` (unique) + `name` fields validate. Note for the integrator: `responsible` points at Counterparty, whose REST landed in L3 — but warehouse's nomenclature CRUD itself is independent and already exists, so this is pure re-verification of an existing endpoint. If a rule is found NOT enforced through the serializer — a defect requiring a CODE change — ESCALATE it for a separate structural fix stage rather than patching in place. Authenticate before asserting (unregistered device 403s before routing). Chained under the contract so the production+warehouse FE leaf relies on a verified surface.",
+      "acceptance_criteria": [
+        "`/api/nomenclature/warehouse/` GET/POST/PUT verified live post-auth; DELETE & PATCH return 405; soft-delete = PUT active=false",
+        "`responsible` FK (→ parties.Counterparty) confirmed NULLABLE: create with no responsible succeeds; set/clear via PUT works",
+        "`code` (unique) + `name` validate on create/edit; duplicate code rejected with a 400",
+        "Counterparty FK resolves (uses the L3 Counterparty rows) and is referenceable in the API response",
+        "VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change is found (a rule not enforced through the serializer), ESCALATE for a separate structural fix stage — never an in-place fix here.",
+        "Authenticated assertions only (no anonymous-curl absence claims)"
+      ],
+      "touched": [
+        "backend/apps/nomenclature/api.py",
+        "backend/apps/nomenclature/models/catalog.py",
+        "backend/apps/nomenclature/tests/test_warehouse_api.py"
+      ]
+    },
+    {
+      "id": "parts-catalog-fe",
+      "name": "[NEW] FE: two-layer Generic→Specific parts catalog manager (OEM/aftermarket codes) — EXTENDS, does not replace, PartsPicker",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React two-layer parts-catalog manager on the verified L4 contract (`generic_parts_catalog` + `specific_parts_catalog`), running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). The screen is a master→detail manager: a GenericPart list (create/edit/deactivate) and, for a selected Generic, its SpecificPart children with the enrichment columns — `original_code` (OEM), `aftermarket_codes` (array editor), `manufacturer` — and create/edit/deactivate of Specifics under that Generic. This EXTENDS, does not replace, the existing search-only `PartsPicker`: keep the picker for search/select flows; this new screen is the management surface around it (and any part picker app-wide must support add-new-inline that lands here / creates through these endpoints). Standing factory law applies: deactivate = PUT active=false (never DELETE/PATCH — they 405); editing is full-object PUT; add-new-inline returns the new row selected. Mirror the backend duplicate-OEM rejection as client validation + surface the API 400 envelope when the server rejects a clashing original_code. Self-loop the screens visually before the founder gate.",
+      "acceptance_criteria": [
+        "Two-layer manager: GenericPart list + its SpecificPart children for a selected Generic; create/edit/deactivate at both layers",
+        "SpecificPart editor covers original_code (OEM), aftermarket_codes (array editor), manufacturer; writes via full-object PUT",
+        "EXTENDS not replaces PartsPicker: the search-only picker stays; this is the management screen; pickers gain add-new-inline that creates through these endpoints",
+        "Soft-delete = deactivate (PUT active=false); no hard delete; duplicate-OEM rejection mirrored client-side + server 400 surfaced",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; add-new-inline returns the new row selected",
+        "vitest covers the master/detail screens + the OEM-clash validation state; founder visual gate inputs prepared"
+      ],
+      "touched": [
+        "frontend/src/modules/catalog/PartsCatalogScreen.tsx",
+        "frontend/src/modules/catalog/SpecificPartDrawer.tsx",
+        "frontend/src/modules/catalog/AftermarketCodesEditor.tsx",
+        "frontend/src/api/catalog.ts"
+      ]
+    },
+    {
+      "id": "prod-warehouse-fe",
+      "name": "[NEW] FE: production + warehouse screens (Stage/StageState/Department/Work/Executor/Warehouse) with M2M editors",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Build the React production + warehouse management screens on the verified L4 contract + warehouse-rest, running the full UI/UX gate (tokens/components, no raw antd outside src/ui, Romanian copy, founder visual review). Six surfaces, each list + create/edit/deactivate: Stage, StageState, Department, Work, Executor, Warehouse. Two M2M editors must round-trip: Department↔Stage (the base_works and foreign_works mappings, presented as distinct chip-sets) and Work↔Stage (work.stages). The Executor form binds counterparty (OneToOne, nullable — add-new-inline to create a Counterparty), base_department (FK), and procent_executor (decimal fraction, e.g. 0.35 — label it clearly as a fraction). The Warehouse form binds the nullable `responsible` Counterparty (also add-new-inline) and may be left empty. Standing factory law: every picker (Stage, Department, Counterparty) supports add-new-inline; deactivate = PUT active=false (never DELETE/PATCH — they 405); edits are full-object PUT. Self-loop visually before the founder gate. The founder L4 gate is met here together with parts-catalog-fe: add a Generic+Specific (OEM code), a Stage, a Department, an Executor (→counterparty+department+percent), and a Warehouse (responsible) — all then selectable in pickers.",
+      "acceptance_criteria": [
+        "Six screens (Stage/StageState/Department/Work/Executor/Warehouse): list + create/edit + deactivate (PUT active=false), full-object PUT",
+        "Department↔Stage M2M editor round-trips base_works + foreign_works as distinct chip-sets; Work↔Stage (work.stages) M2M round-trips",
+        "Executor form: counterparty (O2O, nullable, add-new-inline), base_department (FK), procent_executor (decimal fraction, labelled as such)",
+        "Warehouse form: nullable `responsible` Counterparty (add-new-inline), may be left empty; code/name validated",
+        "Every picker (Stage/Department/Counterparty) supports add-new-inline returning the new row selected; soft-delete only",
+        "All antd via src/ui wrappers, Romanian copy, tokens only; vitest covers screens + M2M editor states",
+        "Founder gate inputs ready: Stage/Department/Executor/Warehouse created here are selectable in pickers"
+      ],
+      "touched": [
+        "frontend/src/modules/production/ProductionScreens.tsx",
+        "frontend/src/modules/production/DepartmentStageM2M.tsx",
+        "frontend/src/modules/production/ExecutorForm.tsx",
+        "frontend/src/modules/catalog/WarehouseScreen.tsx",
+        "frontend/src/api/production.ts"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["parts-prod-rest", "warehouse-rest"],
+    ["parts-prod-rest", "parts-catalog-fe"],
+    ["parts-prod-rest", "prod-warehouse-fe"],
+    ["warehouse-rest", "prod-warehouse-fe"]
+  ]
+}

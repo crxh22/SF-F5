@@ -1,0 +1,82 @@
+{
+  "stages": [
+    {
+      "id": "nomencl-rest-verify",
+      "name": "[KEEP] Re-verify generic nomenclature REST seam (/api/nomenclature/<key>/) for the 9 L1 catalog keys",
+      "risk_class": "routine",
+      "kind": "backend",
+      "role": "contract",
+      "acceptance": "VERIFY-ONLY KEEP stage — prove the EXISTING behavior in reality on the new deps; ship NO production code fix here. Prove IN REALITY (running test ERP, authenticated — an unregistered device 403s before routing, so anonymous curl cannot judge mount) that the existing generic nomenclature CRUD seam at `/api/nomenclature/<key>/` already serves the nine Layer-1 catalog keys with the exact frozen contract every L1 frontend stage will build against, then FREEZE that contract for the layer. The nine real registry keys (verified against `backend/apps/nomenclature/registry.py` + models): `currency`, `bank`, `direction`, `expense_category`, `payment_category`, `cash_desk_type`, `bank_account_type`, `price_level`, `contract_type` (the last is registered in `apps/parties/models.py` but served by the same generic endpoint). Confirm the shape: GET `/api/nomenclature/<key>/` lists, POST creates, GET `/api/nomenclature/<key>/<pk>/` retrieves, PUT `/api/nomenclature/<key>/<pk>/` does a FULL-OBJECT update — and that SOFT-DELETE is `PUT active=false` while DELETE and PATCH both answer 405 by design (`NomenclatureDetailView.http_method_names = [get,put,head,options]`; `test_api.py` already asserts the collection-DELETE 405 — extend TEST coverage to all nine keys + a per-key PATCH/DELETE-405 + a PUT active=false round-trip). Confirm the per-key field shape each catalog screen needs surfaces correctly through the serializer (`fields=__all__`): `payment_category.code` + `direction` IN/OUT enum; `expense_category.code` + `direction` FK→Direction; `cash_desk_type.code` + `requires_pj` bool; `direction.code`; `currency.code`; `bank.code`; `bank_account_type.code`; `price_level.algorithm_key`; `contract_type` fields — and that model `full_clean()` validation errors (e.g. duplicate `code`) come back through the API error envelope, since there is NO separate field-metadata/OPTIONS endpoint (the FE framework drives config-per-entity, not server introspection). This stage is routine = VERIFY-ONLY and gets NO post-build code audit, so a code change must not ship here: if a key is missing/mismounted or PATCH/DELETE do NOT 405 — i.e. a defect requiring a CODE change is found — ESCALATE it for a separate structural fix stage rather than patching in place. The frozen seam (endpoint shape + 405 policy + soft-delete-via-PUT + the per-key writable field set) is the CONTRACT root the whole layer depends on; record it precisely in the .md.",
+      "acceptance_criteria": [
+        "All nine keys (currency, bank, direction, expense_category, payment_category, cash_desk_type, bank_account_type, price_level, contract_type) confirmed reachable+CRUD-capable via /api/nomenclature/<key>/ on the running test ERP, authenticated.",
+        "GET(list)/POST/GET(detail)/PUT(full-object) verified per key; PATCH and DELETE both return 405 for every key (test coverage extended beyond the single existing currency assertion).",
+        "Soft-delete proven as PUT active=false (row deactivates, stays referenceable); no DELETE/PATCH affordance is or will be used anywhere.",
+        "Per-key writable field shape surfaces correctly (payment_category.direction IN/OUT, expense_category.direction FK, cash_desk_type.requires_pj, price_level.algorithm_key, *.code) and clean() errors return through the standard API error envelope.",
+        "No field-metadata/OPTIONS endpoint is assumed — the contract explicitly delegates field/column definitions to FE config-per-entity (documented for the framework stage).",
+        "VERIFY-ONLY: prove the existing behavior in reality on the new deps; if a defect requiring a CODE change is found (missing/mismounted key, wrong 405), ESCALATE for a separate structural fix stage — never an in-place fix here.",
+        "The frozen contract (endpoint shape + 405 policy + soft-delete-via-PUT + nine-key field map) is documented in the companion .md as the layer's seam."
+      ],
+      "touched": [
+        "backend/apps/nomenclature/api.py",
+        "backend/apps/nomenclature/urls.py",
+        "backend/apps/nomenclature/registry.py",
+        "backend/apps/parties/models.py",
+        "backend/apps/nomenclature/tests/test_api.py"
+      ]
+    },
+    {
+      "id": "crud-framework-skeleton",
+      "name": "[NEW] Generic config-driven CRUD catalog framework SKELETON on ONE entity (Currency) — the reusable visual tone-setter",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "contract",
+      "acceptance": "Build the ONE reusable, config-driven catalog screen that every Layer-1 (and later L2/L4) nomenclature instantiates, and prove it end-to-end on a SINGLE entity — Currency — against the frozen `/api/nomenclature/<key>/` seam. This is the visual TONE-SETTER for the whole app: it runs the FULL UI/UX gate against the founder reference apps (NetSuite/Dynamics/Odoo — density + role-model, executed clean), and its config-per-entity descriptor type is the second frozen contract of the layer (the FE seam the fan-out stage drives with config only, no new framework code). Deliverables: (1) a generic `nomenclature.ts` API client (list/create/update via apiFetch over the seam, full-object PUT, soft-delete = PUT active=false; never PATCH/DELETE) returning the paginated `{count,next,previous,results}` envelope; (2) a `CatalogScreen` component driven by an `EntityConfig` descriptor — `{ key, titleRo, columns: ColumnDef[], formFields: FieldDef[] }` where FieldDef covers text/number/select/switch/entity-picker input kinds chosen for MINIMUM clicks (binary → switch not dropdown, ui-ux-laws 9-g) — rendering a LIST (AppTable, dense, exception-first, sortable, active/inactive state visible) + a create/edit DRAWER (AppDrawer + AppForm, full-object PUT on save, optimistic update + instant feedback, validation surfaced from the API error envelope at the right moment, draft never lost) + an explicit DEACTIVATE action (PUT active=false, with reactivate) + an 'adaugă nou' entry point; (3) wire it for Currency as the proving instance (the `currency` config object). The EntityConfig + FieldDef + ColumnDef descriptor types are the CONTRACT — minimal, additive, documented as the public seam; the fan-out stage adds ONLY config objects against them. All styling on tokens + approved components (no raw antd, no hardcoded colors/spacing — mechanical guards green). Standing law baked in: list/drawer expose edit + deactivate(soft-delete via PUT active=false) + the change is auditable/reversible; every entity-picker FieldDef supports add-new-inline (proven generically so instantiations inherit it). Full UI/UX gate: §2 questionnaire (operator role/device, the 500th-use core loop, keyboard operability), all states (loading/error/empty/disabled), desktop+phone capture self-loop. Since this is an 'important screen', it goes to the founder visual review.",
+      "acceptance_criteria": [
+        "Generic nomenclature.ts client (list/create/update over /api/nomenclature/<key>/, full-object PUT, soft-delete=PUT active=false, paginated envelope) added to the api layer; never emits PATCH/DELETE.",
+        "Reusable CatalogScreen driven by an EntityConfig descriptor (key, titleRo, columns, formFields with text/number/select/switch/entity-picker kinds chosen for minimum clicks) renders list + create/edit drawer + deactivate/reactivate + add-new.",
+        "EntityConfig/FieldDef/ColumnDef types are frozen, minimal, and documented as the layer's FE contract; the fan-out stage will add config objects only (no framework code).",
+        "Currency instantiated as the single proving entity: create, edit (full-object PUT), deactivate (PUT active=false) and reactivate all work against the live seam with optimistic update + instant feedback.",
+        "Standing law satisfied generically: edit + soft-delete(PUT active=false, never PATCH/DELETE→405) + reversibility present, and entity-picker fields support add-new-inline so instantiations inherit both.",
+        "Only tokens + approved components used (no raw antd, no hardcoded styles); mechanical UI/UX guards pass; all states loading/error/empty/disabled handled; keyboard-operable, dense per operator philosophy.",
+        "Full UI/UX questionnaire answered + desktop+phone self-capture clean + vitest covers the framework (list/drawer/deactivate/add-new/validation) on Currency; flagged for founder visual review."
+      ],
+      "touched": [
+        "frontend/src/api/nomenclature.ts",
+        "frontend/src/features/catalog/CatalogScreen.tsx",
+        "frontend/src/features/catalog/types.ts",
+        "frontend/src/features/catalog/entities/currency.ts",
+        "frontend/src/features/catalog/strings.ts",
+        "frontend/src/features/catalog/__tests__/CatalogScreen.test.tsx"
+      ]
+    },
+    {
+      "id": "instantiate-catalogs",
+      "name": "[NEW] Instantiate the remaining 8 L1 catalogs on the framework — config-per-entity only, no new framework code",
+      "risk_class": "structural",
+      "kind": "frontend",
+      "role": "leaf",
+      "acceptance": "Drive the `crud-framework-skeleton` CatalogScreen for the other eight Layer-1 nomenclature keys by adding ONLY config objects against the frozen EntityConfig/FieldDef/ColumnDef seam — no new framework code, no new visual primitives. The eight keys + their distinguishing config: `bank` (code/name); `direction` (code/name — the body/service/general tag table, labelled distinctly from PaymentCategory's IN/OUT so the founder never conflates the two 'direction' concepts, per DRAFT Q8); `expense_category` (code + a `direction` entity-picker FieldDef→Direction catalog, with add-new-inline back into the direction catalog); `payment_category` (code + a `direction` IN/OUT switch/segmented control — binary, minimum clicks, NOT a dropdown); `cash_desk_type` (code + a `requires_pj` switch — the flag CashDesk.clean() keys on); `bank_account_type` (code/name); `price_level` (name + `algorithm_key`); `contract_type` (its fields). Register each as a CatalogScreen instance in the L0 menu registry under the `nomenclatoare` group with correct order + Romanian labels (catalog/entity-centric navigation per ui-ux-laws §7.4). Each instantiation inherits — at zero extra cost — list + create/edit drawer + deactivate (PUT active=false) + add-new-inline from the framework; the stage's job is correct per-entity column/field config + labels + registry wiring, plus a thin smoke test per entity. All styling inherited from the framework (tokens + approved components only; mechanical guards green). Standing law is satisfied by inheritance (edit/soft-delete present on every catalog; pickers add-new-inline) — assert it holds per entity rather than re-implementing. Full UI/UX gate applies but is largely satisfied by the shared framework; the questionnaire focuses on per-entity field/control fit (e.g. IN/OUT as a switch, requires_pj as a switch) and the distinct labelling of the two direction concepts; desktop+phone capture spot-check. This is the stage the founder gate exercises: create/edit/soft-delete currency, payment categories (one IN + one OUT), expense category, a cash-desk type with requires_pj=true — persisted + appearing in pickers.",
+      "acceptance_criteria": [
+        "Eight config objects (bank, direction, expense_category, payment_category, cash_desk_type, bank_account_type, price_level, contract_type) added against the existing EntityConfig seam — no new framework/component code, no new visual primitives.",
+        "Per-entity control fit honoured: payment_category.direction = IN/OUT switch (binary, min clicks), cash_desk_type.requires_pj = switch, expense_category.direction = entity-picker→Direction with add-new-inline; price_level uses algorithm_key.",
+        "The two 'direction' concepts (PaymentCategory IN/OUT enum vs the Direction tag table) are labelled distinctly in the UI so they cannot be conflated.",
+        "Each catalog registered in the L0 menu registry under the nomenclatoare group with correct order + Romanian labels (entity-centric).",
+        "Every catalog inherits list + create/edit (full-object PUT) + deactivate (PUT active=false, never PATCH/DELETE) + add-new-inline pickers from the framework; verified per entity, not re-implemented.",
+        "Founder-gate path works end-to-end: create/edit/soft-delete a currency, two payment categories (IN+OUT), an expense category, and a cash-desk type with requires_pj=true — all persist and reappear in pickers.",
+        "Thin smoke test per entity (config renders + one create/edit/deactivate round-trip) green; tokens/approved-components only; per-entity UI/UX control-fit questionnaire answered; desktop+phone spot-check clean."
+      ],
+      "touched": [
+        "frontend/src/features/catalog/entities/index.ts",
+        "frontend/src/features/catalog/entities/paymentCategory.ts",
+        "frontend/src/features/catalog/entities/expenseCategory.ts",
+        "frontend/src/features/catalog/entities/cashDeskType.ts",
+        "frontend/src/shell/registry.tsx",
+        "frontend/src/features/catalog/__tests__/instances.test.tsx"
+      ]
+    }
+  ],
+  "dag_edges": [
+    ["nomencl-rest-verify", "crud-framework-skeleton"],
+    ["crud-framework-skeleton", "instantiate-catalogs"]
+  ]
+}
