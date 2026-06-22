@@ -200,6 +200,11 @@ VALID_PHASE_TRANSITIONS: Mapping[PhaseState, frozenset[PhaseState]] = MappingPro
                 PhaseState.PLANNING,
                 PhaseState.RUNNING,
                 PhaseState.AWAITING_HUMAN,
+                # The architect/founder `settled` (no-action) disposition of an accurate
+                # Tier-2 integration finding routes forward to sign-off exactly as a clean
+                # Tier-2 would (PhaseExecutor._step_escalated → _enter_signoff); this is the
+                # accepted-finding mirror of the INTEGRATING→AWAITING_SIGNOFF edge.
+                PhaseState.AWAITING_SIGNOFF,
                 PhaseState.FAILED,
                 PhaseState.CANCELLED,
             }
@@ -330,6 +335,15 @@ PHASE_ESCALATION_RESOLUTIONS: Mapping[str, PhaseState] = MappingProxyType(
         "cancelled": PhaseState.CANCELLED,
     }
 )
+#: The phase-level no-action (`settled`) disposition (architect-operations.md §1):
+#: the architect/founder accepts an accurate Tier-2 INTEGRATION finding (no
+#: behavioural/correctness/security impact). Like STAGE_NOACTION_RESOLUTION it is
+#: deliberately NOT a key in PHASE_ESCALATION_RESOLUTIONS — it routes to AWAITING_SIGNOFF
+#: via _enter_signoff (not a plain token->state map), so the scheduler SPECIAL-CASES it in
+#: PhaseExecutor._step_escalated before the static lookup. Phase findings have no contested
+#: ROWS (they live in the tier2_gate event); the acceptance rationale lives in the
+#: escalation_resolved event the CLI writes. The CLI admits it for the PHASE level.
+PHASE_NOACTION_RESOLUTION = "settled"
 
 #: Escalation-routing ladder (robustness UNIT 2 / D-0042): the rungs the
 #: stuck-escalation detector climbs and the page-recipient vocabulary. The ONE

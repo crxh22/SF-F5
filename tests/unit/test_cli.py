@@ -1536,15 +1536,15 @@ def test_resolve_escalation_rejects_invalid_resolution_listing_vocabulary(
     assert "empty resolution" in capsys.readouterr().err
 
 
-def test_resolve_escalation_accepts_settled_for_stage_rejects_for_phase(
+def test_resolve_escalation_accepts_settled_for_both_levels(
     cli_env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Slice-2 Unit A: `settled` (the no-action disposition) is a valid STAGE
-    resolution (special-cased in the scheduler, not a static map key) — accepted
-    and stored for the stage level, listed in the stage vocabulary error, and
-    REJECTED for a phase escalation (phase escalations have no contested
-    findings; architect-operations.md §1)."""
-    from sf_factory.models import STAGE_NOACTION_RESOLUTION
+    """Slice-2 Unit A + D-0062: `settled` (the no-action disposition) is a valid
+    resolution at BOTH levels (special-cased in the scheduler, not a static map
+    key) — accepted and stored, and listed in the vocabulary error. A STAGE
+    settles contested audit findings; a PHASE accepts an accurate Tier-2
+    integration finding and routes to sign-off (architect-operations.md §1)."""
+    from sf_factory.models import PHASE_NOACTION_RESOLUTION, STAGE_NOACTION_RESOLUTION
 
     assert _cli(cli_env, "init") == 0
     # Seed the units + the first STAGE escalation once; add the extra rows
@@ -1589,14 +1589,15 @@ def test_resolve_escalation_accepts_settled_for_stage_rejects_for_phase(
     assert _cli(cli_env, "resolve-escalation", str(other_stage), "nope") == 1
     assert "settled" in capsys.readouterr().err
 
-    # Phase level REJECTS `settled` (not in the phase vocabulary), zero writes.
-    phase_esc = _add_escalation(unit_level="phase", trigger="child_failed")
-    assert _cli(cli_env, "resolve-escalation", str(phase_esc), "settled") == 1
-    err = capsys.readouterr().err
-    assert "unknown resolution 'settled'" in err
-    assert "phase escalation" in err
-    row, _ = _escalation_state(cli_env, phase_esc)
-    assert row["status"] == "open"  # rejected -> still open
+    # Phase level now ACCEPTS `settled` (D-0062: the architect/founder accepts an
+    # accurate Tier-2 integration finding) and stores the raw token; the scheduler
+    # then routes the phase forward to sign-off.
+    phase_esc = _add_escalation(unit_level="phase", trigger="semantic_conflict")
+    assert _cli(cli_env, "resolve-escalation", str(phase_esc), "settled") == 0
+    row, resolved_events = _escalation_state(cli_env, phase_esc)
+    assert row["status"] == "resolved"
+    assert row["resolution"] == PHASE_NOACTION_RESOLUTION == "settled"
+    assert resolved_events == 2  # cumulative global count: stage + phase settled
 
 
 def test_resolve_escalation_busy_database_fails_explicitly(

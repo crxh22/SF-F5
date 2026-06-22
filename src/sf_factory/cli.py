@@ -110,6 +110,7 @@ from sf_factory.db import (
 )
 from sf_factory.models import (
     PHASE_ESCALATION_RESOLUTIONS,
+    PHASE_NOACTION_RESOLUTION,
     STAGE_ESCALATION_RESOLUTIONS,
     STAGE_NOACTION_RESOLUTION,
     DecisionRequest,
@@ -1293,15 +1294,15 @@ def cmd_resolve_escalation(
                 f"escalation {escalation_id} has non-unit level"
                 f" {esc_row['unit_level']!r} — no resolution vocabulary applies"
             ) from exc
-        # `settled` (the no-action disposition) is a valid STAGE resolution but
-        # deliberately not in STAGE_ESCALATION_RESOLUTIONS (it is special-cased in
-        # the scheduler, not a static map key) — admit it for the stage level
-        # only. Phase escalations have no contested findings, so it is rejected
-        # there (architect-operations.md §1, design slice-2 risk 5).
+        # `settled` (the no-action disposition) is special-cased in the scheduler
+        # at BOTH levels (not a static *_ESCALATION_RESOLUTIONS map key), so it is
+        # admitted here per level but lives outside those maps: a STAGE settles
+        # contested audit findings; a PHASE accepts an accurate Tier-2 integration
+        # finding and routes to sign-off (architect-operations.md §1, D-0062).
         vocabulary: set[str] = (
             set(STAGE_ESCALATION_RESOLUTIONS) | {STAGE_NOACTION_RESOLUTION}
             if level is Level.STAGE
-            else set(PHASE_ESCALATION_RESOLUTIONS)
+            else set(PHASE_ESCALATION_RESOLUTIONS) | {PHASE_NOACTION_RESOLUTION}
         )
         if token not in vocabulary:
             raise FactoryError(

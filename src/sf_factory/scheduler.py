@@ -67,6 +67,7 @@ from sf_factory.models import (
     ESCALATION_TARGET_LADDER,
     GATE_ANSWERS,
     PHASE_ESCALATION_RESOLUTIONS,
+    PHASE_NOACTION_RESOLUTION,
     STAGE_ESCALATION_RESOLUTIONS,
     STAGE_NOACTION_RESOLUTION,
     STAGE_SPEC_DOC_RESOLUTION,
@@ -4803,6 +4804,29 @@ class PhaseExecutor:
         last = _latest_resolved_escalation(conn, Level.PHASE.value, phase.id)
         if last is None:
             return False
+        # No-action (`settled`) disposition at the PHASE level (architect-operations.md
+        # §1, D-0062): the architect/founder accepts an accurate Tier-2 integration
+        # finding. SPECIAL-CASED before the static PHASE_ESCALATION_RESOLUTIONS lookup
+        # (mirrors the stage settled path, ~3040). There are no contested finding ROWS at
+        # phase level (the finding lives in the tier2_gate event; the acceptance rationale
+        # in the escalation_resolved event the CLI wrote), so this only archives sentinels
+        # then routes forward to sign-off exactly as a clean Tier-2 would
+        # (the ESCALATED→AWAITING_SIGNOFF accepted-finding edge).
+        if last.resolution == PHASE_NOACTION_RESOLUTION:
+            worktree = self._worktree(phase)
+            if not worktree.is_dir():
+                # Derived, recomputable state — recreate (idempotent branch attach,
+                # the merge-gate rule; mirrors the AWAITING_HUMAN recreate below).
+                project = _project_for_phase(self._cfg, phase)
+                worktree = await self._wt.create(
+                    Path(project.workspace),
+                    phase.id,
+                    self._branch(phase),
+                    project.integration_branch,
+                )
+            await self._archive_sentinels(phase, worktree, last)
+            await self._enter_signoff(phase, worktree)
+            return True
         target = PHASE_ESCALATION_RESOLUTIONS.get(last.resolution or "")
         if target is None:
             with self._db.transaction() as tx:

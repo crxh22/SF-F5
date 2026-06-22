@@ -1772,6 +1772,47 @@ async def test_phase_planning_sentinel_archived_on_resolution_no_reescalate(
     assert phase_state(db, "ph") is PhaseState.RUNNING  # replan completed + ingested
 
 
+async def test_phase_settled_resolution_routes_to_signoff(db, config_dict) -> None:
+    """D-0062: the architect/founder `settled` (no-action) disposition of an
+    accurate phase Tier-2 integration finding routes the ESCALATED phase forward
+    to AWAITING_SIGNOFF + a phase_signoff decision request — exactly as a clean
+    Tier-2 would — instead of looping (`resume` re-runs the deterministic gate)
+    or re-planning. Pins the new ESCALATED→AWAITING_SIGNOFF edge + the
+    _step_escalated settled special-case (architect-operations.md §1)."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.ESCALATED)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    with db.transaction() as conn:
+        esc_id = fdb.insert_escalation(
+            conn,
+            Escalation(
+                id=None,
+                unit_level="phase",
+                unit_id="ph",
+                trigger="semantic_conflict",
+                target="main_architect",
+                payload_artifact_id=None,
+                event_seq=None,
+                status="open",
+                resolution=None,
+                created_at=utc_now(),
+                resolved_at=None,
+            ),
+        )
+        fdb.resolve_escalation(conn, esc_id, "settled")
+
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.AWAITING_SIGNOFF
+    assert open_escalations(db, "ph") == []
+    decision = sched_mod._latest_decision(db.read(), "phase", "ph")
+    assert decision is not None
+    assert decision.gate_kind == "phase_signoff"
+    assert decision.status == "pending"
+
+
 async def test_phase_planning_replay_identical_plan_anchors_freeze_on_head(
     db, config_dict
 ) -> None:

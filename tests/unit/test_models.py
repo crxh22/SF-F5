@@ -77,7 +77,14 @@ class TestTransitionTables:
             p.INTEGRATING: {p.AWAITING_SIGNOFF, p.RUNNING, p.ESCALATED, p.CANCELLED},
             p.AWAITING_SIGNOFF: {p.DONE, p.RUNNING, p.CANCELLED},
             p.AWAITING_HUMAN: {p.RUNNING, p.PLANNING, p.CANCELLED},
-            p.ESCALATED: {p.PLANNING, p.RUNNING, p.AWAITING_HUMAN, p.FAILED, p.CANCELLED},
+            p.ESCALATED: {
+                p.PLANNING,
+                p.RUNNING,
+                p.AWAITING_HUMAN,
+                p.AWAITING_SIGNOFF,  # D-0062: `settled` accepted-finding → sign-off
+                p.FAILED,
+                p.CANCELLED,
+            },
             p.DONE: set(),
             p.FAILED: set(),
             p.CANCELLED: set(),
@@ -389,19 +396,29 @@ class TestEscalationResolutionVocabulary:
         )
 
     def test_noaction_resolution_is_not_a_map_key(self):
-        """Slice-2 Unit A pin: `settled` (the no-action disposition) is a
-        first-class STAGE resolution token but deliberately NOT a key in
-        STAGE_ESCALATION_RESOLUTIONS — settling routes by risk (MERGE_GATE /
-        AWAITING_HUMAN), which the token->ONE-state map cannot encode, so the
+        """Slice-2 Unit A + D-0062 pin: `settled` (the no-action disposition) is a
+        first-class resolution token at BOTH levels but deliberately NOT a key in
+        the *_ESCALATION_RESOLUTIONS maps — settling routes specially (a STAGE by
+        risk to MERGE_GATE / AWAITING_HUMAN; a PHASE to AWAITING_SIGNOFF via
+        _enter_signoff), which a token->ONE-state map cannot encode, so the
         scheduler special-cases it. Keeping it out preserves the one-token->
         one-state invariant the other tests pin."""
         from sf_factory.models import (
+            PHASE_ESCALATION_RESOLUTIONS,
+            PHASE_NOACTION_RESOLUTION,
             STAGE_ESCALATION_RESOLUTIONS,
             STAGE_NOACTION_RESOLUTION,
         )
 
         assert STAGE_NOACTION_RESOLUTION == "settled"
         assert STAGE_NOACTION_RESOLUTION not in STAGE_ESCALATION_RESOLUTIONS
+        assert PHASE_NOACTION_RESOLUTION == "settled"
+        assert PHASE_NOACTION_RESOLUTION not in PHASE_ESCALATION_RESOLUTIONS
+        # The accepted-finding disposition routes to sign-off — pin the edge legal.
+        assert (
+            PhaseState.AWAITING_SIGNOFF
+            in VALID_PHASE_TRANSITIONS[PhaseState.ESCALATED]
+        )
 
     def test_phase_values_are_legal_escalated_exits(self):
         from sf_factory.models import PHASE_ESCALATION_RESOLUTIONS

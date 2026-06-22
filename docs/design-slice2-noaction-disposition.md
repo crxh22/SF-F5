@@ -38,7 +38,7 @@ Accurate audit findings REGENERATE every round (CE-AUDIT-1 ×3, AA-A2 ×2+): the
 2. The suppress set `{settled, overruled}` is safety-critical — widening it to sustained/complied would silently mask unfixed bugs. Pin it.
 3. Prompt memory is advisory (Doctrine §20) — the `duplicate` backstop + the slice-3 recurrence flag are the real guarantees; don't over-trust the prompt.
 4. `settled` deliberately bypasses the static resolution map (a reviewer will be surprised) — the constant + comment + the "NOT a map key" pin document why (mirrors how rework:MERGE_GATE needed special handling, D-0042).
-5. `settled` is stage-only (phase escalations have no contested findings).
+5. `settled` applies at BOTH levels (D-0062): a STAGE settles contested audit findings; a PHASE accepts an accurate Tier-2 integration finding and routes ESCALATED→AWAITING_SIGNOFF via `_enter_signoff`. Phase findings have no contested *rows* (they live in the tier2_gate event; the acceptance rationale in the escalation_resolved event), so the scheduler special-cases the token before the static map the same way the stage path does.
 
 ## Critical files
 `src/sf_factory/scheduler.py` (_step_audit 2223-2406, _step_escalated 2614-2755, _audit_prompt 3270, _respond_prompt 3281, _discard_uncommitted 1576, _assert_no_unregistered_files 1921); `src/sf_factory/migrations/0002_settled_finding_disposition.sql` (NEW); `src/sf_factory/models.py` (STAGE_NOACTION_RESOLUTION); `src/sf_factory/cli.py` (cmd_resolve_escalation 1254-1320); `work-protocols/architect-operations.md` §1 (the authoritative `settled` semantics).
