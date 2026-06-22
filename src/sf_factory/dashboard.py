@@ -339,6 +339,8 @@ RO: Mapping[str, str] = {
     "detail_agents_none": "niciun agent rulat încă pe această etapă",
     "detail_findings": "Constatări audit",
     "detail_findings_none": "nicio constatare de audit",
+    "detail_cost": "Cost",
+    "detail_cost_none": "fără cost înregistrat încă",
     "col_from_state": "De la",
     "col_to_state": "La",
     "col_outcome": "Rezultat",
@@ -960,6 +962,7 @@ class StageDetail:
     events: tuple[StageEvent, ...]
     runs: tuple[AgentRunRow, ...]
     findings: tuple[FindingRow, ...]
+    cost: CostSummary = _NO_COST
 
 
 def _estimate_usd(
@@ -2013,6 +2016,7 @@ def build_stage_detail(cfg: FactoryConfig, stage_id: str) -> StageDetail | None:
                     contest=contest,
                 )
             )
+        cost = _cost_buckets(cfg, conn).get((Level.STAGE.value, stage_id), _NO_COST)
         return StageDetail(
             stage_id=srow["id"],
             name=srow["name"],
@@ -2021,6 +2025,7 @@ def build_stage_detail(cfg: FactoryConfig, stage_id: str) -> StageDetail | None:
             events=events,
             runs=tuple(runs),
             findings=tuple(findings),
+            cost=cost,
         )
     finally:
         db.close()
@@ -2556,18 +2561,21 @@ def _render_plan(view: DashboardView) -> str:
         ):
             if not group:
                 continue
-            rows.append(f"<tr class='grup'><th colspan='4'>{esc(RO[label_key])}</th></tr>")
+            rows.append(f"<tr class='grup'><th colspan='5'>{esc(RO[label_key])}</th></tr>")
             rows.extend(
                 f"<tr><td>{esc(st.name)}<span class='token'>({esc(st.stage_id)})</span></td>"
                 f"<td>{_chip(st.state)}</td>"
                 f"<td>{esc(_glossed(st.risk_class))}</td>"
-                f"<td class='num'>{_stage_cost_cell(st)}</td></tr>"
+                f"<td class='num'>{_stage_cost_cell(st)}</td>"
+                f"<td><a href='/stage/{esc(st.stage_id)}'>"
+                f"{esc(RO['stage_detail_link'])}</a></td></tr>"
                 for st in group
             )
         parts.append(
             _table(
                 f"<th>{esc(RO['col_stage'])}</th><th>{esc(RO['col_state'])}</th>"
-                f"<th>{esc(RO['col_risk'])}</th><th class='num'>{esc(RO['col_cost'])}</th>",
+                f"<th>{esc(RO['col_risk'])}</th>"
+                f"<th class='num'>{esc(RO['col_cost'])}</th><th></th>",
                 "".join(rows),
             )
         )
@@ -2987,10 +2995,12 @@ def _render_finding_artifact(label: str, art: FindingArtifact) -> str:
 
 def render_stage_page(detail: StageDetail, cfg: FactoryConfig) -> str:
     """GET /stage/<stage_id> (founder 20-06): read-only, refresh-free, zero JS,
-    NO inputs — a focused detail page for ONE running stage. Four blocs: header
-    (name+id+chip+risk gloss), Istoric (state transitions), Agenți și rezultate
-    (one result row per agent run, the running agent visually distinct), and
-    Constatări audit (findings + the report/contest content rendered inline).
+    NO inputs — a focused detail page for ONE stage, running OR in history (the
+    SAME view reachable from both the running table and the plan/history table,
+    founder 22-06). Five blocs: header (name+id+chip+risk gloss), Istoric (state
+    transitions), Agenți și rezultate (one result row per agent run, the running
+    agent visually distinct), Constatări audit (findings + report/contest inline),
+    and Cost (the §11.2 exact/estimated pair).
     NO meta-refresh (it has no inputs — the §10.5 session/costs precedent)."""
     # 1. Header bloc.
     header_body = (
@@ -3065,6 +3075,15 @@ def render_stage_page(detail: StageDetail, cfg: FactoryConfig) -> str:
     else:
         findings_body = f"<p class='meta'>{esc(RO['detail_findings_none'])}</p>"
     blocs.append(_bloc(RO["detail_findings"], findings_body))
+
+    # 5. Cost — the §11.2 exact/estimated pair, folded into the unified detail
+    # view so it reads identically whether the stage is running or in history.
+    cost_body = (
+        f"<p>{esc(_fmt_cost_pair(detail.cost))}</p>"
+        if not detail.cost.empty
+        else f"<p class='meta'>{esc(RO['detail_cost_none'])}</p>"
+    )
+    blocs.append(_bloc(RO["detail_cost"], cost_body))
 
     return (
         "<!doctype html><html lang='ro'><head><meta charset='utf-8'>"

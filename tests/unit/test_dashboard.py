@@ -2000,9 +2000,14 @@ def test_tables_structure_chips_and_plan_groups(denv) -> None:
     assert _re.search(r"<span class='chip chip-warn'>[^<]*\(AWAITING_HUMAN\)</span>", page)
     # Plan groups as table sections, not nested bullets. [AMENDED with §11
     # (CCR-10): the plan table gained the cost column -> colspan 3 became 4;
+    # AMENDED 22-06 (ARH-01): + the per-stage "Detalii →" link column (the unified
+    # stage-detail view, now reachable from the history/plan table too) -> 4 became 5;
     # old-HTML-shape assertion, §10.8 carve-out — enumerated in the build report.]
-    assert _re.search(r"<tr class='grup'><th colspan='4'>", page)
+    assert _re.search(r"<tr class='grup'><th colspan='5'>", page)
     assert dash.RO["plan_running_group"] in page
+    # Unified detail view (founder 22-06): plan/history rows link to /stage/<id>,
+    # the SAME rich page the running table links to.
+    assert _re.search(r"<a href='/stage/[\w.\-]+'>", page)
 
 
 # ------------------------------------------- §10.1 S1: card order + confirmation
@@ -2657,11 +2662,12 @@ def _seed_finding(
         )
 
 
-def test_stage_detail_renders_four_sections(denv) -> None:
+def test_stage_detail_renders_five_sections(denv) -> None:
     """build_stage_detail + render_stage_page show, as _bloc sections: the
     header (name+id+state chip+risk gloss), Istoric (transitions oldest→newest),
     Agenți și rezultate (one result row per run), Constatări audit (+ inline
-    report content). No meta-refresh (it has no inputs)."""
+    report content), and Cost (the §11.2 pair — founder 22-06 unified detail view,
+    the same page reachable from history too). No meta-refresh (it has no inputs)."""
     _seed_unit(denv)  # phase ph (+ stage ph.s1)
     _seed_build_stage(denv)  # ph.b, BUILD (RUNNING category)
     _seed_transition(denv, unit_id="ph.b", from_state="SPEC", to_state="BUILD")
@@ -2709,6 +2715,9 @@ def test_stage_detail_renders_four_sections(denv) -> None:
     assert "auditor încrucișat (codex) (auditor_cross_model)" in page
     assert dash.RO["finding_status_open"] in page
     assert "Constatare detaliată în raport." in page  # report content inline
+    # Cost: the 5th bloc (founder 22-06 unified view) — always present, showing
+    # either the §11.2 pair or the "no cost yet" meta line.
+    assert dash.RO["detail_cost"] in page
 
 
 def test_stage_detail_outcomes_and_running_agent_distinct(denv) -> None:
