@@ -1,0 +1,69 @@
+// SF-F5 factory pipeline map — agents & real flow. Source for pipeline-map-22-06-2026.png.
+// Founder-facing graphic (pipeline review, 22-06-2026). Role keys = code identifiers (English);
+// glosses + structure = Romanian (conventions.md). Status colors: green=core, yellow=conditional,
+// grey=rare/dormant, blue=human, white=code/process (not an LLM agent).
+digraph pipeline {
+  rankdir=TB; compound=true; bgcolor="white"; nodesep=0.35; ranksep=0.5;
+  fontname="DejaVu Sans";
+  node [fontname="DejaVu Sans", fontsize=11, style="filled,rounded", shape=box, margin=0.12];
+  edge [fontname="DejaVu Sans", fontsize=9, color="#666666"];
+  labelloc="t"; fontsize=15;
+  label=<<b>Pipeline-ul fabricii SF-F5 — agenți &amp; flux real</b><br/><font point-size="11">22-06-2026 · verde = nucleu (la fiecare etapă)  ·  galben = condiționat  ·  gri = rar/dormant  ·  albastru = om  ·  alb = cod/proces (nu LLM)</font>>;
+
+  // ============================ CONTROL PLANE ============================
+  subgraph cluster_control {
+    label="PLAN DE CONTROL — cine conduce"; style="rounded,filled"; fillcolor="#f3f3f3"; fontsize=13; color="#bbbbbb";
+    founder   [label=<<b>FONDATOR</b><br/>PO + arbitru>, fillcolor="#cfe2ff", shape=oval];
+    architect [label=<<b>main_architect</b><br/>sesiune interactivă = EU (opus)<br/>om-în-buclă, NU pornit de fabrică>, fillcolor="#cfe2ff"];
+    orch      [label=<<b>ORCHESTRATOR</b>  (cod, NU un LLM — scheduler.py)<br/>ticăie la 5s · mută unitățile prin flux · pornește agenții>, fillcolor="#ffffff", peripheries=2];
+    founder -> architect [label="strategie / decizii"];
+    architect -> orch [label="porneşte · opreşte · re-seed"];
+  }
+
+  // ============================ PHASE CONVEYOR ============================
+  subgraph cluster_phase {
+    label="CONVEYOR FAZĂ — un STRAT = o fază  (7 în plan)"; style="rounded,filled"; fillcolor="#fbfbef"; fontsize=13; color="#cccc99";
+    p_pend  [label="PENDING", fillcolor="#ffffff"];
+    p_plan  [label=<<b>PLANNING</b><br/>» <b>phase_architect</b> «<br/>descompune faza în etape<br/>+ îngheață contractele>, fillcolor="#d6f5d6"];
+    p_froz  [label="CONTRACTS_FROZEN", fillcolor="#ffffff"];
+    p_run   [label=<<b>RUNNING</b><br/>rulează etapele ↓>, fillcolor="#ffffff"];
+    p_integ [label=<<b>INTEGRATING</b><br/>» <b>integration_validator</b> «<br/>verifică toate etapele împreună>, fillcolor="#d6f5d6"];
+    p_sign  [label=<<b>AWAITING_SIGNOFF</b><br/>» <b>FONDATOR §9</b> « semnătura pe fază>, fillcolor="#cfe2ff"];
+    p_done  [label="DONE", fillcolor="#eafbea", shape=oval];
+    p_pend -> p_plan -> p_froz -> p_run -> p_integ -> p_sign -> p_done;
+  }
+
+  // ============================ STAGE CONVEYOR ============================
+  subgraph cluster_stage {
+    label="CONVEYOR ETAPĂ — în cadrul unei faze  (58 etape: 24 critical / 29 structural / 5 routine)"; style="rounded,filled"; fillcolor="#eef5fb"; fontsize=13; color="#99bbdd";
+    s_pend  [label="PENDING", fillcolor="#ffffff"];
+    s_spec  [label=<<b>SPEC</b><br/>» <b>spec_agent</b> (opus) «<br/>scrie specificația>, fillcolor="#d6f5d6"];
+    s_build [label=<<b>BUILD</b><br/>» <b>builder_routine</b> (sonnet) — routine<br/>» <b>builder_heavy</b> (opus) — structural/critical<br/>scrie codul>, fillcolor="#d6f5d6"];
+    s_val   [label=<<b>VALIDATE</b><br/>» <b>validator</b> (sonnet) — routine<br/>» <b>validator_structural</b> (opus) — struct./critical<br/>rulează &amp; verifică>, fillcolor="#d6f5d6"];
+    s_cp1   [label=<<b>CP-1</b> » <b>cp1_triage</b> (haiku)<br/>doar dacă pragurile NU decid singure>, fillcolor="#fff0c2"];
+    s_audit [label=<<b>AUDIT</b><br/>» <b>auditor_same_model</b> (opus) +<br/>» <b>auditor_cross_model</b> (codex) «<br/>DOAR structural/critical — routine sare>, fillcolor="#d6f5d6"];
+    s_human [label=<<b>AWAITING_HUMAN</b><br/>» <b>FONDATOR §9</b> « DOAR critical>, fillcolor="#cfe2ff"];
+    s_merge [label=<<b>MERGE_GATE</b><br/>Tier-1: <b>test_suite</b> — rulează toate testele (cod, nu LLM)<br/>Tier-2: <b>integration_validator</b> (opus)>, fillcolor="#ffffff"];
+    s_done  [label=<<b>DONE</b> → merge în main>, fillcolor="#eafbea", shape=oval];
+    s_pend -> s_spec -> s_build -> s_val;
+    s_val -> s_cp1 [style=dashed, label="ambiguu"];
+    s_val -> s_audit [label="structural / critical"];
+    s_val -> s_merge [label="routine", style=dashed];
+    s_audit -> s_human [label="critical"];
+    s_audit -> s_merge [label="structural"];
+    s_human -> s_merge [label="aprobat"];
+    s_merge -> s_done;
+  }
+
+  // orchestrator drives both conveyors; phase RUNNING spawns the stage sub-flow
+  orch  -> p_pend  [lhead=cluster_phase, color="#0066cc", penwidth=1.6];
+  p_run -> s_pend  [lhead=cluster_stage, color="#0066cc", penwidth=1.6, label="fiecare etapă\nrulează sub-fluxul"];
+
+  // ============================ AUX AGENTS ============================
+  subgraph cluster_aux {
+    label="AGENȚI AUXILIARI — în afara fluxului de build"; style="rounded,filled"; fillcolor="#f6f6f6"; fontsize=13; color="#bbbbbb";
+    a_cap [label=<<b>capacity_probe</b> (haiku) — galben<br/>canar: DOAR când se atinge limita de uzaj Claude<br/>493 rulări · testează dacă limita s-a ridicat>, fillcolor="#fff0c2"];
+    a_dec [label=<<b>decision_session</b> (opus) — gri/rar<br/>sesiune de decizie cu fondatorul, prin dashboard<br/>doar 2 rulări (20-06); de obicei decizia = un buton>, fillcolor="#e2e2e2"];
+    a_note [label=<NU sunt agenți autonomi: <b>intake</b> (interviu uman, o singură dată) ·<br/><b>notify</b> (notificări ntfy — infrastructură) · <b>test_suite</b> (pytest — cod)>, fillcolor="#ffffff", shape=note];
+  }
+}

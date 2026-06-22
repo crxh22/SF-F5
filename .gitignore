@@ -10,3 +10,4 @@ __pycache__/
 # factory operational state (SQLite + logs are canonical in DB, not git — DoD §6)
 .factory/
 .claude/
+docs/design/pipeline-map-22-06-2026.png
