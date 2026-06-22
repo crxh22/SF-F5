@@ -4310,6 +4310,7 @@ class PhaseExecutor:
                             spec_artifact_id=None,
                             created_at=now,
                             updated_at=now,
+                            kind=ps.kind,
                         ),
                     )
             for from_id, to_id in plan.dag_edges:

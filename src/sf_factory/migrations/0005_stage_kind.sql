@@ -1,0 +1,11 @@
+-- Backend/frontend "kind" dimension on stages (ARH-02 prep, 22-06-2026). A later
+-- step routes builders by kind and injects the UI/UX rules ONLY on frontend
+-- stages (back/front separation now mandatory — see erp-ui-planning-reset-22-06).
+-- This migration is PURE PLUMBING: it only adds the nullable column; no routing,
+-- agent-selection or runtime behaviour changes with it. NULLABLE on purpose —
+-- every pre-existing stage row, and every frozen phase plan that predates the
+-- plan-contract `kind` field, keeps working with kind = NULL; the None-fallback
+-- (what an un-kinded stage means at routing time) is a SEPARATE later decision,
+-- deliberately NOT baked in here. Values, where set, are the strings 'backend'
+-- or 'frontend' (enforced at the plan-contract layer, artifacts.PhasePlanStage).
+ALTER TABLE stages ADD COLUMN kind TEXT;

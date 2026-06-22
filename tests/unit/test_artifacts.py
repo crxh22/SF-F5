@@ -417,6 +417,33 @@ def test_read_phase_plan_rejects_unknown_risk_class(tmp_path: Path):
         artifacts.read_phase_plan(path, RISK_CLASSES)
 
 
+def test_read_phase_plan_kind_omitted_defaults_none(tmp_path: Path):
+    # Backward compat: a plan stage WITHOUT `kind` (every plan that predates the
+    # dimension) parses fine and yields kind=None.
+    path = _write_plan(tmp_path, _plan(["a"], []))
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert plan.stages[0].kind is None
+
+
+def test_read_phase_plan_accepts_explicit_kind(tmp_path: Path):
+    payload = _plan(["fe", "be"], [["be", "fe"]])
+    payload["stages"][0]["kind"] = "frontend"
+    payload["stages"][1]["kind"] = "backend"
+    path = _write_plan(tmp_path, payload)
+    plan = artifacts.read_phase_plan(path, RISK_CLASSES)
+    assert [s.kind for s in plan.stages] == ["frontend", "backend"]
+
+
+def test_read_phase_plan_rejects_unknown_kind(tmp_path: Path):
+    # The Literal['backend','frontend'] guard at the plan-contract layer: a bogus
+    # kind is a malformed plan, not silently coerced.
+    payload = _plan(["a"], [])
+    payload["stages"][0]["kind"] = "fullstack"
+    path = _write_plan(tmp_path, payload)
+    with pytest.raises(ArtifactContractError):
+        artifacts.read_phase_plan(path, RISK_CLASSES)
+
+
 @pytest.mark.parametrize("bad_id", ["has space", "../escape", "a/b", "-flag", "a..b", "end."])
 def test_read_phase_plan_rejects_unsafe_stage_ids(tmp_path: Path, bad_id: str):
     """Plan ids feed branch names and artifact dirs — unsafe ids are malformed."""

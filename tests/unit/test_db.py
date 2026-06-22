@@ -150,12 +150,12 @@ def seeded_stage(db: Database):
 class TestMigrations:
     def test_fresh_migrate_applies_all_packaged(self, db_path: Path):
         # The packaged dir now ships 0001 (init) + 0002 (settled disposition) +
-        # 0003 (runtime_settings) + 0004 (decision published_at); a fresh migrate
-        # applies every pending version in order.
+        # 0003 (runtime_settings) + 0004 (decision published_at) + 0005 (stage kind);
+        # a fresh migrate applies every pending version in order.
         database = Database(db_path, busy_timeout_ms=5000)
         database.open()
         try:
-            assert database.migrate(MIGRATIONS_DIR) == [1, 2, 3, 4]
+            assert database.migrate(MIGRATIONS_DIR) == [1, 2, 3, 4, 5]
         finally:
             database.close()
 
@@ -184,11 +184,12 @@ class TestMigrations:
             "SELECT version, description, applied_at FROM schema_migrations"
             " ORDER BY version"
         ).fetchall()
-        assert [r["version"] for r in rows] == [1, 2, 3, 4]
+        assert [r["version"] for r in rows] == [1, 2, 3, 4, 5]
         assert rows[0]["description"] == "init"
         assert rows[1]["description"] == "settled_finding_disposition"
         assert rows[2]["description"] == "runtime_settings"
         assert rows[3]["description"] == "decision_published_at"
+        assert rows[4]["description"] == "stage_kind"
         assert all(r["applied_at"] for r in rows)  # ISO timestamp written
 
     def test_failed_migration_rolls_back_whole_file(self, db_path: Path, tmp_path: Path):
@@ -243,23 +244,23 @@ class TestMigrations:
             db.migrate(stale_dir)
 
     def test_followup_migration_applies_in_order(self, db: Database, tmp_path: Path):
-        # The `db` fixture already applied every packaged migration (1 + 2 + 3 + 4);
+        # The `db` fixture already applied every packaged migration (1 + 2 + 3 + 4 + 5);
         # an additional dir adds the next free version on top, in order.
         two_dir = tmp_path / "migs"
         two_dir.mkdir()
         for f in MIGRATIONS_DIR.glob("*.sql"):
             (two_dir / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
-        (two_dir / "0005_extra.sql").write_text(
+        (two_dir / "0006_extra.sql").write_text(
             "CREATE TABLE extra (id INTEGER PRIMARY KEY);", encoding="utf-8"
         )
-        assert db.migrate(two_dir) == [5]
+        assert db.migrate(two_dir) == [6]
         versions = [
             r[0]
             for r in db.read().execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        assert versions == [1, 2, 3, 4, 5]
+        assert versions == [1, 2, 3, 4, 5, 6]
 
     def test_migrate_read_only_rejected(self, db: Database, db_path: Path):
         ro = Database(db_path, busy_timeout_ms=5000)
@@ -306,12 +307,24 @@ class TestSettledFindingMigration:
             assert database.migrate(init_only) == [1]
             with database.transaction() as conn:
                 insert_phase(conn, make_phase())
-                insert_stage(conn, make_stage())
+                # Seed the stage with raw SQL omitting `kind`: under the 0001-only
+                # schema the column does not yet exist (it arrives in 0005), so this
+                # faithfully models a pre-kind DB whose rows must survive later
+                # migrations. insert_stage now writes `kind` and would fail here.
+                s = make_stage()
+                conn.execute(
+                    "INSERT INTO stages (id, phase_id, name, risk_class, state,"
+                    " branch, worktree_path, spec_artifact_id, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (s.id, s.phase_id, s.name, s.risk_class, s.state.value, s.branch,
+                     s.worktree_path, s.spec_artifact_id, s.created_at, s.updated_at),
+                )
                 report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))
                 fid = insert_finding(
                     conn, make_finding(report_artifact_id=report, status="overruled")
                 )
-            assert database.migrate(MIGRATIONS_DIR) == [2, 3, 4]  # 0002 + 0003 + 0004 now apply
+            # 0002 + 0003 + 0004 + 0005 now apply on top of the 0001-only baseline.
+            assert database.migrate(MIGRATIONS_DIR) == [2, 3, 4, 5]
             # Pre-existing row carried across the rebuild unchanged.
             rows = findings(database.read(), "st-1")
             assert [f.id for f in rows] == [fid]
@@ -367,7 +380,17 @@ class TestSettledFindingMigration:
             assert versions == [1]
             with database.transaction() as conn:
                 insert_phase(conn, make_phase())
-                insert_stage(conn, make_stage())
+                # Schema is still at v1 (0005's `kind` column never applied), so
+                # seed the stage with raw SQL omitting `kind`; insert_stage writes
+                # it and would fail under this rolled-back schema.
+                s = make_stage()
+                conn.execute(
+                    "INSERT INTO stages (id, phase_id, name, risk_class, state,"
+                    " branch, worktree_path, spec_artifact_id, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (s.id, s.phase_id, s.name, s.risk_class, s.state.value, s.branch,
+                     s.worktree_path, s.spec_artifact_id, s.created_at, s.updated_at),
+                )
             with pytest.raises(sqlite3.IntegrityError):
                 with database.transaction() as conn:
                     report = insert_artifact_ref(conn, make_artifact(kind="audit_report"))

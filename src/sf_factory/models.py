@@ -394,7 +394,7 @@ class Phase:
 @dataclass(frozen=True, slots=True)
 class Stage:
     """id, phase_id, name, risk_class, state: StageState, branch, worktree_path,
-    spec_artifact_id, created_at, updated_at."""
+    spec_artifact_id, created_at, updated_at, kind: 'backend'|'frontend'|None."""
 
     id: str
     phase_id: str
@@ -406,6 +406,7 @@ class Stage:
     spec_artifact_id: int | None
     created_at: str
     updated_at: str
+    kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

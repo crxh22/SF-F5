@@ -25,6 +25,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -176,7 +177,8 @@ _PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class PhasePlanStage(BaseModel):
-    """One stage row of phase-plan.json: id, name, risk_class, acceptance (criteria text)."""
+    """One stage row of phase-plan.json: id, name, risk_class, acceptance (criteria text),
+    kind ('backend'|'frontend', optional — None when the plan predates the dimension)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -184,10 +186,11 @@ class PhasePlanStage(BaseModel):
     name: str
     risk_class: str
     acceptance: str
+    kind: Literal["backend", "frontend"] | None = None
 
 
 class PhasePlan(BaseModel):
-    """Schema of phase-plan.json: stages[{id, name, risk_class, acceptance}],
+    """Schema of phase-plan.json: stages[{id, name, risk_class, acceptance, kind?}],
     dag_edges[[from_id, to_id]]; extra='forbid'."""
 
     model_config = ConfigDict(extra="forbid")

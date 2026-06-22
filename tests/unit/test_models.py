@@ -318,7 +318,8 @@ class TestDataclasses:
         assert names(Phase) == ["id", "project", "name", "state", "branch",
                                 "plan_artifact_id", "created_at", "updated_at"]
         assert names(Stage) == ["id", "phase_id", "name", "risk_class", "state", "branch",
-                                "worktree_path", "spec_artifact_id", "created_at", "updated_at"]
+                                "worktree_path", "spec_artifact_id", "created_at", "updated_at",
+                                "kind"]
         assert names(Event) == ["seq", "unit_level", "unit_id", "event_type", "from_state",
                                 "to_state", "actor", "payload", "created_at"]
         assert names(ArtifactRef) == ["id", "unit_level", "unit_id", "kind", "repo", "path",

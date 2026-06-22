@@ -249,6 +249,7 @@ def _stage_from_row(row: sqlite3.Row) -> Stage:
         spec_artifact_id=row["spec_artifact_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        kind=row["kind"],
     )
 
 
@@ -277,8 +278,8 @@ def get_phase(conn: sqlite3.Connection, phase_id: str) -> Phase | None:
 def insert_stage(conn: sqlite3.Connection, stage: Stage) -> None:
     conn.execute(
         "INSERT INTO stages (id, phase_id, name, risk_class, state, branch,"
-        " worktree_path, spec_artifact_id, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " worktree_path, spec_artifact_id, created_at, updated_at, kind)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             stage.id,
             stage.phase_id,
@@ -290,6 +291,7 @@ def insert_stage(conn: sqlite3.Connection, stage: Stage) -> None:
             stage.spec_artifact_id,
             stage.created_at,
             stage.updated_at,
+            stage.kind,
         ),
     )
 

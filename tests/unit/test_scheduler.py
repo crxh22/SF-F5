@@ -1664,6 +1664,40 @@ async def test_phase_ingests_validated_plan_into_stages_and_dag(db, config_dict)
     assert fdb.deps_done(db.read(), Level.STAGE, "ph.s1")
 
 
+async def test_phase_ingest_threads_stage_kind_through_to_row(db, config_dict) -> None:
+    """End-to-end plumbing of the backend/frontend `kind` dimension: a plan stage
+    that declares kind='frontend' lands as a stage row with kind='frontend'; a plan
+    stage with no `kind` ingests as kind=None (backward compat for un-kinded plans).
+    Pure plumbing — no routing/agent-selection change rides on it here."""
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.CONTRACTS_FROZEN)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    plan_dir = worktree / "_factory" / "phases" / "ph"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "phase-plan.json").write_text(
+        json.dumps(
+            {
+                "stages": [
+                    {"id": "fe", "name": "ui", "risk_class": "routine",
+                     "acceptance": "a", "kind": "frontend"},
+                    {"id": "plain", "name": "svc", "risk_class": "routine",
+                     "acceptance": "b"},  # no kind -> None
+                ],
+                "dag_edges": [["plain", "fe"]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    executor = make_phase_executor(db, cfg)
+    await executor.execute("ph")
+
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    fe = fdb.get_stage(db.read(), "ph.fe")
+    plain = fdb.get_stage(db.read(), "ph.plain")
+    assert fe is not None and fe.kind == "frontend"
+    assert plain is not None and plain.kind is None
+
+
 async def test_phase_rejects_cyclic_plan_without_silent_state_change(
     db, config_dict
 ) -> None:
