@@ -45,8 +45,12 @@ class TestTransitionTables:
         s = StageState
         expected = {
             s.PENDING: {s.SPEC, s.CANCELLED},
-            # VALIDATE is the D-0059 documentary path (rework:SPEC_DOC skips BUILD).
-            s.SPEC: {s.BUILD, s.VALIDATE, s.ESCALATED, s.CANCELLED},
+            # SPEC_AUDIT is the spec dual-audit step; BUILD is kept for the
+            # spec_audits-empty skip; VALIDATE is the D-0059 documentary path
+            # (rework:SPEC_DOC skips BUILD and bypasses SPEC_AUDIT).
+            s.SPEC: {s.SPEC_AUDIT, s.BUILD, s.VALIDATE, s.ESCALATED, s.CANCELLED},
+            # clean -> BUILD, real spec defect -> SPEC rework, contest/loop -> ESCALATED.
+            s.SPEC_AUDIT: {s.BUILD, s.SPEC, s.ESCALATED, s.CANCELLED},
             s.BUILD: {s.VALIDATE, s.ESCALATED, s.CANCELLED},
             s.VALIDATE: {s.MERGE_GATE, s.AUDIT, s.BUILD, s.SPEC, s.ESCALATED, s.CANCELLED},
             s.AUDIT: {s.MERGE_GATE, s.AWAITING_HUMAN, s.BUILD, s.ESCALATED, s.CANCELLED},
@@ -173,8 +177,8 @@ class TestEnumValues:
 
     def test_state_values_match_ddl_check_sets(self):
         assert {s.value for s in StageState} == {
-            "PENDING", "SPEC", "BUILD", "VALIDATE", "AUDIT", "AWAITING_HUMAN",
-            "MERGE_GATE", "ESCALATED", "DONE", "FAILED", "CANCELLED",
+            "PENDING", "SPEC", "SPEC_AUDIT", "BUILD", "VALIDATE", "AUDIT",
+            "AWAITING_HUMAN", "MERGE_GATE", "ESCALATED", "DONE", "FAILED", "CANCELLED",
         }
         assert {p.value for p in PhaseState} == {
             "PENDING", "PLANNING", "CONTRACTS_FROZEN", "RUNNING", "INTEGRATING",
@@ -197,7 +201,9 @@ class TestSchedCategory:
         assert sched_category(level, "PENDING", False) is SchedCategory.WAITING
         assert sched_category(level, "PENDING", True) is SchedCategory.RUNNABLE
 
-    @pytest.mark.parametrize("state", ["SPEC", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE"])
+    @pytest.mark.parametrize(
+        "state", ["SPEC", "SPEC_AUDIT", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE"]
+    )
     def test_stage_running_states(self, state):
         assert sched_category(Level.STAGE, state, True) is SchedCategory.RUNNING
 

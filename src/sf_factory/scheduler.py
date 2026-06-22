@@ -35,7 +35,7 @@ import sys
 import traceback
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatch
@@ -1600,7 +1600,10 @@ _CAPACITY_RESOLVE_REASON = (
 #: test; the §3 transition tables are NOT touched). AUDIT maps to
 #: 'rework:VALIDATE' because no rework:AUDIT token exists in the vocabulary —
 #: the limit-killed auditor re-enters through a fresh validation pass
-#: (re-validation cost accepted). MERGE_GATE maps to 'rework:MERGE_GATE'
+#: (re-validation cost accepted). SPEC_AUDIT mirrors that: it maps to
+#: 'rework:SPEC' (no rework:SPEC_AUDIT token) — a limit-killed spec-audit
+#: re-runs through a fresh spec pass, which then re-enters SPEC_AUDIT.
+#: MERGE_GATE maps to 'rework:MERGE_GATE'
 #: (D-0057): a limit-killed Tier-2 run (agent_run_failed + usage_limit) is the
 #: ONE failure class the architect could not also recover manually, being
 #: frozen by the SAME weekly limit (incidents [61]/[53]). Re-entering ONLY the
@@ -1610,6 +1613,7 @@ _CAPACITY_RESOLVE_REASON = (
 #: misapplication risks (unresolved_contest / pre-AUDIT) cannot arise.
 _CAPACITY_RESOLUTIONS: Mapping[str, str] = {
     "SPEC": "rework:SPEC",
+    "SPEC_AUDIT": "rework:SPEC",
     "BUILD": "rework:BUILD",
     "VALIDATE": "rework:VALIDATE",
     "AUDIT": "rework:VALIDATE",
@@ -1712,6 +1716,7 @@ class StageExecutor:
         steps = {
             StageState.PENDING: self._step_dispatch,
             StageState.SPEC: self._step_spec,
+            StageState.SPEC_AUDIT: self._step_spec_audit,
             StageState.BUILD: self._step_build,
             StageState.VALIDATE: self._step_validate,
             StageState.AUDIT: self._step_audit,
@@ -1778,6 +1783,9 @@ class StageExecutor:
         pickup) return () and are never held."""
         if stage.state is StageState.SPEC:
             return ("spec_agent",)
+        if stage.state is StageState.SPEC_AUDIT:
+            # The spec auditors + the spec_agent triage executor (it owns the spec).
+            return (*self._risk_cfg(stage).spec_audits, "spec_agent")
         if stage.state is StageState.BUILD:
             return (_builder_role(self._cfg, stage.risk_class, stage.kind),)
         if stage.state is StageState.VALIDATE:
@@ -2196,10 +2204,23 @@ class StageExecutor:
         sha = await self._commit_unit_paths(
             stage, worktree, [spec_path], f"stage {stage.id}: spec"
         )
+        # Non-documentary exit: SPEC_AUDIT when the risk class declares spec_audits,
+        # else straight to BUILD (the change is INERT for spec_audits-empty classes;
+        # mirrors the VALIDATE -> AUDIT-if-audits-else-MERGE_GATE pattern). The
+        # documentary path (rework:SPEC_DOC) still goes SPEC -> VALIDATE, bypassing
+        # SPEC_AUDIT — the code is unchanged, so re-auditing the SPEC adds nothing.
+        if documentary:
+            non_doc_target = StageState.VALIDATE
+        else:
+            non_doc_target = (
+                StageState.SPEC_AUDIT
+                if self._risk_cfg(stage).spec_audits
+                else StageState.BUILD
+            )
         self._sm.transition(
             Level.STAGE,
             stage.id,
-            (StageState.VALIDATE if documentary else StageState.BUILD).value,
+            non_doc_target.value,
             actor=_ACTOR,
             reason=(
                 "spec amended (documentary) — BUILD skipped, re-validating"
@@ -2627,6 +2648,306 @@ class StageExecutor:
         raise FactoryError(
             f"CP-1 returned verdict {value!r} outside the executable set"
         )  # consultation validated the closed set — reaching here is a bug
+
+    async def _step_spec_audit(self, stage: Stage) -> bool:
+        """SPEC_AUDIT: spec auditors review spec.md (NOT code) in parallel; the
+        spec_agent (it owns the spec) triages the union of findings — comply ->
+        SPEC rework (BLOCKING; loop-capped at escalation.spec_audit_max_rework),
+        contest -> unresolved-contest escalation, clean -> BUILD. A near-clone of
+        _step_audit, but it targets the SPEC and loops to SPEC instead of BUILD.
+        The spec auditors use DEDICATED role names (spec_auditor_*), so their
+        findings never conflate with the post-build code audit's (which keys every
+        recurrence/prior-adjudication query on auditor_role); and by the time a
+        stage reaches AUDIT these spec findings are non-'open', so AUDIT's
+        open-findings query never consumes them either (no audit_target column
+        needed — role-name + status filtering is sufficient)."""
+        worktree = self._worktree(stage)
+        unit_dir = self._unit_dir(worktree, stage)
+        rc = self._risk_cfg(stage)
+        roles = list(rc.spec_audits)
+        if not roles:
+            # Defensive: _step_spec only routes here when spec_audits is non-empty.
+            raise FactoryError(
+                f"stage {stage.id} entered SPEC_AUDIT with no spec_audit roles"
+            )
+
+        existing_open = fdb.findings(self._db.read(), stage.id, ("open",))
+        if not existing_open:
+            await asyncio.gather(
+                *(
+                    self._run_step_agent(
+                        stage, role, self._spec_audit_prompt(stage, role, worktree),
+                        cwd=worktree,
+                    )
+                    for role in roles
+                )
+            )
+            if await self._apply_thresholds(stage, worktree):
+                return False
+            to_commit: list[Path] = []
+            parsed: list[tuple[str, Path, Path, list[dict]]] = []
+            for role in roles:
+                report = unit_dir / STAGE_ARTIFACTS["audit_report"].replace("<role>", role)
+                sidecar = report.with_suffix(".json")
+                if not report.is_file():
+                    raise ArtifactContractError(
+                        f"spec auditor {role} produced no report at {report}"
+                    )
+                findings = _read_findings_sidecar(sidecar, auditor_role=role)
+                parsed.append((role, report, sidecar, findings))
+                to_commit += [report, sidecar]
+            sha = await self._commit_unit_paths(
+                stage, worktree, to_commit, f"stage {stage.id}: spec audit reports"
+            )
+            with self._db.transaction() as conn:
+                for role, report, sidecar, findings in parsed:
+                    ref = register_artifact(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        kind="audit_report",
+                        repo="workspace",
+                        repo_root=worktree,
+                        path=report,
+                        git_commit=sha,
+                    )
+                    register_artifact(
+                        conn,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        kind="audit_report",
+                        repo="workspace",
+                        repo_root=worktree,
+                        path=sidecar,
+                        git_commit=sha,
+                    )
+                    now = utc_now()
+                    _note_finding_recurrence(conn, stage.id, findings, auditor=role)
+                    for finding in findings:
+                        fdb.insert_finding(
+                            conn,
+                            Finding(
+                                id=None,
+                                stage_id=stage.id,
+                                auditor_role=role,
+                                finding_ref=finding["ref"],
+                                severity=finding.get("severity"),
+                                report_artifact_id=ref.id,
+                                status="open",
+                                contest_artifact_id=None,
+                                resolved_by=None,
+                                created_at=now,
+                                updated_at=now,
+                            ),
+                        )
+            existing_open = fdb.findings(self._db.read(), stage.id, ("open",))
+
+        if not existing_open:
+            return self._leave_clean_spec_audit(stage)
+
+        # Spec executor triage of the union of findings (the spec_agent owns the spec).
+        await self._run_step_agent(
+            stage,
+            "spec_agent",
+            self._respond_prompt(stage, existing_open, worktree),
+            cwd=worktree,
+        )
+        if await self._apply_thresholds(stage, worktree):
+            return False
+        response_path = unit_dir / "findings-response.json"
+        responses = _read_response_sidecar(
+            response_path, [f.finding_ref for f in existing_open]
+        )
+        sha = await self._commit_unit_paths(
+            stage, worktree, [response_path], f"stage {stage.id}: spec audit response"
+        )
+        # Drop any stray uncommitted writes the triage step left (mirror _step_audit's
+        # [20] write-isolation): the response sidecar is committed above, so a SPEC or
+        # BUILD re-entry's §3.1 isolation assertion never wedges on triage droppings.
+        discarded = await self._discard_uncommitted(worktree)
+        contested = [f for f in existing_open if responses[f.finding_ref]["action"] == "contest"]
+        complied = [f for f in existing_open if responses[f.finding_ref]["action"] == "comply"]
+
+        def couple_statuses(conn: sqlite3.Connection) -> None:
+            response_ref = register_artifact(
+                conn,
+                unit_level=Level.STAGE.value,
+                unit_id=stage.id,
+                kind="contest_rationale",
+                repo="workspace",
+                repo_root=worktree,
+                path=response_path,
+                git_commit=sha,
+            )
+            for finding in existing_open:
+                action = responses[finding.finding_ref]["action"]
+                assert finding.id is not None
+                if action == "comply":
+                    fdb.set_finding_status(
+                        conn, finding.id, "complied", resolved_by="executor"
+                    )
+                elif action == "duplicate":
+                    fdb.set_finding_status(
+                        conn, finding.id, "duplicate", resolved_by="executor"
+                    )
+                else:
+                    fdb.set_finding_status(
+                        conn,
+                        finding.id,
+                        "contested",
+                        contest_artifact_id=response_ref.id,
+                    )
+            if contested and not fdb.open_escalation(
+                conn, Level.STAGE.value, stage.id, "unresolved_contest"
+            ):
+                fdb.insert_escalation(
+                    conn,
+                    Escalation(
+                        id=None,
+                        unit_level=Level.STAGE.value,
+                        unit_id=stage.id,
+                        trigger="unresolved_contest",
+                        target="phase_architect",
+                        payload_artifact_id=response_ref.id,
+                        event_seq=None,
+                        status="open",
+                        resolution=None,
+                        created_at=utc_now(),
+                        resolved_at=None,
+                    ),
+                )
+
+        if contested:
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.ESCALATED.value,
+                actor=_ACTOR,
+                reason="contested spec-audit finding(s) escalate to the phase architect",
+                payload={
+                    "contested": [f.finding_ref for f in contested],
+                    "discarded": discarded,
+                },
+                coupled=couple_statuses,
+            )
+            return False
+        if complied:
+            return await self._spec_audit_rework_or_escalate(
+                stage, complied, discarded, couple_statuses
+            )
+        # Only duplicates: close them and leave SPEC_AUDIT clean -> BUILD.
+        with self._db.transaction() as conn:
+            couple_statuses(conn)
+        return self._leave_clean_spec_audit(stage)
+
+    def _leave_clean_spec_audit(self, stage: Stage) -> bool:
+        """Spec findings closed: the spec is clean -> BUILD (unconditional; the §9
+        human gate is a POST-BUILD/AUDIT concern, never a spec-review one)."""
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.BUILD.value,
+            actor=_ACTOR,
+            reason="spec audit clean",
+        )
+        return True
+
+    async def _spec_audit_rework_or_escalate(
+        self,
+        stage: Stage,
+        complied: list[Finding],
+        discarded: list[str],
+        couple_statuses: Callable[[sqlite3.Connection], None],
+    ) -> bool:
+        """Comply path: loop SPEC_AUDIT -> SPEC to rework the spec (BLOCKING),
+        unless this stage has already looped spec_audit_max_rework times since its
+        last FRESH spec entry — then ESCALATE instead of looping forever (the
+        spec-rework loop's bound; mirrors the merge-gate loop-cap, Doctrine §8/§20).
+        A 'fresh' spec entry is a SPEC transition NOT coming from SPEC_AUDIT (i.e.
+        PENDING->SPEC or ESCALATED->SPEC): loops are counted only after it."""
+        with self._db.transaction() as conn:
+            # The seq of the last fresh spec entry (a transition INTO SPEC whose
+            # from_state is NOT SPEC_AUDIT); loops are SPEC_AUDIT->SPEC after it.
+            fresh = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE unit_level = 'stage'"
+                " AND unit_id = ? AND event_type = 'transition' AND to_state = 'SPEC'"
+                " AND from_state IS NOT 'SPEC_AUDIT'",
+                (stage.id,),
+            ).fetchone()[0]
+            loops = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE unit_level = 'stage'"
+                " AND unit_id = ? AND event_type = 'transition' AND to_state = 'SPEC'"
+                " AND from_state = 'SPEC_AUDIT' AND seq > ?",
+                (stage.id, fresh),
+            ).fetchone()[0]
+        cap = self._cfg.escalation.spec_audit_max_rework
+        complied_refs = [f.finding_ref for f in complied]
+        if loops >= cap:
+            loop_evidence = {
+                "spec_audit_reworks": loops,
+                "cap": cap,
+                "complied": complied_refs,
+            }
+
+            def couple_loop(conn: sqlite3.Connection) -> None:
+                couple_statuses(conn)
+                seq = fdb.insert_event(
+                    conn,
+                    unit_level=Level.STAGE.value,
+                    unit_id=stage.id,
+                    event_type="spec_audit_loop",
+                    actor=_ACTOR,
+                    payload=loop_evidence,
+                )
+                if not fdb.open_escalation(
+                    conn, Level.STAGE.value, stage.id, "spec_audit_loop"
+                ):  # uq_open_escalation: one open row per (stage, trigger)
+                    fdb.insert_escalation(
+                        conn,
+                        Escalation(
+                            id=None,
+                            unit_level=Level.STAGE.value,
+                            unit_id=stage.id,
+                            trigger="spec_audit_loop",
+                            target="phase_architect",
+                            payload_artifact_id=None,
+                            event_seq=seq,
+                            status="open",
+                            resolution=None,
+                            created_at=utc_now(),
+                            resolved_at=None,
+                        ),
+                    )
+
+            self._sm.transition(
+                Level.STAGE,
+                stage.id,
+                StageState.ESCALATED.value,
+                actor=_ACTOR,
+                reason=(
+                    f"spec audit reworked the spec {loops}x (cap {cap}) with no clean"
+                    " spec — stuck loop, escalated"
+                ),
+                payload=loop_evidence | {"triggers": ["spec_audit_loop"]},
+                coupled=couple_loop,
+            )
+            return False
+        rework = "spec agent complies with spec-audit finding(s) — spec rework"
+        self._sm.transition(
+            Level.STAGE,
+            stage.id,
+            StageState.SPEC.value,
+            actor=_ACTOR,
+            reason=rework,
+            payload={
+                "complied": complied_refs,
+                # CCR-9: carry the WHY into the re-entered spec_agent's prompt.
+                "rework_context": rework,
+                "discarded": discarded,
+            },
+            coupled=couple_statuses,
+        )
+        return True
 
     async def _step_audit(self, stage: Stage) -> bool:
         """AUDIT: risk-routed auditors in parallel; the executor (Builder role)
@@ -3834,6 +4155,25 @@ class StageExecutor:
             f"You are auditor '{role}' for stage '{stage.id}' ({stage.name}, risk class "
             f"{stage.risk_class}).\nAudit the implementation against {unit_rel}/spec.md "
             "and the contracts under _factory/contracts/. Cite concrete locations.\n"
+            f"Write {unit_rel}/audit-{role}.md (prose) and {unit_rel}/audit-{role}.json — "
+            'EXACTLY {"findings": [{"ref": "<id>", "severity": "...", "summary": "...", '
+            '"location": "..."}]} (empty list = clean).\n'
+            + self._prior_adjudications_note(stage)
+            + self._layout_note(stage)
+        )
+
+    def _spec_audit_prompt(self, stage: Stage, role: str, worktree: Path) -> str:
+        unit_rel = f"_factory/stages/{stage.id}"
+        return (
+            f"You are spec auditor '{role}' for stage '{stage.id}' ({stage.name}, risk "
+            f"class {stage.risk_class}).\n"
+            f"Review the SPECIFICATION at {unit_rel}/spec.md against the frozen contracts "
+            "under _factory/contracts/. There is NO code yet — do NOT review code. Look "
+            "for: internal contradictions; non-conformance to the frozen contracts; "
+            "ambiguity; missing or untestable acceptance criteria; incomplete edge-case "
+            "coverage (e.g. a 'delete X' spec that never says what happens to records "
+            "referencing X); and anything that would stop a builder from implementing it "
+            "UNAMBIGUOUSLY. Cite concrete spec locations.\n"
             f"Write {unit_rel}/audit-{role}.md (prose) and {unit_rel}/audit-{role}.json — "
             'EXACTLY {"findings": [{"ref": "<id>", "severity": "...", "summary": "...", '
             '"location": "..."}]} (empty list = clean).\n'

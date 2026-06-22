@@ -231,11 +231,23 @@ class EscalationCfg(_StrictModel):
     # re-looping forever (Doctrine §8/§20). Defaulted so existing/test configs
     # validate without it; the live YAML sets it explicitly.
     merge_gate_max_tier1_failures: int = Field(ge=1, default=3)
+    # Spec dual-audit rework loop-cap: a stage whose SPEC_AUDIT step loops back to
+    # SPEC (a real spec defect the spec agent reworks) this many times since its
+    # last FRESH spec entry is ESCALATED instead of looping forever (the BLOCKING
+    # spec-rework loop's bound; mirrors merge_gate_max_tier1_failures, Doctrine
+    # §8/§20). Defaulted so existing/test configs validate without it.
+    spec_audit_max_rework: int = Field(ge=1, default=2)
 
 
 class RiskClassCfg(_StrictModel):
     validator: str
     audits: list[str]
+    #: Spec dual-audit roles (config models.* keys) — the auditors that review
+    #: spec.md after SPEC and before BUILD. EMPTY default = backward-compatible:
+    #: the SPEC_AUDIT step is never reached, SPEC goes straight to BUILD (the
+    #: change is INERT for any risk class that does not opt in). The golden config
+    #: opts ALL classes in. Cross-checked against models in FactoryConfig.
+    spec_audits: list[str] = []
     human_gate: bool = False
 
 
@@ -486,6 +498,12 @@ class FactoryConfig(_StrictModel):
                 if auditor not in self.models:
                     raise ValueError(
                         f"risk_classes.{rc_name}.audits: {auditor!r} is not a models.* key"
+                    )
+            for spec_auditor in rc.spec_audits:
+                if spec_auditor not in self.models:
+                    raise ValueError(
+                        f"risk_classes.{rc_name}.spec_audits: {spec_auditor!r}"
+                        " is not a models.* key"
                     )
         # CCR-6 + D-0038: per-role reasoning effort. claude → `--effort <v>`
         # (§5.1 argv literal); codex (gpt-5.x) → `-c model_reasoning_effort="<v>"`

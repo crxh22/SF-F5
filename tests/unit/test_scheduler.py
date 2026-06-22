@@ -5503,6 +5503,9 @@ async def test_capacity_resolution_map_audit_maps_to_rework_validate(
 
     assert sched_mod._CAPACITY_RESOLUTIONS == {
         "SPEC": "rework:SPEC",
+        # SPEC_AUDIT mirrors AUDIT: no rework:SPEC_AUDIT token exists, so a
+        # limit-killed spec audit re-runs through a fresh spec pass (rework:SPEC).
+        "SPEC_AUDIT": "rework:SPEC",
         "BUILD": "rework:BUILD",
         "VALIDATE": "rework:VALIDATE",
         "AUDIT": "rework:VALIDATE",
@@ -6104,4 +6107,299 @@ async def test_build_prompt_audit_comply_rework_context(
     assert (
         "Rework context: executor complies with audit finding(s) — rework."
         in builder_call.prompt
+    )
+
+
+# ============================================================ SPEC_AUDIT step
+# Spec dual-audit (runs after SPEC, before BUILD): two auditors review spec.md,
+# the spec_agent triages, clean -> BUILD, comply -> SPEC rework (blocking,
+# loop-capped), contest -> ESCALATED. Backward-compat: a risk class with
+# spec_audits=[] never enters SPEC_AUDIT (SPEC -> BUILD unchanged). These tests
+# mutate config_dict locally (the supported way; conftest is frozen) to add the
+# spec_auditor_* routes + spec_audits to a risk class.
+_SPEC_AUDIT_ROLES = ("spec_auditor_same_model", "spec_auditor_cross_model")
+
+
+def _enable_spec_audits(config_dict, *, classes=("structural", "critical"), cap=2):
+    """Add the spec_auditor_* model routes and wire spec_audits onto the named
+    risk classes (+ set the rework loop-cap). Mirrors the golden config's shape:
+    same strong routes as the code auditors, dedicated names."""
+    stub = {"cli": "stub", "model": "stub-model", "mode": "print"}
+    config_dict["models"]["spec_auditor_same_model"] = dict(stub)
+    config_dict["models"]["spec_auditor_cross_model"] = dict(stub)
+    for rc in classes:
+        config_dict["risk_classes"][rc]["spec_audits"] = list(_SPEC_AUDIT_ROLES)
+    config_dict["escalation"]["spec_audit_max_rework"] = cap
+
+
+def _spec_auditor(ref: str | None):
+    """A spec-auditor behavior writing the audit-<role>.md/.json sidecar pair —
+    one finding when ``ref`` is given, empty (clean) when None."""
+    def behavior(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        role = ref.split(":")[0] if ref else None
+        # When clean, the calling test passes the role via a closure variable; the
+        # clean variant is created per-role by _clean_spec_auditor below.
+        assert role is not None
+        (d / f"audit-{role}.md").write_text(f"finding {ref}", encoding="utf-8")
+        (d / f"audit-{role}.json").write_text(
+            json.dumps({"findings": [{"ref": ref, "severity": "major", "summary": "s"}]}),
+            encoding="utf-8",
+        )
+    return behavior
+
+
+def _clean_spec_auditor(role: str):
+    def behavior(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"audit-{role}.md").write_text("clean\n", encoding="utf-8")
+        (d / f"audit-{role}.json").write_text(
+            json.dumps({"findings": []}), encoding="utf-8"
+        )
+    return behavior
+
+
+def _set_one_finding_spec_audit(env):
+    """Wire the two spec auditors: same_model raises one finding, cross_model clean."""
+    env.runner.behaviors["spec_auditor_same_model"] = _spec_auditor(
+        "spec_auditor_same_model:F1"
+    )
+    env.runner.behaviors["spec_auditor_cross_model"] = _clean_spec_auditor(
+        "spec_auditor_cross_model"
+    )
+
+
+def _spec_responder(actions: dict[str, str]):
+    """spec_agent triage behavior: answer each finding ref with its action."""
+    def behavior(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "stages" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "findings-response.json").write_text(
+            json.dumps(
+                {"responses": [
+                    {"ref": ref, "action": act, "rationale": "r"}
+                    for ref, act in actions.items()
+                ]}
+            ),
+            encoding="utf-8",
+        )
+    return behavior
+
+
+async def test_spec_audit_clean_routes_to_build(db, config_dict, tmp_path) -> None:
+    """Clean spec (no findings) -> SPEC_AUDIT -> BUILD; the spec_agent triage is
+    never even spawned (nothing to triage)."""
+    _enable_spec_audits(config_dict)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC_AUDIT")
+    for role in _SPEC_AUDIT_ROLES:
+        env.runner.behaviors[role] = _clean_spec_auditor(role)
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec_audit(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.BUILD
+    assert not [c for c in env.runner.calls if c.role == "spec_agent"]
+    # Both spec auditors ran; their reports are registered.
+    assert {c.role for c in env.runner.calls} == set(_SPEC_AUDIT_ROLES)
+
+
+async def test_spec_audit_comply_loops_to_spec_with_rework_context(
+    db, config_dict, tmp_path
+) -> None:
+    """A real spec defect: the spec_agent COMPLIES -> SPEC_AUDIT -> SPEC (the
+    blocking rework loop), carrying rework_context; the next spec pass's prompt
+    renders that context."""
+    _enable_spec_audits(config_dict)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC_AUDIT")
+    _set_one_finding_spec_audit(env)
+    env.runner.behaviors["spec_agent"] = _spec_responder({"spec_auditor_same_model:F1": "comply"})
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec_audit(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC
+    spec_entry = [e for e in events_of(db, "ph.s1", "transition") if e["to_state"] == "SPEC"][-1]
+    payload = json.loads(spec_entry["payload_json"])
+    assert payload["complied"] == ["spec_auditor_same_model:F1"]
+    assert "spec rework" in payload["rework_context"]
+    findings = {f.finding_ref: f for f in fdb.findings(db.read(), "ph.s1")}
+    assert findings["spec_auditor_same_model:F1"].status == "complied"
+    # The re-entered spec_agent sees the rework context in its prompt.
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("reworked spec")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    phase = fdb.get_phase(db.read(), "ph")
+    prompt = env.executor._spec_prompt(stage, phase, env.worktree, payload)
+    assert "Rework context: spec agent complies" in prompt
+
+
+async def test_spec_audit_contest_escalates_then_rework_spec_routes_back(
+    db, config_dict, tmp_path
+) -> None:
+    """A contested spec finding -> unresolved_contest escalation + SPEC_AUDIT ->
+    ESCALATED; resolving with rework:SPEC then routes ESCALATED -> SPEC."""
+    _enable_spec_audits(config_dict)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC_AUDIT")
+    _set_one_finding_spec_audit(env)
+    env.runner.behaviors["spec_agent"] = _spec_responder({"spec_auditor_same_model:F1": "contest"})
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec_audit(stage) is False
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    assert [r["trigger"] for r in open_escalations(db, "ph.s1")] == ["unresolved_contest"]
+    findings = {f.finding_ref: f for f in fdb.findings(db.read(), "ph.s1")}
+    assert findings["spec_auditor_same_model:F1"].status == "contested"
+    assert findings["spec_auditor_same_model:F1"].contest_artifact_id is not None
+    # The architect resolves the contest with rework:SPEC -> ESCALATED -> SPEC.
+    (esc,) = open_escalations(db, "ph.s1")
+    with db.transaction() as conn:
+        fdb.resolve_escalation(conn, esc["id"], "rework:SPEC")
+        fdb.insert_event(
+            conn, unit_level="stage", unit_id="ph.s1",
+            event_type="escalation_resolved", actor="main_architect",
+            payload={"escalation_id": esc["id"], "resolution": "rework:SPEC",
+                     "reason": "spec is genuinely ambiguous", "via": "cli"},
+        )
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_escalated(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC
+
+
+async def test_spec_audit_backward_compat_empty_spec_audits_spec_to_build(
+    db, config_dict, tmp_path
+) -> None:
+    """Backward-compat: a risk class with spec_audits=[] (the conftest default,
+    untouched here) -> SPEC routes straight to BUILD, never SPEC_AUDIT — the
+    change is INERT."""
+    # routine has audits=[] AND (default) spec_audits=[] in the frozen conftest.
+    env = make_stage_env(db, config_dict, tmp_path, risk="routine")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC")
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("the spec")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.BUILD
+
+
+async def test_spec_audit_documentary_rework_still_bypasses_to_validate(
+    db, config_dict, tmp_path
+) -> None:
+    """Documentary bypass: rework:SPEC_DOC keeps the SPEC -> VALIDATE shortcut
+    even when spec_audits is configured (the code is unchanged; re-auditing the
+    spec adds nothing) — SPEC_AUDIT is skipped."""
+    _enable_spec_audits(config_dict, classes=("routine", "structural", "critical"))
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    out: list = []
+    _escalate_and_resolve_stage(db, out, "rework:SPEC_DOC", "spec line 12 mismatch")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_escalated(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("amended text")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.VALIDATE  # SPEC_AUDIT + BUILD skipped
+
+
+async def test_spec_exit_routes_to_spec_audit_when_configured(
+    db, config_dict, tmp_path
+) -> None:
+    """Non-documentary SPEC exit -> SPEC_AUDIT when the risk class declares
+    spec_audits (the opposite of the backward-compat case)."""
+    _enable_spec_audits(config_dict)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC")
+    env.runner.behaviors["spec_agent"] = _spec_agent_writing("the spec")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec(stage) is True
+    assert stage_state(db, "ph.s1") is StageState.SPEC_AUDIT
+
+
+async def test_spec_audit_loop_cap_escalates_to_phase_architect(
+    db, config_dict, tmp_path
+) -> None:
+    """Loop-cap: after spec_audit_max_rework SPEC_AUDIT->SPEC loops since the last
+    fresh spec entry, the comply path ESCALATES (spec_audit_loop) instead of
+    looping forever."""
+    _enable_spec_audits(config_dict, cap=2)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    # Seed a fresh SPEC entry + two prior SPEC_AUDIT->SPEC loops (already at cap).
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "PENDING")
+    sm = StateMachine(db)
+    sm.transition(Level.STAGE, "ph.s1", "SPEC", actor="control_plane", reason="fresh")
+    for _ in range(2):
+        sm.transition(Level.STAGE, "ph.s1", "SPEC_AUDIT", actor="control_plane", reason="r")
+        sm.transition(Level.STAGE, "ph.s1", "SPEC", actor="control_plane", reason="loop")
+    sm.transition(Level.STAGE, "ph.s1", "SPEC_AUDIT", actor="control_plane", reason="r")
+    _set_one_finding_spec_audit(env)
+    env.runner.behaviors["spec_agent"] = _spec_responder({"spec_auditor_same_model:F1": "comply"})
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert await env.executor._step_spec_audit(stage) is False
+    assert stage_state(db, "ph.s1") is StageState.ESCALATED
+    (esc,) = open_escalations(db, "ph.s1")
+    assert esc["trigger"] == "spec_audit_loop"
+    assert esc["target"] == "phase_architect"
+    loop_events = events_of(db, "ph.s1", "spec_audit_loop")
+    assert loop_events and json.loads(loop_events[-1]["payload_json"])["cap"] == 2
+
+
+def test_spawn_roles_spec_audit_returns_auditors_plus_spec_agent(
+    db, config_dict, tmp_path
+) -> None:
+    """_step_spawn_roles(SPEC_AUDIT) = the spec_audits roles + the spec_agent
+    triage executor (the capacity-hold predicate)."""
+    _enable_spec_audits(config_dict)
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "SPEC_AUDIT")
+    stage = fdb.get_stage(db.read(), "ph.s1")
+    assert env.executor.spawn_roles(stage) == (*_SPEC_AUDIT_ROLES, "spec_agent")
+
+
+async def test_spec_audit_open_findings_not_consumed_by_post_build_audit(
+    db, config_dict, tmp_path
+) -> None:
+    """Findings isolation WITHOUT an audit_target column (the chosen minimal
+    approach): spec findings and code findings on the SAME stage are kept apart by
+    (1) status filtering — by the time a stage reaches post-build AUDIT every spec
+    finding is non-'open', so AUDIT's `findings(stage_id,('open',))` query never
+    re-consumes them; and (2) DEDICATED role names — `prior_disposed_finding` and
+    `_prior_adjudications_note` key recurrence/do-not-re-raise on auditor_role, so a
+    SETTLED spec finding is invisible to a code auditor's recurrence check (and vice
+    versa) even when both reuse a finding_ref string. This pins both guarantees."""
+    from sf_factory.artifacts import register_artifact
+    from sf_factory.models import Finding
+
+    env = make_stage_env(db, config_dict, tmp_path, risk="structural")
+    unit_dir = env.worktree / "_factory" / "stages" / "ph.s1"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / "spec.md").write_text("s", encoding="utf-8")
+    with db.transaction() as conn:
+        ref = register_artifact(
+            conn, unit_level=Level.STAGE.value, unit_id="ph.s1", kind="audit_report",
+            repo="workspace", repo_root=env.worktree, path=unit_dir / "spec.md",
+            git_commit=None,
+        )
+        # A SETTLED spec finding sharing the bare ref 'F-1' with a future code finding.
+        fid = fdb.insert_finding(
+            conn, Finding(
+                id=None, stage_id="ph.s1", auditor_role="spec_auditor_same_model",
+                finding_ref="F-1", severity="minor", report_artifact_id=ref.id,
+                status="open", contest_artifact_id=None, resolved_by=None,
+                created_at=utc_now(), updated_at=utc_now(),
+            ),
+        )
+        fdb.set_finding_status(conn, fid, "settled", resolved_by="phase_architect")
+    # (1) status: the spec finding is non-'open', so AUDIT's open-query skips it.
+    assert [f.finding_ref for f in fdb.findings(db.read(), "ph.s1", ("open",))] == []
+    # (2) role-name: a code auditor reusing ref 'F-1' is NOT flagged as a recurrence
+    # of the settled SPEC 'F-1' (auditor_role is part of the disposition match).
+    assert fdb.prior_disposed_finding(db.read(), "ph.s1", "F-1", "auditor_same_model") is None
+    # ...while the SAME spec role DOES see its own settled disposition (control).
+    assert (
+        fdb.prior_disposed_finding(db.read(), "ph.s1", "F-1", "spec_auditor_same_model")
+        == "settled"
     )

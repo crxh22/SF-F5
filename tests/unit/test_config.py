@@ -118,6 +118,8 @@ class TestGoldenRealConfig:
             "auditor_same_model",
             "integration_validator",
             "auditor_cross_model",
+            "spec_auditor_same_model",
+            "spec_auditor_cross_model",
             "decision_session",
         ):
             assert cfg.models[role].effort == "xhigh", role

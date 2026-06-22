@@ -404,6 +404,7 @@ GLOSS: Mapping[str, str] = {
     # unit states (stage + phase; shared names glossed once)
     "PENDING": "planificată — așteaptă pornirea",
     "SPEC": "specificare în lucru",
+    "SPEC_AUDIT": "audit al specificației în lucru",
     "BUILD": "construcție în lucru",
     "VALIDATE": "validare în lucru",
     "AUDIT": "audit în lucru",
@@ -470,6 +471,8 @@ GLOSS: Mapping[str, str] = {
     "agent_run_failed": "agentul a eșuat la rulare (oprire fără rezultat)",
     # loop-cap (incident 22-06): merge-gate Tier-1 suite kept failing un-fixably
     "merge_gate_loop": "buclă la poarta de merge (teste eșuate repetat)",
+    # spec dual-audit rework loop-cap: SPEC_AUDIT kept bouncing the spec back un-fixably
+    "spec_audit_loop": "buclă la auditul specificației (specificația refăcută repetat)",
     # integration safety net (step-5): small-stage size gate flagged a plan stage
     "stage_size_gate": "etapă în afara limitelor de dimensiune (plan)",
     # escalation targets (DDL CHECK set, §10.4 — who handles it)
@@ -515,6 +518,8 @@ GLOSS: Mapping[str, str] = {
     "integration_validator": "validator de integrare",
     "auditor_same_model": "auditor (același model)",
     "auditor_cross_model": "auditor încrucișat (codex)",
+    "spec_auditor_same_model": "auditor de specificație (același model)",
+    "spec_auditor_cross_model": "auditor de specificație încrucișat (codex)",
     "cp1_triage": "triaj CP-1",
     "decision_session": "sesiune de decizie",
     "capacity_probe": "sondă de capacitate",
@@ -536,6 +541,7 @@ GLOSS: Mapping[str, str] = {
 STATE_CHIPS: Mapping[str, str] = {
     "PENDING": "neutral",
     "SPEC": "accent",
+    "SPEC_AUDIT": "accent",
     "BUILD": "accent",
     "VALIDATE": "accent",
     "AUDIT": "accent",
@@ -1687,8 +1693,8 @@ def _build_health(
     waiting_stages: list[WaitingStage] = []
     waiting = runnable = 0
     budgets: list[BudgetRow] = []
-    active_states = {"SPEC", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE", "AWAITING_HUMAN",
-                     "ESCALATED"}
+    active_states = {"SPEC", "SPEC_AUDIT", "BUILD", "VALIDATE", "AUDIT", "MERGE_GATE",
+                     "AWAITING_HUMAN", "ESCALATED"}
     for srow in stage_rows:
         state = srow["state"]
         deps = fdb.deps_done(conn, Level.STAGE, srow["id"]) if state == "PENDING" else True

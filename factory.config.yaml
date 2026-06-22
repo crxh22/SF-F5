@@ -59,6 +59,11 @@ models:
   integration_validator: {cli: claude, model: opus,    mode: print, effort: xhigh, tools: [Read, Write]}
   auditor_same_model:    {cli: claude, model: opus,    mode: print, effort: xhigh}
   auditor_cross_model:   {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
+  # Spec dual-audit (runs after SPEC, before BUILD): SAME strong models as the code
+  # auditors above (founder mandate — no cheap variant for spec review), but DEDICATED
+  # role names so spec findings are disambiguable from post-build code findings by role.
+  spec_auditor_same_model:  {cli: claude, model: opus,    mode: print, effort: xhigh}
+  spec_auditor_cross_model: {cli: codex,  model: gpt-5.5, mode: print, effort: xhigh}
   cp1_triage:            {cli: claude, model: haiku,   mode: print}   # output is schema-validated anyway
   # CCR-11 (D-0037): the capacity governor's hold-exit canary — cheapest claude
   # print run; an ordinary registered agent run (process registry + ledger).
@@ -111,6 +116,7 @@ escalation:
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
   stuck_escalation_threshold_min: 30 # open-too-long climb (2a) + resolved-not-advanced (2b) trigger past this age
   merge_gate_max_tier1_failures: 3 # Tier-1 suite fails this many times since last escalation -> ESCALATE, not re-loop (incident 22-06: treasury socket-path loop, 12x)
+  spec_audit_max_rework: 2     # SPEC_AUDIT->SPEC rework loops since last fresh spec entry -> ESCALATE, not re-loop (the blocking spec-rework loop's bound)
                           # RESTORED to 30 by ETAPA-5f after the proper case-2b fix shipped: the over-fire (case-2b
                           # paging escalation_stuck_resolved for EVERY old resolved escalation of a re-ESCALATED unit,
                           # ~32 false [arhitect] pages) is fixed by scoping (2b) to each unit's MOST-RECENT escalation
@@ -118,9 +124,12 @@ escalation:
                           # disable (D-0044) is retired.
 
 risk_classes:
-  routine:    {validator: validator,            audits: []}
-  structural: {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model]}
-  critical:   {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model], human_gate: true}
+  # spec_audits runs at ALL classes (founder's "toate"): the spec is dual-audited before
+  # BUILD everywhere. routine still keeps audits: [] (no post-build CODE audit) — only the
+  # pre-build SPEC audit is new there.
+  routine:    {validator: validator,            audits: [],                                       spec_audits: [spec_auditor_same_model, spec_auditor_cross_model]}
+  structural: {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model], spec_audits: [spec_auditor_same_model, spec_auditor_cross_model]}
+  critical:   {validator: validator_structural, audits: [auditor_same_model, auditor_cross_model], spec_audits: [spec_auditor_same_model, spec_auditor_cross_model], human_gate: true}
 
 economics:
   dual_audit_structural: true  # second auditor's marginal cost ~0 on current subscriptions (DoD §7)

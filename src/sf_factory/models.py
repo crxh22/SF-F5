@@ -38,11 +38,15 @@ class RiskClass(StrEnum):
 
 
 class StageState(StrEnum):
-    """PENDING SPEC BUILD VALIDATE AUDIT AWAITING_HUMAN MERGE_GATE ESCALATED DONE FAILED
-    CANCELLED."""
+    """PENDING SPEC SPEC_AUDIT BUILD VALIDATE AUDIT AWAITING_HUMAN MERGE_GATE ESCALATED
+    DONE FAILED CANCELLED."""
 
     PENDING = "PENDING"
     SPEC = "SPEC"
+    #: Spec dual-audit step: two auditors review spec.md (not code) after SPEC and
+    #: before BUILD; clean -> BUILD, real spec defect -> SPEC rework (blocking) or
+    #: ESCALATED. INERT when the risk class declares no spec_audits (SPEC -> BUILD).
+    SPEC_AUDIT = "SPEC_AUDIT"
     BUILD = "BUILD"
     VALIDATE = "VALIDATE"
     AUDIT = "AUDIT"
@@ -104,8 +108,27 @@ VALID_STAGE_TRANSITIONS: Mapping[StageState, frozenset[StageState]] = MappingPro
     {
         StageState.PENDING: frozenset({StageState.SPEC, StageState.CANCELLED}),
         StageState.SPEC: frozenset(
-            # VALIDATE is the D-0059 documentary path (skip BUILD); the normal exit is BUILD.
-            {StageState.BUILD, StageState.VALIDATE, StageState.ESCALATED, StageState.CANCELLED}
+            # SPEC_AUDIT is the spec dual-audit step (taken when the risk class declares
+            # spec_audits). BUILD is KEPT for the spec_audits-empty skip (the change is
+            # INERT for those risk classes). VALIDATE is the D-0059 documentary path
+            # (rework:SPEC_DOC skips BUILD and bypasses SPEC_AUDIT).
+            {
+                StageState.SPEC_AUDIT,
+                StageState.BUILD,
+                StageState.VALIDATE,
+                StageState.ESCALATED,
+                StageState.CANCELLED,
+            }
+        ),
+        StageState.SPEC_AUDIT: frozenset(
+            # BUILD=clean spec, SPEC=rework loop (blocking — a real spec defect),
+            # ESCALATED=contested finding / cross-cutting / loop-cap.
+            {
+                StageState.BUILD,
+                StageState.SPEC,
+                StageState.ESCALATED,
+                StageState.CANCELLED,
+            }
         ),
         StageState.BUILD: frozenset(
             {StageState.VALIDATE, StageState.ESCALATED, StageState.CANCELLED}
@@ -218,6 +241,7 @@ VALID_PHASE_TRANSITIONS: Mapping[PhaseState, frozenset[PhaseState]] = MappingPro
 _RUNNING_STAGE_STATES = frozenset(
     {
         StageState.SPEC,
+        StageState.SPEC_AUDIT,
         StageState.BUILD,
         StageState.VALIDATE,
         StageState.AUDIT,
