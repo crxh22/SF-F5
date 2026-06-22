@@ -36,10 +36,12 @@ Agentul care scrie spec-ul de UI NU trece la build până nu răspunde EXPLICIT 
 2. **Garduri mecanice** (build-ul PICĂ): fără culori/stiluri în afara tokens; doar componente din
    strat; fără defaults interzise. Transformă regulile din „rugăminți" în „legi". *Cel mai ieftin, primul.*
 3. **Poarta de chestionar UX la spec** (§2): aspectul + controalele + referința decise ÎNAINTE de build.
-4. **Bucla vizuală**: build-agentul randează + captură (3 lățimi) + autoverificare (rupt/suprapus/
-   gol/overflow) + autocorecție 2-3×. Prinde „rupt", NU „frumos" (~10-18% îmbunătățire — cercetare).
+4. **Bucla vizuală**: build-agentul randează + captură (**2 lățimi: desktop + telefon; fără tabletă**,
+   decizie fondator 22-06) + autoverificare (rupt/suprapus/gol/overflow) + autocorecție 2-3×. Prinde
+   „rupt", NU „frumos" (~10-18% îmbunătățire — cercetare).
 5. **Poarta de revizie vizuală a fondatorului**: fondatorul parcurge ecranele randate (pe ERP-ul de
-   test) înainte de semnarea fazei de UI. Singurul judecător de „gust". Pe ecranele importante.
+   test) înainte de semnarea fazei de UI. Singurul judecător de „gust". **Doar la primele câteva
+   iterații de UI, apoi reevaluăm** (decizie fondator 22-06). Pe ecranele importante.
 + Structural: separare front/back pe etape (#6); o referință vizuală (1-2 aplicații-model).
 **De evitat acum (nu se potrivesc):** generatoare gen v0/Lovable/bolt, unelte Figma (nu avem
 design-uri), servicii plătite de testare vizuală. [cercetare]

@@ -41,13 +41,13 @@ acestei combinații — nu o defecțiune punctuală.
 ## 4. Mecanismul de garanție la nivel de execuție (#10) — DEFINIT (ordine = pârghie)
 → MUTAT în `work-protocols/ui-ux-laws.md`. Vezi ui-ux-laws.md §4.
 
-## 5. Decizii deschise (fondator)
-1. **Referința vizuală:** ✅ REZOLVAT 22-06 — NetSuite + Dynamics 365 + Odoo + un document de filosofie UX-ERP al fondatorului. Vezi **§7**.
-2. **Gestionare date de bază:** ECRANE în aplicație (recomand) vs doar import 1C + admin.
-3. **Adoptăm planul §4** (5 mecanisme) + separarea front/back ca regulă? (recomand DA)
-4. **Cadența reviziei:** tu vezi ecranele importante la fiecare fază de UI. (default recomandat)
-5. **Accesibilitate standard (AA) implicit:** recomand DA (ieftin acum, scump retroactiv).
-6. **Paleta de culori:** după ce setăm regulile + referința (recomand) vs fix rapid acum.
+## 5. Decizii (rezolvate 22-06-2026)
+1. **Referința vizuală:** ✅ NetSuite + Dynamics 365 + Odoo + filosofia UX-ERP a fondatorului → `work-protocols/ui-ux-laws.md §7`.
+2. **Gestionare date de bază:** ✅ **ECRANE în aplicație** (adăugare/editare/ștergere), nu doar import 1C + panoul Django.
+3. **Mecanismele §4 + separarea front/back:** ✅ **adoptate**, cu 2 ajustări (în `ui-ux-laws.md §4`): captură la **2 lățimi** (desktop + telefon, fără tabletă); poarta vizuală a fondatorului **doar la primele câteva iterații, apoi reevaluăm**.
+4. **Cadența reviziei:** ✅ fondatorul vede ecranele importante la fiecare fază de UI.
+5. **Accesibilitate AA implicit:** ✅ DA.
+6. **Paleta de culori:** ⏳ se decide după ce se setează regulile; până atunci stil modern default (Claude Code/codex). Nu e critic.
 
 ## 6. Intrări (surse)
 - Cercetare „cum se face UI/UX cu AI" (instrumente/metodologii/integrare): `docs/research/ui-ux-ai-assisted-research-22-06-2026.md` ✅
