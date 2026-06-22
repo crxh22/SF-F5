@@ -129,3 +129,12 @@ long-lived architect, carry only this pointer and read the file on demand.
 ntfy titles) so a successor session learns of escalations within one poll of the threshold
 crossing — see `docs/runbooks/session-succession.md` for the hand-down. The ntfy `[arhitect]`
 push is the human backstop if the monitor is down.
+
+## 6. Succession launch — the mechanical contract is FIXED, follow it verbatim
+
+When you hand off (context-guard threshold, `session-succession.md`), the START algorithm, the FORBIDDEN
+actions (never broad-kill a prompt-matchable pattern — `pkill -f` killed 5u/5v/5w at once), and the EXACT
+successor AUTO-LAUNCH command live in **`docs/runbooks/session-launch-protocol.md`** — follow it verbatim,
+never deviate. The founder is PHONE-ONLY: he CANNOT launch a successor for you, so YOU auto-launch it
+(`SFF5_TMUX_SESSION=arh-NN SFF5_RC_NAME="ARH - NN" /home/artur/projects/SF-F5/claude_canon.sh "<prompt>"`
+— no `env -u TMUX` wrapper; the launcher handles the detached pty+RC session itself, D-0051).

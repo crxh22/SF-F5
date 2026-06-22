@@ -10,6 +10,11 @@ firing session's id).
 
 ## The protocol (executed by the SITTING architect session when the note appears)
 
+> **Launch mechanics are FIXED in [`session-launch-protocol.md`](./session-launch-protocol.md)** — the
+> START algorithm, the FORBIDDEN actions (broad kills), and the EXACT auto-launch command. The architect
+> AUTO-launches the successor itself (the founder is phone-only and cannot run commands). Follow that file
+> verbatim for step 3 below.
+
 1. **Finish the current work unit** — never hand off mid-slice (a successor inheriting a
    half-built slice re-derives context expensively and errs). The note repeats on every
    founder prompt until succession; no urgency spike — 500k of a 1M window.
