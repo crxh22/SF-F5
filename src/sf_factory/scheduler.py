@@ -32,9 +32,8 @@ import shutil
 import signal
 import sqlite3
 import sys
+import time
 import traceback
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -102,6 +101,7 @@ from sf_factory.runner import AgentResult, AgentRunner, cmdline_matches
 from sf_factory.runtime_settings import EffectiveConfig
 from sf_factory.statemachine import StateMachine
 from sf_factory.thresholds import ThresholdEvaluator
+from sf_factory.usage import get_usage
 from sf_factory.worktrees import (
     StaleGateError,
     WorktreeManager,
@@ -1284,31 +1284,29 @@ class CapacityGovernor:
             await self._lift_proactive_hold(five_hour, seven_day)
 
     def _query_usage(self) -> tuple[float, float] | None:
-        """Blocking OAuth usage GET — runs OFF-loop via ``asyncio.to_thread``
+        """Blocking OAuth usage query — runs OFF-loop via ``asyncio.to_thread``
         (the notify.py precedent, §7). Returns ``(five_hour%, seven_day%)`` or
-        ``None`` on ANY failure (missing/short token file, network, malformed
-        body) — never a guessed number (Doctrine §7). sf-limit.sh parity
-        (D-0058): same endpoint, beta header, and credentials key."""
+        ``None`` on ANY failure (missing token, network, malformed body) — never
+        a guessed number (Doctrine §7).
+
+        The fetch + the serve-stale-on-failure cache live in
+        ``sf_factory.usage.get_usage`` (the SINGLE source shared with sf-limit.sh
+        and the dashboard poller, D-0058 parity). ``now`` is the WALL clock
+        (``time.time()``): the cache file is shared cross-process, so freshness
+        must NOT be measured on the asyncio loop clock — only the poll-interval
+        gate (``_next_limit_poll_at``) stays on the loop clock."""
         cg = self._cfg.capacity_governor
-        try:
-            path = os.path.expanduser(cg.oauth_credentials_path)
-            with open(path, encoding="utf-8") as handle:
-                token = json.load(handle)["claudeAiOauth"]["accessToken"]
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-        request = urllib.request.Request(
-            cg.usage_endpoint,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": cg.usage_beta_header,
-            },
+        data = get_usage(
+            credentials_path=cg.oauth_credentials_path,
+            endpoint=cg.usage_endpoint,
+            beta_header=cg.usage_beta_header,
+            timeout_s=cg.usage_poll_timeout_s,
+            cache_path=cg.usage_cache_path,
+            fresh_ttl_s=cg.usage_cache_fresh_ttl_s,
+            max_stale_s=cg.usage_cache_max_stale_s,
+            now=time.time(),
         )
-        try:
-            with urllib.request.urlopen(
-                request, timeout=cg.usage_poll_timeout_s
-            ) as response:
-                data = json.load(response)
-        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        if data is None:
             return None
         try:
             five_hour = float((data.get("five_hour") or {}).get("utilization"))

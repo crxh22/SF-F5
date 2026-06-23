@@ -154,6 +154,17 @@ class CapacityGovernorCfg(_StrictModel):
     usage_beta_header: str = "oauth-2025-04-20"
     oauth_credentials_path: str = "~/.claude/.credentials.json"
     usage_poll_timeout_s: float = Field(default=20, gt=0)
+    #: Shared usage-query cache (reliability fix, 23-06): ONE cache file across
+    #: every independent caller of the OAuth usage endpoint (governor poll +
+    #: sf-limit.sh + the dashboard poller that calls it), so intermittent 429/
+    #: transient failures no longer blind the proactive drain. A FRESH cache
+    #: (within ``usage_cache_fresh_ttl_s``) is served with no network; on a fetch
+    #: failure the last value is served while within ``usage_cache_max_stale_s``
+    #: (a recent cached number is evidence, not a guess — Doctrine §7), else the
+    #: query is the explicit ``None`` failure. ``~`` is expanded at use.
+    usage_cache_path: str = "~/.claude/.sf-limit-cache.json"
+    usage_cache_fresh_ttl_s: float = Field(default=90, gt=0)
+    usage_cache_max_stale_s: float = Field(default=900, gt=0)
 
 
 class ConsultationPointCfg(_StrictModel):
