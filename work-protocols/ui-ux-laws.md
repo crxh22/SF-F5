@@ -39,6 +39,13 @@ Agentul care scrie spec-ul de UI NU trece la build până nu răspunde EXPLICIT 
 4. **Bucla vizuală**: build-agentul randează + captură (**2 lățimi: desktop + telefon; fără tabletă**,
    decizie fondator 22-06) + autoverificare (rupt/suprapus/gol/overflow) + autocorecție 2-3×. Prinde
    „rupt", NU „frumos" (~10-18% îmbunătățire — cercetare).
+   - **Ciclul de viață al dev-server-ului de randare (vite etc.) — oprește-l DOAR pe PID/PGID EXACT,
+     NICIODATĂ `pkill -f` / `pgrep -f`:** salvează PID-ul la pornire și oprește-l cu `kill <PID>` (sau
+     grupul lui, `kill -- -<PGID>`). NU folosi `pkill -f "vite"` / `pgrep -f` cu un tipar generic — el
+     caută în TOATĂ linia de comandă și se potrivește cu PROPRIUL tău proces/shell (promptul + comanda
+     ta conțin tiparul), deci te AUTO-OMORI cu SIGTERM și pierzi tot lucrul ne-comis. (Incident 23-06:
+     un builder a rulat `pkill -f "vite"` la curățare și s-a auto-terminat la exit 143 — etapa întreagă
+     pierdută.) Aceeași regulă pentru orice proces ajutător pe care îl pornești.
 5. **Poarta de revizie vizuală a fondatorului**: fondatorul parcurge ecranele randate (pe ERP-ul de
    test) înainte de semnarea fazei de UI. Singurul judecător de „gust". **Doar la primele câteva
    iterații de UI, apoi reevaluăm** (decizie fondator 22-06). Pe ecranele importante.
