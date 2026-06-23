@@ -28,7 +28,7 @@ deferral is stated here for a CONSCIOUS founder decision, not discovered later:
 | **1C migration / cutover** — master-data import, **opening balances**, open-document import, reconciliation | old phase `migration-1c` | the cutover happens AFTER the system is built + founder-verified |
 | **Service-orders job-flow beyond cont+ZN** — **defectare** (defect-assessment doc #1), vehicle **intake/`act primire`/custody transitions**, **production** tracking, **release/act-predare**, sale/incomplete-delivery docs | part of old `service-orders` | L7 delivers the cont(quote)+ZN commercial SPINE; the full job lifecycle builds on it next round. Interim: L5's Vehicle form is the quick vehicle-creation path; custody columns stay read-only until intake exists |
 | **Global search** (gap G8) | never scoped | nice-to-have; cross-entity search |
-| **In-app config/users/rights UI** (L9) | deferred-as-planned (ADR-0002) | INCLUDED here build-ready, but may be reduced to Django-admin-v1 — founder's call at L9 |
+| **In-app config/users/rights UI** (L9) | deferred-as-planned (ADR-0002) | **DECIDED (founder 23-06): BUILD the in-app screens** — NOT Django-admin-v1. The 3 L9 stages ship as authored (`config-rights-rest` + `users-rights-fe` are critical-gated) |
 
 **Why the deferral is correct:** the methodology builds a usable core first, verified layer by layer; the
 deferred items are separate domains (payroll), downstream of working operations (reporting), a post-build
@@ -177,7 +177,7 @@ create a scoped user, approve a device — no Django admin.
 - **Diapazon** data prereq before L6: it is a registry nomenclature (generic-CRUD + admin already) —
   seed/admin-enter a fiscal range per issuing OwnPJ as a re-seed setup step BEFORE the L6 fiscal-invoice
   gate (its in-app management screen is L9). **L9 build-vs-Django-admin-v1** — founder decision (stages
-  build-ready, may be deferred/reduced). **Vehicle intake `act primire`** is DEFERRED to the next-round
+  build as authored — **DECIDED (founder 23-06): in-app screens, NOT Django-admin-v1**). **Vehicle intake `act primire`** is DEFERRED to the next-round
   service-orders job-flow (see the Scope Boundary) — NOT a silent L7 item; L5's Vehicle form is the interim path.
 
 ## Two factory-mechanics decisions that gate USABILITY (see the founder summary)
