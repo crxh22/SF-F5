@@ -4520,9 +4520,39 @@ class PhaseExecutor:
         the plan is validated BEFORE freezing (a defective plan escalates from
         PLANNING — CONTRACTS_FROZEN has no ESCALATED edge in §3.2)."""
         worktree = self._worktree(phase)
+        # Option A (founder-ratified pre-authored plans): when the project pins a
+        # prefrozen_phase_plans dir AND this phase has a plan there, ADOPT it
+        # byte-exactly into the worktree before the spawn, and narrow the Phase
+        # Architect to authoring contracts only. The mechanical guarantee (re-
+        # asserted after the spawn): the ingested stage structure is exactly the
+        # founder-RATIFIED one — the architect may not regenerate/edit/move it.
+        proj = _project_for_phase(self._cfg, phase)
+        prefrozen = proj.prefrozen_phase_plans
+        adopted = False
+        frozen_sha: str | None = None
+        if prefrozen is not None:
+            src_dir = _resolve(self._cfg.factory.home, prefrozen) / phase.id
+            src_json = src_dir / PHASE_ARTIFACTS["phase_plan_sidecar"]
+            src_md = src_dir / PHASE_ARTIFACTS["phase_plan"]
+            if src_json.is_file():
+                if not src_md.is_file():
+                    self._escalate(
+                        phase,
+                        trigger="artifact_contract",
+                        target="main_architect",
+                        reason="prefrozen plan missing .md companion",
+                        payload={"src_json": str(src_json), "src_md": str(src_md)},
+                    )
+                    return False
+                unit_dir = self._unit_dir(worktree, phase)
+                unit_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src_json, unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"])
+                shutil.copyfile(src_md, unit_dir / PHASE_ARTIFACTS["phase_plan"])
+                frozen_sha = sha256_file(unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"])
+                adopted = True
         result = await self._runner.run_agent(
             "phase_architect",
-            self._planning_prompt(phase),
+            self._planning_prompt(phase, prefrozen=adopted),
             unit_level=Level.PHASE.value,
             unit_id=phase.id,
             cwd=worktree,
@@ -4545,6 +4575,38 @@ class PhaseExecutor:
         if await self._detect_phase_sentinels(phase, worktree):
             return False
         unit_dir = self._unit_dir(worktree, phase)
+        if adopted:
+            # THE mechanical guarantee (Option A): the stage structure that gets
+            # ingested is byte-exactly the founder-RATIFIED one. The narrowed
+            # architect was told not to touch the frozen plan — verify it didn't.
+            after_sha = sha256_file(unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"])
+            if after_sha != frozen_sha:
+                self._escalate(
+                    phase,
+                    trigger="prefrozen_plan_modified",
+                    target="main_architect",
+                    reason="phase_architect modified the frozen pre-authored phase-plan",
+                    payload={
+                        "phase_plan_sidecar": str(
+                            unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"]
+                        ),
+                        "frozen_sha256": frozen_sha,
+                        "observed_sha256": after_sha,
+                    },
+                )
+                with self._db.transaction() as conn:
+                    fdb.insert_event(
+                        conn,
+                        unit_level=Level.PHASE.value,
+                        unit_id=phase.id,
+                        event_type="prefrozen_plan_modified",
+                        actor=_ACTOR,
+                        payload={
+                            "frozen_sha256": frozen_sha,
+                            "observed_sha256": after_sha,
+                        },
+                    )
+                return False
         plan_md = unit_dir / PHASE_ARTIFACTS["phase_plan"]
         plan_json = unit_dir / PHASE_ARTIFACTS["phase_plan_sidecar"]
         try:
@@ -5571,7 +5633,7 @@ class PhaseExecutor:
 
     # ----------------------------------------------------------------- prompts
 
-    def _planning_prompt(self, phase: Phase) -> str:
+    def _planning_prompt(self, phase: Phase, *, prefrozen: bool = False) -> str:
         risk_classes = sorted(self._cfg.risk_classes)
         unit_rel = f"_factory/phases/{phase.id}"
         contracts_ns = f"_factory/contracts/phase-{phase.id}/"
@@ -5595,34 +5657,50 @@ class PhaseExecutor:
                 "both Tier-2 collection sites rglob recursively, so namespaced contracts "
                 "are picked up unchanged)\n"
             )
+        if prefrozen:
+            # Option A: the stage decomposition is ALREADY FROZEN (founder-RATIFIED,
+            # adopted into the worktree by the scheduler). Narrow the architect to
+            # authoring the intra-phase seam contracts only — the plan is verified
+            # byte-unchanged after this spawn, so touching it only escalates.
+            body = (
+                f"The stage plan ({unit_rel}/phase-plan.json + .md) is ALREADY FROZEN "
+                "and present — do NOT regenerate, edit, move, or delete it. Author ONLY "
+                f"the intra-phase {contracts_ns} seam specs (shared schemas, API "
+                "signatures, named invariants) that the existing stages reference, "
+                "freezing them as files BEFORE any fan-out.\n"
+            )
+        else:
+            body = (
+                "Decompose the phase into stages sized at the upper bound of one-pass "
+                "builder confidence; declare per-stage acceptance criteria and risk class; "
+                "freeze the intra-phase contracts (shared schemas, API signatures, named "
+                f"invariants) as files under {contracts_ns} BEFORE any fan-out.\n"
+                f"Write {unit_rel}/phase-plan.md (rationale) and {unit_rel}/phase-plan.json — "
+                'EXACTLY {"stages": [{"id": "<plan-local-id>", "name": "...", '
+                '"risk_class": "<one of ' + "|".join(risk_classes) + '>", '
+                '"acceptance": "...", "acceptance_criteria": ["...", "..."], '
+                '"touched": ["path/or/component", "..."], "role": "<contract|leaf>"}], '
+                '"dag_edges": [["<from>", "<to>"]]} — '
+                "ids unique, every edge endpoint declared, DAG acyclic.\n"
+                "Per stage ALSO emit: acceptance_criteria (the acceptance as a checklist "
+                "of discrete, testable items); touched (the files / components / "
+                "contract-symbols the stage will modify); role ('contract' for a thin "
+                "seam-freezing stage that fixes a shared schema/API signature/invariant, "
+                "'leaf' otherwise).\n"
+                "CONTRACT-FIRST: when the phase has shared seams, author a role='contract' "
+                "stage that freezes them FIRST and add dag_edges so EVERY dependent (leaf) "
+                "stage is a DAG descendant of a contract stage — dependents then build "
+                "against a frozen contract (a leaf with no contract ancestor is rejected).\n"
+                "SIZE each stage within the limits: <=7 acceptance_criteria, <=6 touched, "
+                "<=6 dependency-degree (in+out edges); split anything larger, and do not "
+                "over-split a leaf below 1 criterion / 1 touched (contract stages may be "
+                "thinner). Oversized stages are flagged to the architect.\n"
+            )
         return (
             f"You are the Phase Architect for phase '{phase.id}' ({phase.name}).\n"
             + context
-            + "Decompose the phase into stages sized at the upper bound of one-pass "
-            "builder confidence; declare per-stage acceptance criteria and risk class; "
-            "freeze the intra-phase contracts (shared schemas, API signatures, named "
-            f"invariants) as files under {contracts_ns} BEFORE any fan-out.\n"
-            f"Write {unit_rel}/phase-plan.md (rationale) and {unit_rel}/phase-plan.json — "
-            'EXACTLY {"stages": [{"id": "<plan-local-id>", "name": "...", '
-            '"risk_class": "<one of ' + "|".join(risk_classes) + '>", '
-            '"acceptance": "...", "acceptance_criteria": ["...", "..."], '
-            '"touched": ["path/or/component", "..."], "role": "<contract|leaf>"}], '
-            '"dag_edges": [["<from>", "<to>"]]} — '
-            "ids unique, every edge endpoint declared, DAG acyclic.\n"
-            "Per stage ALSO emit: acceptance_criteria (the acceptance as a checklist "
-            "of discrete, testable items); touched (the files / components / "
-            "contract-symbols the stage will modify); role ('contract' for a thin "
-            "seam-freezing stage that fixes a shared schema/API signature/invariant, "
-            "'leaf' otherwise).\n"
-            "CONTRACT-FIRST: when the phase has shared seams, author a role='contract' "
-            "stage that freezes them FIRST and add dag_edges so EVERY dependent (leaf) "
-            "stage is a DAG descendant of a contract stage — dependents then build "
-            "against a frozen contract (a leaf with no contract ancestor is rejected).\n"
-            "SIZE each stage within the limits: <=7 acceptance_criteria, <=6 touched, "
-            "<=6 dependency-degree (in+out edges); split anything larger, and do not "
-            "over-split a leaf below 1 criterion / 1 touched (contract stages may be "
-            "thinner). Oversized stages are flagged to the architect.\n"
-            f"If you cannot proceed, write {unit_rel}/_DECLARED_FAILURE.md; a cross-phase "
+            + body
+            + f"If you cannot proceed, write {unit_rel}/_DECLARED_FAILURE.md; a cross-phase "
             f"contract change needs {unit_rel}/_CONTRACT_CHANGE_REQUEST.md + stop."
         )
 

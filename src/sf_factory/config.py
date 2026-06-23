@@ -200,6 +200,13 @@ class ProjectCfg(_StrictModel):
     # Phase-seeding design §4: factory-repo-relative PROJECT.md path; None ⇒ the
     # Phase Architect project-context block is omitted (synthetic/b8 projects).
     project_md: Path | None = None
+    # Option A (founder-ratified pre-authored plans): factory-home-relative dir
+    # holding pre-authored phase-plan.{json,md} per phase id (<dir>/<phase-id>/);
+    # None ⇒ legacy — the Phase Architect authors the stage decomposition itself.
+    # When set and a phase's plan is present, PLANNING adopts it byte-exactly and
+    # narrows the architect to authoring contracts only (mechanical guarantee:
+    # ingested stages == approved stages).
+    prefrozen_phase_plans: Path | None = None
 
 
 class BudgetsCfg(_StrictModel):

@@ -2194,6 +2194,173 @@ async def test_phase_planning_replay_identical_plan_anchors_freeze_on_head(
     assert phase_state(db, "ph") is PhaseState.RUNNING  # replay continued cleanly
 
 
+# Option A (founder-RATIFIED pre-authored plans): the stage structure is adopted
+# byte-exactly at PLANNING and the architect is narrowed to authoring contracts.
+_PREFROZEN_PLAN = {
+    "stages": [
+        {
+            "id": "contract",
+            "name": "seam",
+            "risk_class": "structural",
+            "acceptance": "freeze the shared schema",
+        },
+        {
+            "id": "leaf",
+            "name": "feature",
+            "risk_class": "routine",
+            "acceptance": "build on the seam",
+        },
+    ],
+    "dag_edges": [["contract", "leaf"]],
+}
+
+
+def _seed_prefrozen_plan(config_dict, tmp_path: Path, phase_id: str = "ph") -> Path:
+    """Point projects.proj at a factory-home-relative prefrozen dir and write the
+    valid pre-authored plan for ``phase_id`` into <dir>/<phase-id>/. Returns the
+    per-phase source dir."""
+    config_dict["projects"]["proj"]["prefrozen_phase_plans"] = "ratified-plans"
+    src_dir = tmp_path / "ratified-plans" / phase_id
+    src_dir.mkdir(parents=True)
+    (src_dir / "phase-plan.json").write_text(
+        json.dumps(_PREFROZEN_PLAN), encoding="utf-8"
+    )
+    (src_dir / "phase-plan.md").write_text("ratified rationale\n", encoding="utf-8")
+    return src_dir
+
+
+async def test_phase_planning_adopts_prefrozen_plan_and_freezes(
+    db, config_dict, tmp_path
+) -> None:
+    """Option A happy path: projects.proj pins prefrozen_phase_plans and the phase
+    has a RATIFIED plan there. PLANNING copies it byte-exactly into the worktree,
+    the (narrowed) architect authors ONLY a contract and leaves the plan untouched,
+    the post-spawn sha matches, the phase freezes to CONTRACTS_FROZEN and ingests —
+    and the ingested stage ids EQUAL the source plan's (the mechanical guarantee)."""
+    _seed_prefrozen_plan(config_dict, tmp_path)
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.PLANNING)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    runner = FakeRunner(db)
+
+    def architect(cwd: Path, unit_id: str, resume) -> None:
+        # Narrowed mandate: author a seam contract, NEVER touch the frozen plan.
+        cdir = cwd / "_factory" / "contracts" / f"phase-{unit_id}"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "seam.md").write_text("# shared schema\n", encoding="utf-8")
+
+    runner.behaviors["phase_architect"] = architect
+    executor = make_phase_executor(db, cfg, runner=runner)
+    await executor.execute("ph")
+
+    # The narrowed prompt was used (contracts-only, no decompose instruction).
+    (call,) = [c for c in runner.calls if c.role == "phase_architect"]
+    assert "ALREADY FROZEN" in call.prompt
+    assert "Decompose the phase into stages" not in call.prompt
+
+    # Froze + ingested; the ingested stage ids are byte-exactly the source's.
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    src_ids = {s["id"] for s in _PREFROZEN_PLAN["stages"]}
+    ingested = {
+        s.id.split(".", 1)[1]
+        for s in fdb.list_units(db.read(), Level.STAGE)
+        if isinstance(s, Stage) and s.phase_id == "ph"
+    }
+    assert ingested == src_ids
+    assert fdb.get_stage(db.read(), "ph.contract").risk_class == "structural"
+    # No tamper escalation/event on the clean path.
+    assert open_escalations(db, "ph") == []
+    assert events_of(db, "ph", "prefrozen_plan_modified") == []
+    # The committed plan equals the RATIFIED source byte-for-byte.
+    unit_dir = worktree / "_factory" / "phases" / "ph"
+    assert (
+        (unit_dir / "phase-plan.json").read_text(encoding="utf-8")
+        == (tmp_path / "ratified-plans" / "ph" / "phase-plan.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+async def test_phase_planning_prefrozen_plan_tamper_escalates_no_freeze(
+    db, config_dict, tmp_path
+) -> None:
+    """Option A mechanical guarantee: if the (narrowed) architect overwrites the
+    adopted phase-plan.json, the post-spawn sha check fails — the phase escalates
+    `prefrozen_plan_modified` to the main architect (a greppable event lands too)
+    and does NOT freeze. Ingested-stages-must-equal-approved-stages has teeth."""
+    _seed_prefrozen_plan(config_dict, tmp_path)
+    cfg = make_config(config_dict)
+    insert_phase(db, "ph", PhaseState.PLANNING)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    runner = FakeRunner(db)
+
+    def tampering_architect(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "phases" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        # Rewrite the frozen plan (extra stage) — a forbidden mutation.
+        tampered = json.loads(json.dumps(_PREFROZEN_PLAN))
+        tampered["stages"].append(
+            {"id": "sneaky", "name": "x", "risk_class": "routine", "acceptance": "z"}
+        )
+        (d / "phase-plan.json").write_text(json.dumps(tampered), encoding="utf-8")
+
+    runner.behaviors["phase_architect"] = tampering_architect
+    executor = make_phase_executor(db, cfg, runner=runner)
+    await executor.execute("ph")
+
+    # No freeze; still in PLANNING (no ESCALATED edge from PLANNING? there is —
+    # _step_planning escalates from PLANNING which DOES have an ESCALATED edge).
+    assert phase_state(db, "ph") is PhaseState.ESCALATED
+    (esc,) = open_escalations(db, "ph")
+    assert esc["trigger"] == "prefrozen_plan_modified"
+    assert esc["target"] == "main_architect"
+    assert len(events_of(db, "ph", "prefrozen_plan_modified")) == 1
+    # No stages ingested — the tampered structure never reached the DAG.
+    assert [
+        s for s in fdb.list_units(db.read(), Level.STAGE)
+        if isinstance(s, Stage) and s.phase_id == "ph"
+    ] == []
+    frozen = [
+        e for e in events_of(db, "ph", "transition") if e["to_state"] == "CONTRACTS_FROZEN"
+    ]
+    assert frozen == []
+
+
+async def test_phase_planning_legacy_no_prefrozen_authors_as_today(
+    db, config_dict, tmp_path
+) -> None:
+    """Option A is INERT when prefrozen_phase_plans is unset (None, the proj
+    fixture default): the architect authors the plan itself (the full decompose
+    prompt) exactly as before — no adoption copy, no tamper check, no escalation."""
+    cfg = make_config(config_dict)  # proj has no prefrozen_phase_plans
+    assert cfg.projects["proj"].prefrozen_phase_plans is None
+    insert_phase(db, "ph", PhaseState.PLANNING)
+    worktree = Path(cfg.projects["proj"].worktrees_dir) / "ph"
+    init_repo(worktree)
+    runner = FakeRunner(db)
+
+    def architect(cwd: Path, unit_id: str, resume) -> None:
+        d = cwd / "_factory" / "phases" / unit_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "phase-plan.md").write_text("plan\n", encoding="utf-8")
+        (d / "phase-plan.json").write_text(_VALID_PLAN_JSON, encoding="utf-8")
+
+    runner.behaviors["phase_architect"] = architect
+    executor = make_phase_executor(db, cfg, runner=runner)
+    await executor.execute("ph")
+
+    # Full decompose prompt (not the narrowed one); authored + ingested normally.
+    (call,) = [c for c in runner.calls if c.role == "phase_architect"]
+    assert "Decompose the phase into stages" in call.prompt
+    assert "ALREADY FROZEN" not in call.prompt
+    assert phase_state(db, "ph") is PhaseState.RUNNING
+    assert fdb.get_stage(db.read(), "ph.s1") is not None
+    assert open_escalations(db, "ph") == []
+    assert events_of(db, "ph", "prefrozen_plan_modified") == []
+
+
 def test_render_sibling_diffs_budget_switches_to_hunk_headers() -> None:
     """D-0046: the Tier-2 sibling block renders full diff bodies under the total
     byte budget and collapses to file+@@ hunk headers above it; the gating
