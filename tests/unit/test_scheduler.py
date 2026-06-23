@@ -669,30 +669,85 @@ async def test_max_parallel_override_lowers_cap_live(db, config_dict) -> None:
 
 
 async def test_drain_manual_override_holds_new_spawns_then_lifts(db, config_dict) -> None:
-    """Item 5 (the founder's manual brake): drain.manual=True holds EVERY new agent
-    spawn — PENDING stages never dispatch and the scheduler idles (dispatched==0,
-    no tasks -> run_until_blocked returns; no busy-spin). Flipping it back to NORMAL
-    lets the same stages run to completion. Proves the 5e drain gate in _dispatch
-    and that drain is a clean wind-down, not a stall."""
+    """Item 5 (the founder's manual brake), AGENT granularity (5e correction):
+    drain.manual=True holds EVERY new agent spawn — at BOTH boundaries.
+
+    NEW stages never dispatch (the dispatch gate). An IN-FLIGHT stage (here one
+    seeded at BUILD, a spawn state) does NOT wind down to completion either: it
+    PARKS at its next agent-spawn boundary instead of walking BUILD->...->DONE,
+    so its state is unchanged under drain. The scheduler still idles cleanly
+    (dispatched==0, no tasks -> run_until_blocked returns; no busy-spin), not a
+    stall. Flipping back to NORMAL re-dispatches the parked unit (Part B
+    drain_lifted) and lets every stage run to completion."""
     cfg = make_config(config_dict)
     with db.transaction() as conn:
         fdb.set_runtime_setting(conn, rs.KEY_DRAIN_MANUAL, True, updated_by="founder", at=_RS_AT)
     insert_phase(db, "ph")
+    # Two NEW (PENDING) stages + one IN-FLIGHT stage already at BUILD (a spawn
+    # state whose ScriptedExecutor walk would otherwise reach DONE).
     for sid in ("s1", "s2"):
         insert_stage(db, sid, "ph", StageState.PENDING)
+    insert_stage(db, "inflight", "ph", StageState.BUILD)
     stage_exec = ScriptedExecutor(Level.STAGE, db, StateMachine(db), hold_s=0.08)
     scheduler, _ = make_scheduler(db, cfg, {Level.STAGE: stage_exec})
     await run_blocked(scheduler)
 
-    # Under DRAIN: nothing spawned, both stages still PENDING.
+    # Under DRAIN: nothing spawned. NEW stages still PENDING, and the in-flight
+    # stage PARKED at its agent boundary (still BUILD) — it did NOT run to DONE.
     assert stage_exec.max_concurrent == 0
     assert all(stage_state(db, s) is StageState.PENDING for s in ("s1", "s2"))
+    assert stage_state(db, "inflight") is StageState.BUILD  # agent-level: parked
 
-    # Founder flips the switch back to NORMAL -> the held stages now run.
+    # Founder flips the switch back to NORMAL -> the held + parked stages run.
     with db.transaction() as conn:
         fdb.set_runtime_setting(conn, rs.KEY_DRAIN_MANUAL, False, updated_by="founder", at=_RS_AT)
     await run_blocked(scheduler)
-    assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2"))
+    assert all(stage_state(db, s) is StageState.DONE for s in ("s1", "s2", "inflight"))
+
+
+async def test_drain_manual_parks_in_flight_stage_at_agent_boundary_then_redispatches(
+    db, config_dict, tmp_path
+) -> None:
+    """5e correction (the NEW behaviour): drain holds at AGENT granularity inside
+    the REAL StageExecutor conveyor, not only at dispatch. A stage at BUILD (its
+    NEXT step spawns) is driven under drain -> it PARKS at the agent boundary:
+    state UNCHANGED (still BUILD), NO runner spawn, NO event for the unit (the
+    Part-A execute-level hold; the in-flight winding-down case the dispatch gate
+    alone cannot show). Lifting drain re-dispatches the parked unit through the
+    scheduler (Part-B drain_lifted, no new event needed) and it spawns/progresses
+    past BUILD. Mirrors test_capacity_hold_blocks_claude_steps_codex_proceeds."""
+    env = make_stage_env(db, config_dict, tmp_path)  # real StageExecutor
+    with db.transaction() as conn:
+        fdb.set_unit_state(conn, Level.STAGE, "ph.s1", "BUILD")  # at a spawn step
+        fdb.set_runtime_setting(
+            conn, rs.KEY_DRAIN_MANUAL, True, updated_by="founder", at=_RS_AT
+        )
+    env.runner.behaviors["builder_routine"] = builder_writing([0])
+    env.runner.behaviors["validator"] = validator_writing(0)
+
+    # Part A: driving the real executor under drain PARKS at the agent boundary.
+    await env.executor.execute("ph.s1")
+    assert stage_state(db, "ph.s1") is StageState.BUILD  # state untouched
+    assert env.runner.calls == []  # NO new agent spawned
+    assert events_of(db, "ph.s1") == []  # holding writes NOTHING for the unit
+
+    # Part B: park stays under drain through the scheduler, then drain lifts and
+    # the parked RUNNING unit re-dispatches (drain_lifted) without a new event.
+    scheduler, _ = make_scheduler(db, env.cfg, {Level.STAGE: env.executor})
+    await run_blocked(scheduler)
+    assert stage_state(db, "ph.s1") is StageState.BUILD  # still parked under drain
+    assert env.runner.calls == []
+
+    with db.transaction() as conn:
+        fdb.set_runtime_setting(
+            conn, rs.KEY_DRAIN_MANUAL, False, updated_by="founder", at=_RS_AT
+        )
+    await run_blocked(scheduler)
+    # Re-dispatched: the builder spawned and the stage advanced past BUILD. The
+    # eventual unset-suite OPEN-2 ConfigError at MERGE_GATE is §6-contained on
+    # the loop -> ESCALATED; the point here is the agent boundary was crossed.
+    assert [c.role for c in env.runner.calls] == ["builder_routine", "validator"]
+    assert stage_state(db, "ph.s1") is not StageState.BUILD
 
 
 def _resolve_escalation_for(db, level: Level, unit_id: str, resolution: str) -> int:

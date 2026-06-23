@@ -1741,9 +1741,19 @@ class StageExecutor:
             step = steps.get(stage.state)
             if step is None:  # DONE / FAILED / CANCELLED
                 return
-            if self._governor.held and self._governor.blocks(
-                self._step_spawn_roles(stage)
-            ):
+            spawn_roles = self._step_spawn_roles(stage)
+            if spawn_roles and EffectiveConfig(
+                fdb.get_runtime_settings(self._db.read()), self._cfg
+            ).drain_manual:
+                # founder manual DRAIN at AGENT granularity (5e correction): this
+                # step would spawn a NEW agent — park here (state untouched, NO
+                # event). Agents of earlier steps already finished (execute()
+                # awaits sequentially), so the stage winds down to the AGENT
+                # boundary, not the stage end. Drain-lift re-dispatches us (see
+                # _dispatch drain_lifted). Only read runtime_settings when a step
+                # actually spawns — cheap no-spawn steps must not pay the read.
+                return
+            if self._governor.held and self._governor.blocks(spawn_roles):
                 # CCR-11 (D-0037) capacity hold: this step would spawn a
                 # claude-route agent — it simply does not run this tick (state
                 # untouched, NO event, NO escalation); codex/stub-routed steps
@@ -4358,9 +4368,19 @@ class PhaseExecutor:
             step = steps.get(phase.state)
             if step is None:
                 return
-            if self._governor.held and self._governor.blocks(
-                self._step_spawn_roles(phase)
-            ):
+            spawn_roles = self._step_spawn_roles(phase)
+            if spawn_roles and EffectiveConfig(
+                fdb.get_runtime_settings(self._db.read()), self._cfg
+            ).drain_manual:
+                # founder manual DRAIN at AGENT granularity (5e correction): same
+                # contract as the stage conveyor — this step would spawn a NEW
+                # agent, so park here (state untouched, NO event). Earlier steps'
+                # agents already finished (execute() awaits sequentially), so the
+                # phase winds down to the AGENT boundary, not the phase end.
+                # Drain-lift re-dispatches us (see _dispatch drain_lifted). Only
+                # read runtime_settings when a step actually spawns.
+                return
+            if self._governor.held and self._governor.blocks(spawn_roles):
                 # CCR-11 (D-0037) capacity hold — same contract as the stage
                 # conveyor: a held step does not run this tick, no new state.
                 return
@@ -5770,6 +5790,12 @@ class Scheduler:
         #: wakes BLOCKED units on resolutions/answers even if the answering
         #: plumbing wrote no event.
         self._blocked_snapshot: dict[tuple[Level, str], tuple[int, int]] = {}
+        #: Last tick's manual-DRAIN state (5e correction): on a True->False edge
+        #: the agent-level drain hold lifts, so RUNNING units parked at an agent
+        #: boundary (Part A) must re-dispatch even without a new event — the
+        #: capacity probe re-dispatches governor-held units, but manual drain has
+        #: no such fallback. See _dispatch's `drain_lifted`.
+        self._prev_drain_manual: bool = False
         self._stall_event_logged = False
         self._stall_published = False
         #: One alert_delivery_failed event per consecutive-failure streak (the
@@ -6244,6 +6270,14 @@ class Scheduler:
         # => byte-identical to the load-once cfg (the existing cap tests hold).
         eff = EffectiveConfig(fdb.get_runtime_settings(conn), self._cfg)
         cap = eff.max_parallel_agents
+        # Manual-DRAIN ON->OFF edge (5e correction): a RUNNING unit parked at an
+        # agent boundary by the execute-level drain hold (Part A) wrote no new
+        # event, so its `_last_seq` already covers `seq` and it is not otherwise
+        # eligible. Force RUNNING units eligible for this one tick so they
+        # re-dispatch and resume; drain now being off, neither the dispatch check
+        # nor the execute check holds them again.
+        drain_lifted = self._prev_drain_manual and not eff.drain_manual
+        self._prev_drain_manual = eff.drain_manual
         seq = _max_event_seq(conn)
         dispatched = 0
         for level, unit_id, category, unit in scan:
@@ -6259,7 +6293,11 @@ class Scheduler:
             if category is SchedCategory.RUNNABLE:
                 eligible = True
             elif category is SchedCategory.RUNNING:
-                eligible = key not in self._last_seq or seq > self._last_seq[key]
+                eligible = (
+                    drain_lifted
+                    or key not in self._last_seq
+                    or seq > self._last_seq[key]
+                )
             else:  # BLOCKED
                 snapshot = (
                     _open_escalation_count(conn, level.value, unit_id),
