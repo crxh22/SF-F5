@@ -50,6 +50,23 @@ horizontal scroll inside the table to reach "Editează" — standard antd, page 
 - Catalogs start EMPTY (no nomenclature seed) — the founder tests by ADDING entries. Verified: app serves (HTTP 200), proxy reaches backend (403 unauth = healthy).
 - **Revert when he's DONE testing L1:** `tmux kill-session -t erp-fe` (or repoint to l0-shell). The 2 UNCOMMITTED dev-cookie files live in `.worktrees/l0-shell` (`backend/erp/settings/dev.py` + `apps/accounts/api.py`) — `git checkout` them only when he's done with the BACKEND too. See [[erp-local-test-instance]].
 
+## 🐞 POST-HANDOFF FINDING (ARH-09, for ARH-10) — founder live-test of L1 caught a real edge
+The founder tested L1 live (catalogs) and reported "Save does nothing" on add/edit (bank, currency). **The CRUD
+implementation is CORRECT** — I reproduced a write with proper CSRF: `POST /api/nomenclature/bank/` with the
+`X-CSRFToken` header → **HTTP 201** (created "Banca Test ARH09", id 3; my repro also made device 4 — both harmless,
+in the test DB). Two real (minor) findings the mock-based gates + visual gate could NOT catch (they never exercise
+real CSRF):
+1. **Silent error on a failed write.** The FE surfaces 400 validation errors (details[field] + non_field_errors)
+   but SWALLOWS a 403 — the founder saw nothing on a CSRF 403. A failed Save must surface the error (ui-ux-laws).
+   The 403 path is an edge (logged-in superuser + csrf normally succeeds), so minor — but the silent-failure UX is real.
+2. **CSRF-cookie robustness for a returning user.** `superuser_only` rights backend passes for artur (superuser),
+   device middleware passes (reads work); the 403 is **CSRF** ("CSRF token missing") — the founder's browser lacks the
+   `csrftoken` cookie. The app primes csrf at device bootstrap; a returning, already-registered user whose csrf cookie
+   is gone never re-primes it → writes 403. Robust fix: `@ensure_csrf_cookie` on the app-shell/`/api/me` GET.
+**Founder workaround given:** test in an incognito tab (fresh bootstrap → csrf primed) or clear site cookies +
+re-login. **Not a showstopper for the signoff** (core works); candidate for a small L1 follow-up or a pre-signoff
+`changes` — the founder's call. Evidence: backend log POST→403; repro `/tmp/.../scratchpad/repro_write.py`.
+
 ## 🏭 STATE (verify fresh)
 - Factory **RUNNING** (orchestrator pid 946867; `sf-factory run` in tmux `factory`). Dashboard `http://100.69.221.108:8377`.
 - `drain.manual=false`, `max_parallel_agents=1`, `governor.seven_day_threshold_pct=97`.
