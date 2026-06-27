@@ -117,7 +117,7 @@ escalation:
   decision_latency_alert_h: 24 # founder decision sitting unanswered -> alert (DoD §13)
   stuck_escalation_threshold_min: 30 # open-too-long climb (2a) + resolved-not-advanced (2b) trigger past this age
   merge_gate_max_tier1_failures: 3 # Tier-1 suite fails this many times since last escalation -> ESCALATE, not re-loop (incident 22-06: treasury socket-path loop, 12x)
-  spec_audit_max_rework: 2     # SPEC_AUDIT->SPEC rework loops since last fresh spec entry -> ESCALATE, not re-loop (the blocking spec-rework loop's bound)
+  spec_audit_max_rework: 4     # SPEC_AUDIT->SPEC rework loops since last fresh spec entry -> ESCALATE, not re-loop (the blocking spec-rework loop's bound). 2->4 by ARH-11 27-06: L2 spec audits converge in ~3-4 rounds of pedantic-but-converging documentary nits; cap 2 escalated 2/3 structural stages (money-loc-rest, money-fe) for a manual rework:SPEC reset that simply granted more rounds — 4 lets them converge without the architect round-trip (still bounded, still escalates a genuinely-stuck spec).
                           # RESTORED to 30 by ETAPA-5f after the proper case-2b fix shipped: the over-fire (case-2b
                           # paging escalation_stuck_resolved for EVERY old resolved escalation of a re-ESCALATED unit,
                           # ~32 false [arhitect] pages) is fixed by scoping (2b) to each unit's MOST-RECENT escalation
